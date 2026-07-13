@@ -1,0 +1,8 @@
+dependencies:
+  idf:
+    version: '>=5.5'
+
+  waveshare/esp32_s3_touch_amoled_1_75:
+    version: "*"
+
+version: 0.0.2
