@@ -107,9 +107,11 @@
 #define WIFI_NVS_SSID_KEY "ssid"
 #define WIFI_NVS_PASSWORD_KEY "pass"
 #define WEATHER_NVS_CITY_KEY "weather_city"
+#define WEATHER_NVS_KEY_KEY "weather_key"
 #define WIFI_SSID_STORAGE_SIZE 33
 #define WIFI_PASSWORD_STORAGE_SIZE 65
 #define WEATHER_CITY_STORAGE_SIZE 64
+#define WEATHER_KEY_STORAGE_SIZE 80
 #define WIFI_SCAN_MAX_AP 16
 
 /* 100 ms tick gives a sweeping second hand; labels and the other hands
@@ -335,6 +337,7 @@ static uint32_t s_last_ntp_attempt_ms;
 static httpd_handle_t s_config_server;
 static wifi_credentials_t s_wifi_credentials;
 static char s_weather_city[WEATHER_CITY_STORAGE_SIZE];
+static char s_weather_api_key[WEATHER_KEY_STORAGE_SIZE];
 
 static volatile bool s_reset_requested;
 static uint32_t s_step_count;
@@ -405,9 +408,9 @@ static bool codex_configured(void)
            config_value_is_set(CODEX_USAGE_URL, "http://YOUR_PC_IP:8765/usage");
 }
 
-static bool weather_configured(void)
+static bool weather_api_key_configured(void)
 {
-    return wifi_configured() && s_weather_city[0] != '\0';
+    return config_value_is_set(s_weather_api_key, "YOUR_AMAP_WEB_SERVICE_KEY");
 }
 
 static void copy_string(char *dest, size_t dest_size, const char *src)
@@ -448,15 +451,15 @@ typedef struct {
 } weather_city_preset_t;
 
 static const weather_city_preset_t s_weather_city_presets[] = {
-    {"青岛", "青岛市", "Qingdao", "Qingdao", "101120201", 36.06488, 120.38042},
-    {"青口", "青口市", NULL, "Qingdao", "101120201", 36.06488, 120.38042},
-    {"上海", "上海市", "Shanghai", "Shanghai", "101020100", 31.23040, 121.47370},
-    {"北京", "北京市", "Beijing", "Beijing", "101010100", 39.90420, 116.40740},
-    {"深圳", "深圳市", "Shenzhen", "Shenzhen", "101280601", 22.54310, 114.05790},
-    {"广州", "广州市", "Guangzhou", "Guangzhou", "101280101", 23.12910, 113.26440},
-    {"杭州", "杭州市", "Hangzhou", "Hangzhou", "101210101", 30.27410, 120.15510},
-    {"南京", "南京市", "Nanjing", "Nanjing", "101190101", 32.06030, 118.79690},
-    {"济南", "济南市", "Jinan", "Jinan", "101120101", 36.65120, 117.12010},
+    {"青岛", "青岛市", "Qingdao", "Qingdao", "370200", 36.06488, 120.38042},
+    {"青口", "青口市", NULL, "Qingdao", "370200", 36.06488, 120.38042},
+    {"上海", "上海市", "Shanghai", "Shanghai", "310000", 31.23040, 121.47370},
+    {"北京", "北京市", "Beijing", "Beijing", "110000", 39.90420, 116.40740},
+    {"深圳", "深圳市", "Shenzhen", "Shenzhen", "440300", 22.54310, 114.05790},
+    {"广州", "广州市", "Guangzhou", "Guangzhou", "440100", 23.12910, 113.26440},
+    {"杭州", "杭州市", "Hangzhou", "Hangzhou", "330100", 30.27410, 120.15510},
+    {"南京", "南京市", "Nanjing", "Nanjing", "320100", 32.06030, 118.79690},
+    {"济南", "济南市", "Jinan", "Jinan", "370100", 36.65120, 117.12010},
 };
 
 static bool weather_city_matches(const char *city, const weather_city_preset_t *preset)
@@ -484,7 +487,7 @@ static bool lookup_weather_city_preset(const char *city, double *latitude, doubl
 
 static bool looks_like_weather_city_code(const char *city)
 {
-    if (city == NULL || strlen(city) != 9) {
+    if (city == NULL || strlen(city) != 6) {
         return false;
     }
     for (size_t i = 0; city[i] != '\0'; i++) {
@@ -543,6 +546,7 @@ static void load_wifi_credentials(void)
 {
     memset(&s_wifi_credentials, 0, sizeof(s_wifi_credentials));
     copy_string(s_weather_city, sizeof(s_weather_city), WEATHER_CITY);
+    copy_string(s_weather_api_key, sizeof(s_weather_api_key), AMAP_WEATHER_KEY);
     copy_string(s_last_weather.city, sizeof(s_last_weather.city), WEATHER_CITY);
 
     nvs_handle_t nvs;
@@ -551,14 +555,20 @@ static void load_wifi_credentials(void)
         size_t ssid_len = sizeof(s_wifi_credentials.ssid);
         size_t pass_len = sizeof(s_wifi_credentials.password);
         size_t city_len = sizeof(s_weather_city);
+        size_t key_len = sizeof(s_weather_api_key);
         esp_err_t ssid_ret =
             nvs_get_str(nvs, WIFI_NVS_SSID_KEY, s_wifi_credentials.ssid, &ssid_len);
         esp_err_t pass_ret =
             nvs_get_str(nvs, WIFI_NVS_PASSWORD_KEY, s_wifi_credentials.password, &pass_len);
         esp_err_t city_ret = nvs_get_str(nvs, WEATHER_NVS_CITY_KEY, s_weather_city, &city_len);
+        esp_err_t key_ret =
+            nvs_get_str(nvs, WEATHER_NVS_KEY_KEY, s_weather_api_key, &key_len);
         if (city_ret == ESP_OK && s_weather_city[0] != '\0') {
             normalize_weather_city(s_weather_city, sizeof(s_weather_city));
             copy_string(s_last_weather.city, sizeof(s_last_weather.city), s_weather_city);
+        }
+        if (key_ret != ESP_OK || s_weather_api_key[0] == '\0') {
+            copy_string(s_weather_api_key, sizeof(s_weather_api_key), AMAP_WEATHER_KEY);
         }
         nvs_close(nvs);
         if (ssid_ret == ESP_OK) {
@@ -602,6 +612,30 @@ static esp_err_t save_weather_city(const char *city)
         normalize_weather_city(s_weather_city, sizeof(s_weather_city));
         copy_string(s_last_weather.city, sizeof(s_last_weather.city), city);
         normalize_weather_city(s_last_weather.city, sizeof(s_last_weather.city));
+    }
+    return ret;
+}
+
+static esp_err_t save_weather_api_key(const char *api_key)
+{
+    if (api_key == NULL || api_key[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t nvs;
+    esp_err_t ret = nvs_open(WIFI_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = nvs_set_str(nvs, WEATHER_NVS_KEY_KEY, api_key);
+    if (ret == ESP_OK) {
+        ret = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+
+    if (ret == ESP_OK) {
+        copy_string(s_weather_api_key, sizeof(s_weather_api_key), api_key);
     }
     return ret;
 }
@@ -2351,17 +2385,12 @@ static int weather_code_from_china_type(const char *type)
     return 2;
 }
 
-static bool extract_first_int(const char *text, int *out_value)
+static bool parse_weather_temp(const char *text, int *out_value)
 {
     if (text == NULL || out_value == NULL) {
         return false;
     }
-    while (*text != '\0' && !isdigit((unsigned char)*text) && *text != '-') {
-        text++;
-    }
-    if (*text == '\0') {
-        return false;
-    }
+
     char *end = NULL;
     long value = strtol(text, &end, 10);
     if (end == text) {
@@ -2413,44 +2442,51 @@ static bool parse_codex_usage_json(const char *json, codex_usage_t *usage)
     return true;
 }
 
-static bool parse_china_weather_json(const char *json, weather_data_t *weather,
-                                     const char *display_city)
+static bool parse_amap_weather_json(const char *json, weather_data_t *weather,
+                                    const char *display_city)
 {
-    char temp_text[16];
-    char high_text[32];
-    char low_text[32];
-    char type_text[32];
-    char update_time[24];
+    char status[8];
+    char day_weather[32];
+    char day_temp_text[16];
+    char night_temp_text[16];
+    char report_time[32];
     int high = 0;
     int low = 0;
 
-    if (!json_get_string_after(json, "data", "wendu", temp_text, sizeof(temp_text)) ||
-        !json_get_string_after(json, "forecast", "high", high_text, sizeof(high_text)) ||
-        !json_get_string_after(json, "forecast", "low", low_text, sizeof(low_text)) ||
-        !json_get_string_after(json, "forecast", "type", type_text, sizeof(type_text))) {
+    if (!json_get_string(json, "status", status, sizeof(status)) || strcmp(status, "1") != 0) {
         return false;
     }
 
-    (void)json_get_string_after(json, "cityInfo", "updateTime", update_time,
-                                sizeof(update_time));
-    if (!extract_first_int(high_text, &high) || !extract_first_int(low_text, &low)) {
+    if (!json_get_string_after(json, "casts", "dayweather", day_weather,
+                               sizeof(day_weather)) ||
+        !json_get_string_after(json, "casts", "daytemp", day_temp_text,
+                               sizeof(day_temp_text)) ||
+        !json_get_string_after(json, "casts", "nighttemp", night_temp_text,
+                               sizeof(night_temp_text))) {
         return false;
     }
 
-    weather->current_temp_c = (int)lround(strtod(temp_text, NULL));
+    (void)json_get_string_after(json, "forecasts", "reporttime", report_time,
+                                sizeof(report_time));
+    if (!parse_weather_temp(day_temp_text, &high) ||
+        !parse_weather_temp(night_temp_text, &low)) {
+        return false;
+    }
+
+    weather->current_temp_c = high;
     weather->max_temp_c = high;
     weather->min_temp_c = low;
-    weather->weather_code = weather_code_from_china_type(type_text);
-    copy_string(weather->condition, sizeof(weather->condition), type_text);
+    weather->weather_code = weather_code_from_china_type(day_weather);
+    copy_string(weather->condition, sizeof(weather->condition), day_weather);
     copy_string(weather->city, sizeof(weather->city),
                 display_city != NULL && display_city[0] != '\0' ? display_city : "China City");
     copy_string(weather->region, sizeof(weather->region), "中国");
-    if (update_time[0] != '\0') {
-        snprintf(weather->updated, sizeof(weather->updated), "%s CNWeather", update_time);
+    if (strlen(report_time) >= 16) {
+        snprintf(weather->updated, sizeof(weather->updated), "%.5s AMap", report_time + 11);
     } else {
         struct tm local_time;
         get_local_clock(&local_time);
-        snprintf(weather->updated, sizeof(weather->updated), "%02d:%02d CNWeather",
+        snprintf(weather->updated, sizeof(weather->updated), "%02d:%02d AMap",
                  local_time.tm_hour, local_time.tm_min);
     }
     weather->valid = true;
@@ -2517,12 +2553,16 @@ static esp_err_t fetch_weather(weather_data_t *weather)
 {
     char query_city[WEATHER_CITY_STORAGE_SIZE];
     char display_city[WEATHER_CITY_STORAGE_SIZE];
-    char city_code[16];
-    char url[384];
+    char adcode[16];
+    char url[512];
     http_response_t response;
 
+    if (!weather_api_key_configured()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     build_weather_query_city(s_weather_city, query_city, sizeof(query_city));
-    (void)lookup_weather_city_code(query_city, city_code, sizeof(city_code),
+    (void)lookup_weather_city_code(query_city, adcode, sizeof(adcode),
                                    display_city, sizeof(display_city));
 
     weather_data_t parsed = {
@@ -2533,16 +2573,17 @@ static esp_err_t fetch_weather(weather_data_t *weather)
         .valid = false,
     };
 
-    render_weather_status("China HTTP");
-    snprintf(url, sizeof(url), "http://t.weather.itboy.net/api/weather/city/%s",
-             city_code);
-    esp_err_t ret = http_get_url(url, WEATHER_HTTP_TIMEOUT_MS, false, &response);
+    render_weather_status("AMap HTTP");
+    snprintf(url, sizeof(url),
+             "https://restapi.amap.com/v3/weather/weatherInfo?city=%s&key=%s&extensions=all&output=JSON",
+             adcode, s_weather_api_key);
+    esp_err_t ret = http_get_url(url, WEATHER_HTTP_TIMEOUT_MS, true, &response);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    if (!parse_china_weather_json(response.body, &parsed, display_city)) {
-        ESP_LOGW(TAG, "China weather parse failed: %s", response.body);
+    if (!parse_amap_weather_json(response.body, &parsed, display_city)) {
+        ESP_LOGW(TAG, "AMap weather parse failed: %s", response.body);
         return ESP_FAIL;
     }
 
@@ -2783,7 +2824,7 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
                              ".card{max-width:520px;margin:auto}.hint{color:#9fb0c0;font-size:14px}</style>"
                              "</head><body><div class='card'><h2>ESP32 Wi-Fi 配网</h2>"
                              "<p class='hint'>手机连接热点 CodexPedometer 后，访问 192.168.4.1。保存后设备会用 STA 连接你选择的 Wi-Fi，AP 会继续保留。</p>"
-                             "<p class='hint'>天气默认使用国内 HTTP 接口。可填城市名，也可填 9 位中国天气城市码。</p>"
+                             "<p class='hint'>天气使用高德开放平台 Web 服务。可填城市名，也可填 6 位高德 adcode，例如青岛 370200。</p>"
                              "<form method='post' action='/save'><label>选择 Wi-Fi</label><select name='ssid'>");
 
     wifi_ap_record_t records[WIFI_SCAN_MAX_AP];
@@ -2822,9 +2863,19 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
                      s_weather_city[0] != '\0' ? s_weather_city : WEATHER_CITY);
     char city_input[180];
     snprintf(city_input, sizeof(city_input),
-             "<input name='weather_city' maxlength='63' value='%s' placeholder='例如 青岛市、上海市、101120201'>",
+             "<input name='weather_city' maxlength='63' value='%s' placeholder='例如 青岛市、上海市、370200'>",
              escaped_city);
     httpd_resp_sendstr_chunk(req, city_input);
+
+    char escaped_key[WEATHER_KEY_STORAGE_SIZE];
+    html_escape_copy(escaped_key, sizeof(escaped_key),
+                     weather_api_key_configured() ? s_weather_api_key : "");
+    char key_input[240];
+    snprintf(key_input, sizeof(key_input),
+             "<label>高德天气 Web服务 Key</label>"
+             "<input name='weather_key' maxlength='79' value='%s' placeholder='在高德开放平台申请 Web服务 Key'>",
+             escaped_key);
+    httpd_resp_sendstr_chunk(req, key_input);
     httpd_resp_sendstr_chunk(req,
                              "<button type='submit'>保存并连接</button></form>"
                              "<p class='hint'>当前保存 SSID: ");
@@ -2839,7 +2890,7 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
 
 static esp_err_t config_page_post_handler(httpd_req_t *req)
 {
-    char body[384];
+    char body[768];
     int total = 0;
     int remaining = req->content_len;
     while (remaining > 0 && total < (int)sizeof(body) - 1) {
@@ -2862,10 +2913,12 @@ static esp_err_t config_page_post_handler(httpd_req_t *req)
     char manual_ssid[WIFI_SSID_STORAGE_SIZE];
     char password[WIFI_PASSWORD_STORAGE_SIZE];
     char weather_city[WEATHER_CITY_STORAGE_SIZE];
+    char weather_key[WEATHER_KEY_STORAGE_SIZE];
     (void)get_form_value(body, "ssid", ssid, sizeof(ssid));
     (void)get_form_value(body, "manual_ssid", manual_ssid, sizeof(manual_ssid));
     (void)get_form_value(body, "password", password, sizeof(password));
     (void)get_form_value(body, "weather_city", weather_city, sizeof(weather_city));
+    (void)get_form_value(body, "weather_key", weather_key, sizeof(weather_key));
     if (manual_ssid[0] != '\0') {
         copy_string(ssid, sizeof(ssid), manual_ssid);
     }
@@ -2875,11 +2928,19 @@ static esp_err_t config_page_post_handler(httpd_req_t *req)
     if (wifi_changed) {
         ret = save_wifi_credentials(ssid, password);
     }
+    bool weather_changed = false;
     if (ret == ESP_OK && weather_city[0] != '\0') {
         ret = save_weather_city(weather_city);
+        weather_changed = ret == ESP_OK;
+    }
+    if (ret == ESP_OK && weather_key[0] != '\0') {
+        ret = save_weather_api_key(weather_key);
+        weather_changed = ret == ESP_OK;
+    }
+    if (ret == ESP_OK && weather_changed) {
         s_last_weather.valid = false;
         copy_string(s_last_weather.condition, sizeof(s_last_weather.condition), "等待天气");
-        copy_string(s_last_weather.updated, sizeof(s_last_weather.updated), "city saved");
+        copy_string(s_last_weather.updated, sizeof(s_last_weather.updated), "weather saved");
         render_weather_status("Weather saved");
         request_weather_refresh();
     }
@@ -3158,8 +3219,13 @@ static void weather_task(void *arg)
     }
 
     while (true) {
-        if (!weather_configured()) {
+        if (!wifi_configured() || s_weather_city[0] == '\0') {
             render_weather_status("Open setup AP");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+        if (!weather_api_key_configured()) {
+            render_weather_status("Set AMap key");
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
@@ -3179,7 +3245,7 @@ static void weather_task(void *arg)
             ret = fetch_weather(&weather);
             if (ret == ESP_OK) {
                 s_last_weather = weather;
-                render_weather(&s_last_weather, "CNWeather");
+                render_weather(&s_last_weather, "AMap");
             } else {
                 ESP_LOGW(TAG, "Weather refresh failed: %s", esp_err_to_name(ret));
                 render_weather_status("Weather offline");
