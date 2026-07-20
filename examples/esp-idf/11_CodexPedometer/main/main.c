@@ -97,6 +97,7 @@
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
+#define WEATHER_REFRESH_REQUEST_BIT BIT2
 #define WIFI_MAXIMUM_RETRY 8
 #define WIFI_SETUP_AP_SSID "CodexPedometer"
 #define WIFI_SETUP_AP_PASSWORD "12345678"
@@ -421,6 +422,27 @@ static void copy_string(char *dest, size_t dest_size, const char *src)
     snprintf(dest, dest_size, "%s", src);
 }
 
+static void normalize_weather_city(char *city, size_t city_size)
+{
+    if (city == NULL || city_size == 0 || city[0] == '\0') {
+        return;
+    }
+
+    /* Keep old/bad saved values from making Open-Meteo resolve to the wrong
+     * place. The display font contains the proper "岛" glyph; the alias is
+     * only for persisted config that was already wrong. */
+    if (strcmp(city, "青口") == 0 || strcmp(city, "青口市") == 0) {
+        copy_string(city, city_size, "青岛市");
+    }
+}
+
+static void request_weather_refresh(void)
+{
+    if (s_wifi_event_group != NULL) {
+        xEventGroupSetBits(s_wifi_event_group, WEATHER_REFRESH_REQUEST_BIT);
+    }
+}
+
 static void load_wifi_credentials(void)
 {
     memset(&s_wifi_credentials, 0, sizeof(s_wifi_credentials));
@@ -439,6 +461,7 @@ static void load_wifi_credentials(void)
             nvs_get_str(nvs, WIFI_NVS_PASSWORD_KEY, s_wifi_credentials.password, &pass_len);
         esp_err_t city_ret = nvs_get_str(nvs, WEATHER_NVS_CITY_KEY, s_weather_city, &city_len);
         if (city_ret == ESP_OK && s_weather_city[0] != '\0') {
+            normalize_weather_city(s_weather_city, sizeof(s_weather_city));
             copy_string(s_last_weather.city, sizeof(s_last_weather.city), s_weather_city);
         }
         nvs_close(nvs);
@@ -480,7 +503,9 @@ static esp_err_t save_weather_city(const char *city)
 
     if (ret == ESP_OK) {
         copy_string(s_weather_city, sizeof(s_weather_city), city);
+        normalize_weather_city(s_weather_city, sizeof(s_weather_city));
         copy_string(s_last_weather.city, sizeof(s_last_weather.city), city);
+        normalize_weather_city(s_last_weather.city, sizeof(s_last_weather.city));
     }
     return ret;
 }
@@ -1189,6 +1214,7 @@ static void create_weather_page(lv_obj_t *parent)
                                            lv_color_hex(0x8DDFFF));
     lv_obj_set_width(s_weather_ui.city_label, 280);
     lv_obj_set_style_text_align(s_weather_ui.city_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_transform_scale(s_weather_ui.city_label, 320, 0);
     lv_label_set_long_mode(s_weather_ui.city_label, LV_LABEL_LONG_DOT);
     lv_obj_align(s_weather_ui.city_label, LV_ALIGN_CENTER, 0, -154);
 
@@ -2469,6 +2495,7 @@ static esp_err_t fetch_weather(weather_data_t *weather)
         ESP_LOGW(TAG, "Weather geocode parse failed: %s", response.body);
         return ESP_FAIL;
     }
+    copy_string(parsed.city, sizeof(parsed.city), query_city);
 
     snprintf(url, sizeof(url),
              "https://api.open-meteo.com/v1/forecast?latitude=%.5f&longitude=%.5f&current=temperature_2m,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min&forecast_days=1&timezone=Asia%%2FShanghai",
@@ -2613,13 +2640,16 @@ static void reconnect_station(void)
     esp_err_t ret = apply_station_config();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Apply STA config failed: %s", esp_err_to_name(ret));
+        render_weather_status("Wi-Fi config failed");
         return;
     }
 
+    render_weather_status("Wi-Fi connecting");
     (void)esp_wifi_disconnect();
     ret = esp_wifi_connect();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "STA reconnect failed: %s", esp_err_to_name(ret));
+        render_weather_status("Wi-Fi connect failed");
     }
     render_time_page();
 }
@@ -2814,6 +2844,7 @@ static esp_err_t config_page_post_handler(httpd_req_t *req)
         copy_string(s_last_weather.condition, sizeof(s_last_weather.condition), "等待天气");
         copy_string(s_last_weather.updated, sizeof(s_last_weather.updated), "city saved");
         render_weather_status("Weather saved");
+        request_weather_refresh();
     }
 
     if (ret == ESP_OK) {
@@ -2877,7 +2908,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         if (s_wifi_event_group != NULL) {
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+            xEventGroupSetBits(s_wifi_event_group, WEATHER_REFRESH_REQUEST_BIT);
         }
+        render_weather_status("Wi-Fi reconnecting");
         if (wifi_configured() && s_wifi_retry_num < WIFI_MAXIMUM_RETRY) {
             esp_wifi_connect();
             s_wifi_retry_num++;
@@ -2891,8 +2924,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         s_last_ntp_attempt_ms = 0;
         if (s_wifi_event_group != NULL) {
             xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+            xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT |
+                                                  WEATHER_REFRESH_REQUEST_BIT);
         }
+        render_weather_status("Weather updating");
         ESP_LOGI(TAG, "Wi-Fi connected");
     }
 }
@@ -2955,6 +2990,7 @@ static esp_err_t start_wifi_station(void)
     s_wifi_started = true;
     ESP_RETURN_ON_ERROR(start_config_web_server(), TAG, "start config web failed");
     render_time_page();
+    render_weather_status(wifi_configured() ? "Wi-Fi connecting" : "Open setup AP");
     render_codex_status(wifi_configured() ? "Wi-Fi connecting" : "Open setup AP");
     return ESP_OK;
 }
@@ -3091,24 +3127,41 @@ static void weather_task(void *arg)
             continue;
         }
 
-        EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                               WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE,
-                                               pdFALSE, pdMS_TO_TICKS(30000));
+        if (s_wifi_event_group == NULL) {
+            render_weather_status("Wi-Fi not started");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+
+        EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
         if ((bits & WIFI_CONNECTED_BIT) != 0) {
+            xEventGroupClearBits(s_wifi_event_group, WEATHER_REFRESH_REQUEST_BIT);
+            render_weather_status("Weather updating");
+
             weather_data_t weather;
             ret = fetch_weather(&weather);
             if (ret == ESP_OK) {
                 s_last_weather = weather;
                 render_weather(&s_last_weather, "Open-Meteo");
             } else {
+                ESP_LOGW(TAG, "Weather refresh failed: %s", esp_err_to_name(ret));
                 render_weather_status("Weather offline");
             }
-            vTaskDelay(pdMS_TO_TICKS(WEATHER_POLL_INTERVAL_MS));
+
+            (void)xEventGroupWaitBits(s_wifi_event_group,
+                                      WEATHER_REFRESH_REQUEST_BIT | WIFI_FAIL_BIT,
+                                      pdTRUE, pdFALSE,
+                                      pdMS_TO_TICKS(WEATHER_POLL_INTERVAL_MS));
         } else if ((bits & WIFI_FAIL_BIT) != 0) {
             render_weather_status("Wi-Fi failed");
             vTaskDelay(pdMS_TO_TICKS(5000));
+            reconnect_station();
         } else {
-            render_weather_status("Wi-Fi timeout");
+            render_weather_status("Wi-Fi connecting");
+            (void)xEventGroupWaitBits(s_wifi_event_group,
+                                      WIFI_CONNECTED_BIT | WIFI_FAIL_BIT |
+                                          WEATHER_REFRESH_REQUEST_BIT,
+                                      pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));
         }
     }
 }
@@ -3249,8 +3302,12 @@ void app_main(void)
         render_pedometer(0, 0, "QMI8658 offline");
     }
 
-    xTaskCreate(codex_usage_task, "codex_usage_task", 6144, NULL, 4, NULL);
-    xTaskCreate(weather_task, "weather_task", 6144, NULL, 4, NULL);
+    if (xTaskCreate(codex_usage_task, "codex_usage_task", 6144, NULL, 4, NULL) != pdPASS) {
+        render_codex_status("Codex task failed");
+    }
+    if (xTaskCreate(weather_task, "weather_task", 8192, NULL, 4, NULL) != pdPASS) {
+        render_weather_status("Weather task failed");
+    }
     xTaskCreate(screenshot_console_task, "shot_console", SCREENSHOT_CMD_TASK_STACK, NULL, 2,
                 NULL);
 }
