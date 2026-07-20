@@ -57,12 +57,11 @@
 #define APP_DRAW_BUFFER_HEIGHT 14
 
 /* Whole-UI rotation is done in the CO5300 panel (MADCTL) so it costs nothing.
- * The touch flags below must match; if the direction ends up wrong, use
- * BSP_DISPLAY_ROTATE_270 with swap_xy=1, mirror_x=0, mirror_y=1 instead. */
+ * The touch flags below must match the panel orientation. */
 #define APP_DISPLAY_ROTATION BSP_DISPLAY_ROTATE_90
 #define APP_TOUCH_SWAP_XY 1
-#define APP_TOUCH_MIRROR_X 1
-#define APP_TOUCH_MIRROR_Y 0
+#define APP_TOUCH_MIRROR_X 0
+#define APP_TOUCH_MIRROR_Y 1
 
 /* Pull-down settings panel with persisted UI preferences. */
 #define SETTINGS_NVS_NAMESPACE "ui_cfg"
@@ -4183,6 +4182,11 @@ static lv_display_t *app_display_start(void)
     if (bsp_display_rotation_set(APP_DISPLAY_ROTATION) != ESP_OK) {
         ESP_LOGW(TAG, "Panel rotation set failed");
     }
+    /* The CO5300 visible window sits 6 columns into GRAM (BSP sets gap 6,0).
+     * After the MADCTL axis swap that physical column offset belongs on Y;
+     * leaving it on X paints past one edge and leaves a stripe of
+     * uninitialized (green) GRAM on two others. */
+    (void)esp_lcd_panel_set_gap(panel, 0, 6);
 
     const esp_lv_adapter_display_config_t display_cfg = {
         .panel = panel,
