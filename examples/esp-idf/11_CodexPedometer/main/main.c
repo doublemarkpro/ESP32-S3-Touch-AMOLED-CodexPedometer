@@ -143,6 +143,9 @@
 #define UI_METRIC_VALUE_CENTER_Y 133
 #define UI_METRIC_LABEL_CENTER_Y 155
 #define UI_UPDATED_CENTER_Y 172
+#define PAGE_NAV_DEBOUNCE_MS 250
+#define PAGE_SWIPE_MIN_PX 45
+#define PAGE_SWIPE_MAX_OFF_AXIS_PX 90
 
 #if LV_FONT_MONTSERRAT_48
 #define FONT_STEPS (&lv_font_montserrat_48)
@@ -281,6 +284,9 @@ static lv_obj_t *s_dot_time;
 static lv_obj_t *s_dot_pedometer;
 static lv_obj_t *s_dot_codex;
 static app_page_t s_current_page = APP_PAGE_TIME;
+static uint32_t s_last_page_nav_ms;
+static lv_point_t s_page_press_point;
+static bool s_page_press_active;
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_num;
@@ -307,7 +313,7 @@ static codex_usage_t s_last_codex_usage = {
     .updated = "boot",
 };
 
-static void page_tap_event_cb(lv_event_t *event);
+static void page_nav_event_cb(lv_event_t *event);
 static void render_time_page(void);
 static void update_time_page_locked(void);
 static void screenshot_console_task(void *arg);
@@ -663,7 +669,9 @@ static lv_obj_t *create_page(lv_obj_t *parent)
     lv_obj_align(page, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(page, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(page, page_tap_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(page, page_nav_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(page, page_nav_event_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(page, page_nav_event_cb, LV_EVENT_PRESS_LOST, NULL);
     return page;
 }
 
@@ -744,14 +752,67 @@ static void set_active_page_locked(app_page_t page)
     update_status_bar_locked();
 }
 
-static void page_tap_event_cb(lv_event_t *event)
+static void set_relative_page_locked(int delta)
 {
-    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+    uint32_t current_ms = now_ms();
+    if ((current_ms - s_last_page_nav_ms) < PAGE_NAV_DEBOUNCE_MS) {
+        return;
+    }
+    s_last_page_nav_ms = current_ms;
+
+    int page = (int)s_current_page + delta;
+    while (page < 0) {
+        page += APP_PAGE_COUNT;
+    }
+    page %= APP_PAGE_COUNT;
+    set_active_page_locked((app_page_t)page);
+}
+
+static void page_nav_event_cb(lv_event_t *event)
+{
+    lv_event_code_t code = lv_event_get_code(event);
+    lv_indev_t *indev = lv_event_get_indev(event);
+    if (indev == NULL) {
+        indev = lv_indev_active();
+    }
+
+    if (code == LV_EVENT_PRESS_LOST) {
+        s_page_press_active = false;
         return;
     }
 
-    app_page_t next_page = (app_page_t)((s_current_page + 1) % APP_PAGE_COUNT);
-    set_active_page_locked(next_page);
+    if (indev == NULL) {
+        return;
+    }
+
+    if (code == LV_EVENT_PRESSED) {
+        lv_indev_get_point(indev, &s_page_press_point);
+        s_page_press_active = true;
+        return;
+    }
+
+    if (code != LV_EVENT_RELEASED || !s_page_press_active) {
+        return;
+    }
+
+    lv_point_t release_point;
+    lv_indev_get_point(indev, &release_point);
+    s_page_press_active = false;
+
+    int dx = (int)release_point.x - (int)s_page_press_point.x;
+    int dy = (int)release_point.y - (int)s_page_press_point.y;
+    int abs_dx = abs(dx);
+    int abs_dy = abs(dy);
+
+    if (abs_dx >= PAGE_SWIPE_MIN_PX && abs_dx > abs_dy && abs_dy <= PAGE_SWIPE_MAX_OFF_AXIS_PX) {
+        if (dx < 0) {
+            set_relative_page_locked(1);
+        } else {
+            set_relative_page_locked(-1);
+        }
+    } else if (abs_dx < PAGE_SWIPE_MIN_PX && abs_dy < PAGE_SWIPE_MIN_PX) {
+        set_relative_page_locked(1);
+    }
 }
 
 static void draw_canvas_text(lv_layer_t *layer, const char *text, const lv_font_t *font,

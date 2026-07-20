@@ -7,4 +7,4 @@
 #define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 #define NTP_SERVER "ntp.aliyun.com"
-#define CODEX_USAGE_URL "http://YOUR_PC_IP:8765/usage"
+#define CODEX_USAGE_URL "http://192.168.50.37:8765/usage"
