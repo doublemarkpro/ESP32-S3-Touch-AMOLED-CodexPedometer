@@ -140,6 +140,7 @@
 #define CODEX_POLL_INTERVAL_MS 15000
 #define CODEX_HTTP_TIMEOUT_MS 5000
 #define WEATHER_POLL_INTERVAL_MS 1800000
+#define WEATHER_RETRY_INTERVAL_MS 60000
 #define WEATHER_HTTP_TIMEOUT_MS 8000
 #define HTTP_RESPONSE_BUFFER_SIZE 4096
 #define SCREENSHOT_CMD_TASK_STACK 3072
@@ -164,6 +165,9 @@
 #define UI_UPDATED_CENTER_Y 172
 #define PAGE_NAV_DEBOUNCE_MS 250
 #define PAGE_SWIPE_MIN_PX 45
+/* Holding a page this long (without moving) forces a manual sync: NTP on the
+ * clock page, weather refresh on the weather page. */
+#define PAGE_LONG_PRESS_MS 800
 #define PAGE_SWIPE_MAX_OFF_AXIS_PX 90
 
 #if LV_FONT_MONTSERRAT_48
@@ -251,7 +255,6 @@ typedef struct {
     lv_obj_t *page;
     lv_obj_t *temp_arc;
     lv_obj_t *icon_bg;
-    lv_obj_t *icon_label;
     lv_obj_t *city_label;
     lv_obj_t *temp_label;
     lv_obj_t *condition_label;
@@ -337,6 +340,7 @@ static app_page_t s_current_page = APP_PAGE_TIME;
 static uint32_t s_last_page_nav_ms;
 static lv_point_t s_page_press_point;
 static bool s_page_press_active;
+static uint32_t s_page_press_start_ms;
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_num;
@@ -362,6 +366,7 @@ static lv_point_precise_t s_minute_hand_points[2];
 static lv_point_precise_t s_second_hand_points[2];
 static volatile int s_battery_percent = -1;
 static volatile float s_board_temp_c = BOARD_TEMP_INVALID;
+static volatile bool s_ntp_resync_requested;
 static i2c_master_dev_handle_t s_axp2101_dev;
 static codex_usage_t s_last_codex_usage = {
     .label = "Codex usage",
@@ -384,6 +389,7 @@ static weather_data_t s_last_weather = {
 static void page_nav_event_cb(lv_event_t *event);
 static void render_time_page(void);
 static void render_weather_status(const char *status_text);
+static esp_err_t request_ntp_sync(void);
 static void render_pedometer(uint32_t steps, int motion_mg, const char *status_text);
 static void update_time_page_locked(void);
 static void screenshot_console_task(void *arg);
@@ -1106,6 +1112,7 @@ static void page_nav_event_cb(lv_event_t *event)
     if (code == LV_EVENT_PRESSED) {
         lv_indev_get_point(indev, &s_page_press_point);
         s_page_press_active = true;
+        s_page_press_start_ms = now_ms();
         return;
     }
 
@@ -1129,7 +1136,16 @@ static void page_nav_event_cb(lv_event_t *event)
             set_relative_page_locked(-1);
         }
     } else if (abs_dx < PAGE_SWIPE_MIN_PX && abs_dy < PAGE_SWIPE_MIN_PX) {
-        set_relative_page_locked(1);
+        uint32_t press_elapsed_ms = now_ms() - s_page_press_start_ms;
+        if (press_elapsed_ms >= PAGE_LONG_PRESS_MS) {
+            if (s_current_page == APP_PAGE_TIME) {
+                s_ntp_resync_requested = true;
+            } else if (s_current_page == APP_PAGE_WEATHER) {
+                request_weather_refresh();
+            }
+        } else {
+            set_relative_page_locked(1);
+        }
     }
 }
 
@@ -1351,24 +1367,138 @@ static void create_time_page(lv_obj_t *parent)
     lv_obj_clear_flag(cap_inner, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 }
 
+#define WEATHER_ICON_SIZE 96
+
+static void icon_draw_circle(lv_layer_t *layer, uint32_t color, int32_t cx, int32_t cy,
+                             int32_t r)
+{
+    lv_draw_rect_dsc_t dsc;
+    lv_draw_rect_dsc_init(&dsc);
+    dsc.bg_color = lv_color_hex(color);
+    dsc.bg_opa = LV_OPA_COVER;
+    dsc.radius = LV_RADIUS_CIRCLE;
+    lv_area_t area = { cx - r, cy - r, cx + r - 1, cy + r - 1 };
+    lv_draw_rect(layer, &dsc, &area);
+}
+
+static void icon_draw_round_rect(lv_layer_t *layer, uint32_t color, int32_t x1, int32_t y1,
+                                 int32_t x2, int32_t y2, int32_t radius)
+{
+    lv_draw_rect_dsc_t dsc;
+    lv_draw_rect_dsc_init(&dsc);
+    dsc.bg_color = lv_color_hex(color);
+    dsc.bg_opa = LV_OPA_COVER;
+    dsc.radius = radius;
+    lv_area_t area = { x1, y1, x2, y2 };
+    lv_draw_rect(layer, &dsc, &area);
+}
+
+static void icon_draw_line(lv_layer_t *layer, uint32_t color, int32_t width, float x1,
+                           float y1, float x2, float y2)
+{
+    lv_draw_line_dsc_t dsc;
+    lv_draw_line_dsc_init(&dsc);
+    dsc.color = lv_color_hex(color);
+    dsc.width = width;
+    dsc.round_start = 1;
+    dsc.round_end = 1;
+    dsc.p1.x = x1;
+    dsc.p1.y = y1;
+    dsc.p2.x = x2;
+    dsc.p2.y = y2;
+    lv_draw_line(layer, &dsc);
+}
+
+static void icon_draw_cloud(lv_layer_t *layer, uint32_t color, int32_t cx, int32_t cy)
+{
+    icon_draw_circle(layer, color, cx - 14, cy + 2, 11);
+    icon_draw_circle(layer, color, cx + 2, cy - 6, 15);
+    icon_draw_circle(layer, color, cx + 16, cy + 4, 10);
+    icon_draw_round_rect(layer, color, cx - 22, cy + 2, cx + 24, cy + 13, 6);
+}
+
+static void icon_draw_sun(lv_layer_t *layer, uint32_t color, int32_t cx, int32_t cy,
+                          int32_t r, int32_t ray_inner, int32_t ray_outer)
+{
+    icon_draw_circle(layer, color, cx, cy, r);
+    for (int i = 0; i < 8; i++) {
+        float a = WATCH_DEG_TO_RAD(i * 45);
+        float ca = cosf(a);
+        float sa = sinf(a);
+        icon_draw_line(layer, color, 4, (float)cx + ca * ray_inner, (float)cy + sa * ray_inner,
+                       (float)cx + ca * ray_outer, (float)cy + sa * ray_outer);
+    }
+}
+
+/* Weather condition icons drawn as flat vector art on a small canvas. */
+static void draw_weather_icon(lv_obj_t *canvas, int code)
+{
+    if (canvas == NULL) {
+        return;
+    }
+
+    lv_canvas_fill_bg(canvas, lv_color_hex(0x000000), LV_OPA_COVER);
+    lv_layer_t layer;
+    lv_canvas_init_layer(canvas, &layer);
+
+    if (code == 0) {
+        /* Clear sky */
+        icon_draw_sun(&layer, 0xFFD60A, 48, 48, 18, 25, 33);
+    } else if (code == 2) {
+        /* Partly cloudy: sun peeking behind a cloud */
+        icon_draw_sun(&layer, 0xFFD60A, 34, 32, 13, 18, 25);
+        icon_draw_cloud(&layer, 0xE5E5EA, 52, 58);
+    } else if (code == 3) {
+        /* Overcast */
+        icon_draw_cloud(&layer, 0x9AA7B5, 48, 50);
+    } else if (code == 45 || code == 48) {
+        /* Fog / haze */
+        icon_draw_line(&layer, 0x9AA7B5, 5, 22, 32, 74, 32);
+        icon_draw_line(&layer, 0x9AA7B5, 5, 14, 48, 66, 48);
+        icon_draw_line(&layer, 0x9AA7B5, 5, 26, 64, 78, 64);
+    } else if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) {
+        /* Rain */
+        icon_draw_cloud(&layer, 0xC9D3DC, 48, 38);
+        icon_draw_line(&layer, 0x18D7F5, 4, 34, 62, 28, 78);
+        icon_draw_line(&layer, 0x18D7F5, 4, 50, 62, 44, 78);
+        icon_draw_line(&layer, 0x18D7F5, 4, 66, 62, 60, 78);
+    } else if ((code >= 71 && code <= 77) || code == 85 || code == 86) {
+        /* Snow */
+        icon_draw_cloud(&layer, 0xC9D3DC, 48, 38);
+        icon_draw_circle(&layer, 0xF7FBFF, 34, 70, 4);
+        icon_draw_circle(&layer, 0xF7FBFF, 50, 76, 4);
+        icon_draw_circle(&layer, 0xF7FBFF, 66, 70, 4);
+    } else if (code >= 95) {
+        /* Thunderstorm */
+        icon_draw_cloud(&layer, 0x8E99A5, 48, 36);
+        icon_draw_line(&layer, 0xFFD60A, 5, 54, 54, 43, 71);
+        icon_draw_line(&layer, 0xFFD60A, 5, 43, 71, 53, 71);
+        icon_draw_line(&layer, 0xFFD60A, 5, 53, 71, 41, 90);
+    } else {
+        /* Unknown / waiting for data */
+        icon_draw_cloud(&layer, 0x5F6B77, 48, 50);
+    }
+
+    lv_canvas_finish_layer(canvas, &layer);
+    lv_obj_invalidate(canvas);
+}
+
 static lv_obj_t *create_weather_icon_visual(lv_obj_t *parent)
 {
-    lv_obj_t *bg = lv_obj_create(parent);
-    lv_obj_remove_style_all(bg);
-    lv_obj_set_size(bg, 58, 58);
-    lv_obj_align(bg, LV_ALIGN_CENTER, 0, -108);
-    lv_obj_set_style_radius(bg, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(bg, lv_color_hex(0xFFD166), 0);
-    lv_obj_set_style_bg_opa(bg, LV_OPA_COVER, 0);
-    lv_obj_set_style_shadow_width(bg, 16, 0);
-    lv_obj_set_style_shadow_color(bg, lv_color_hex(0xFFD166), 0);
-    lv_obj_set_style_shadow_opa(bg, LV_OPA_40, 0);
-    lv_obj_clear_flag(bg, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    size_t buf_size = (size_t)WEATHER_ICON_SIZE * WEATHER_ICON_SIZE * 2;
+    void *buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == NULL) {
+        ESP_LOGW(TAG, "Weather icon canvas alloc failed");
+        return NULL;
+    }
 
-    s_weather_ui.icon_label = create_label(bg, LV_SYMBOL_BULLET, FONT_TITLE,
-                                           lv_color_hex(0x111820));
-    lv_obj_center(s_weather_ui.icon_label);
-    return bg;
+    lv_obj_t *canvas = lv_canvas_create(parent);
+    lv_canvas_set_buffer(canvas, buf, WEATHER_ICON_SIZE, WEATHER_ICON_SIZE,
+                         LV_COLOR_FORMAT_RGB565);
+    lv_obj_align(canvas, LV_ALIGN_CENTER, 0, -108);
+    lv_obj_clear_flag(canvas, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    draw_weather_icon(canvas, -1);
+    return canvas;
 }
 
 static void create_weather_page(lv_obj_t *parent)
@@ -2021,6 +2151,14 @@ static void clock_task(void *arg)
             refresh_battery_percent();
         }
 
+        if (s_ntp_resync_requested) {
+            s_ntp_resync_requested = false;
+            s_time_synced = false;
+            s_ntp_sync_in_progress = false;
+            s_last_ntp_attempt_ms = 0;
+            (void)request_ntp_sync();
+        }
+
         render_time_page();
         vTaskDelay(pdMS_TO_TICKS(CLOCK_TASK_DELAY_MS));
     }
@@ -2079,26 +2217,6 @@ static void render_pedometer(uint32_t steps, int motion_mg, const char *status_t
     update_status_bar_locked();
 
     bsp_display_unlock();
-}
-
-static const char *weather_icon_symbol(int code)
-{
-    if (code == 0) {
-        return LV_SYMBOL_BULLET;
-    }
-    if (code == 45 || code == 48) {
-        return LV_SYMBOL_BARS;
-    }
-    if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) {
-        return LV_SYMBOL_TINT;
-    }
-    if ((code >= 71 && code <= 77) || code == 85 || code == 86) {
-        return "*";
-    }
-    if (code >= 95) {
-        return LV_SYMBOL_CHARGE;
-    }
-    return LV_SYMBOL_IMAGE;
 }
 
 static uint32_t weather_accent_color(int code)
@@ -2164,12 +2282,13 @@ static void render_weather(const weather_data_t *weather, const char *status_tex
     }
     lv_obj_set_style_arc_color(s_weather_ui.temp_arc, lv_color_hex(accent),
                                LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(s_weather_ui.icon_bg, lv_color_hex(accent), 0);
-    lv_obj_set_style_shadow_color(s_weather_ui.icon_bg, lv_color_hex(accent), 0);
 
-    set_label_text_if_changed(s_weather_ui.icon_label,
-                              data->valid ? weather_icon_symbol(data->weather_code)
-                                          : LV_SYMBOL_REFRESH);
+    static int last_icon_code = -999;
+    int icon_code = data->valid ? data->weather_code : -1;
+    if (icon_code != last_icon_code) {
+        last_icon_code = icon_code;
+        draw_weather_icon(s_weather_ui.icon_bg, icon_code);
+    }
     set_label_text_if_changed(s_weather_ui.city_label, display_city);
     set_label_text_if_changed(s_weather_ui.temp_label, temp_text);
     set_label_text_if_changed(s_weather_ui.condition_label, data->condition);
@@ -2587,6 +2706,59 @@ static esp_err_t http_event_handler(esp_http_client_event_t *event)
     return ESP_OK;
 }
 
+static bool http_headers_have_chunked(const char *headers)
+{
+    for (const char *p = headers; *p != '\0'; p++) {
+        if (tolower((unsigned char)p[0]) == 'c' && tolower((unsigned char)p[1]) == 'h' &&
+            tolower((unsigned char)p[2]) == 'u' && tolower((unsigned char)p[3]) == 'n' &&
+            tolower((unsigned char)p[4]) == 'k' && tolower((unsigned char)p[5]) == 'e' &&
+            tolower((unsigned char)p[6]) == 'd') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Collapse a chunked transfer-encoded body in place: strip the hex size
+ * lines and trailing CRLFs so only payload bytes remain. */
+static bool dechunk_http_body(char *body, int *length)
+{
+    int total = *length;
+    int out = 0;
+    int in = 0;
+
+    while (in < total) {
+        char *size_start = body + in;
+        char *size_end = NULL;
+        long chunk_len = strtol(size_start, &size_end, 16);
+        if (size_end == size_start || chunk_len < 0) {
+            return false;
+        }
+
+        char *data_start = strstr(size_end, "\r\n");
+        if (data_start == NULL) {
+            return false;
+        }
+        data_start += 2;
+
+        if (chunk_len == 0) {
+            break;
+        }
+
+        int data_offset = (int)(data_start - body);
+        if (data_offset + chunk_len > total) {
+            chunk_len = total - data_offset;
+        }
+        memmove(body + out, data_start, (size_t)chunk_len);
+        out += (int)chunk_len;
+        in = data_offset + (int)chunk_len + 2;
+    }
+
+    body[out] = '\0';
+    *length = out;
+    return true;
+}
+
 static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bundle,
                               http_response_t *response)
 {
@@ -2662,9 +2834,12 @@ static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bund
     }
     freeaddrinfo(result);
 
+    /* HTTP/1.0 so the server may not use chunked transfer encoding; this raw
+     * client reads the body as-is. A dechunk fallback still runs below in
+     * case the server chunks anyway. */
     char request[768];
     int request_len = snprintf(request, sizeof(request),
-                               "GET %s HTTP/1.1\r\n"
+                               "GET %s HTTP/1.0\r\n"
                                "Host: %s\r\n"
                                "User-Agent: CodexPedometer/1.0\r\n"
                                "Connection: close\r\n"
@@ -2722,12 +2897,20 @@ static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bund
         ESP_LOGW(TAG, "Weather HTTP response missing body");
         return ESP_FAIL;
     }
+    *body = '\0';
+    bool chunked = http_headers_have_chunked(response->body);
+    *body = '\r';
     body += 4;
     size_t header_len = (size_t)(body - response->body);
     size_t body_len = (size_t)response->length - header_len;
     memmove(response->body, body, body_len);
     response->body[body_len] = '\0';
     response->length = (int)body_len;
+
+    if (chunked && !dechunk_http_body(response->body, &response->length)) {
+        ESP_LOGW(TAG, "Weather HTTP dechunk failed");
+        return ESP_FAIL;
+    }
 
     if (status_code != 200) {
         ESP_LOGW(TAG, "Weather HTTP status: %d from %s", status_code, host);
@@ -3302,6 +3485,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT |
                                                   WEATHER_REFRESH_REQUEST_BIT);
         }
+        /* Kick SNTP right away instead of waiting for the codex task loop. */
+        (void)request_ntp_sync();
         render_weather_status("Weather updating");
         ESP_LOGI(TAG, "Wi-Fi connected");
     }
@@ -3477,8 +3662,10 @@ static void codex_usage_task(void *arg)
         } else if ((bits & WIFI_FAIL_BIT) != 0) {
             render_codex_status("Wi-Fi failed");
             render_time_page();
-            vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_BACKOFF_MS));
-            if (s_ap_client_count == 0) {
+            EventBits_t recover_bits =
+                xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE,
+                                    pdMS_TO_TICKS(WIFI_RETRY_BACKOFF_MS));
+            if ((recover_bits & WIFI_CONNECTED_BIT) == 0 && s_ap_client_count == 0) {
                 reconnect_station();
             }
         } else {
@@ -3537,10 +3724,13 @@ static void weather_task(void *arg)
                 render_weather_status("Weather offline");
             }
 
+            /* Retry soon after a failure; do not clear WIFI_FAIL_BIT here —
+             * the codex task owns reconnect handling. */
+            uint32_t wait_ms = ret == ESP_OK ? WEATHER_POLL_INTERVAL_MS
+                                             : WEATHER_RETRY_INTERVAL_MS;
             (void)xEventGroupWaitBits(s_wifi_event_group,
                                       WEATHER_REFRESH_REQUEST_BIT | WIFI_FAIL_BIT,
-                                      pdTRUE, pdFALSE,
-                                      pdMS_TO_TICKS(WEATHER_POLL_INTERVAL_MS));
+                                      pdFALSE, pdFALSE, pdMS_TO_TICKS(wait_ms));
         } else if ((bits & WIFI_FAIL_BIT) != 0) {
             /* Reconnect attempts are owned by codex_usage_task; driving them
              * from here too would defeat the retry backoff. */
