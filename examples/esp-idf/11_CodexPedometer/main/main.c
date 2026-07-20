@@ -128,7 +128,7 @@
 #define CODEX_HTTP_TIMEOUT_MS 5000
 #define WEATHER_POLL_INTERVAL_MS 1800000
 #define WEATHER_HTTP_TIMEOUT_MS 8000
-#define HTTP_RESPONSE_BUFFER_SIZE 2048
+#define HTTP_RESPONSE_BUFFER_SIZE 4096
 #define SCREENSHOT_CMD_TASK_STACK 4096
 #define DEBUG_AUTO_DELAY_MS 5000
 #define UI_ROUND_VISIBLE_RADIUS (BSP_LCD_H_RES / 2)
@@ -430,8 +430,8 @@ static void normalize_weather_city(char *city, size_t city_size)
         return;
     }
 
-    /* Keep old/bad saved values from making Open-Meteo resolve to the wrong
-     * place. */
+    /* Keep old/bad saved values from making weather city lookup resolve to the
+     * wrong place. */
     if (strcmp(city, "青口") == 0 || strcmp(city, "青口市") == 0) {
         copy_string(city, city_size, "青岛市");
     }
@@ -442,20 +442,21 @@ typedef struct {
     const char *match_b;
     const char *match_c;
     const char *display;
+    const char *city_code;
     double latitude;
     double longitude;
 } weather_city_preset_t;
 
 static const weather_city_preset_t s_weather_city_presets[] = {
-    {"青岛", "青岛市", "Qingdao", "Qingdao", 36.06488, 120.38042},
-    {"青口", "青口市", NULL, "Qingdao", 36.06488, 120.38042},
-    {"上海", "上海市", "Shanghai", "Shanghai", 31.23040, 121.47370},
-    {"北京", "北京市", "Beijing", "Beijing", 39.90420, 116.40740},
-    {"深圳", "深圳市", "Shenzhen", "Shenzhen", 22.54310, 114.05790},
-    {"广州", "广州市", "Guangzhou", "Guangzhou", 23.12910, 113.26440},
-    {"杭州", "杭州市", "Hangzhou", "Hangzhou", 30.27410, 120.15510},
-    {"南京", "南京市", "Nanjing", "Nanjing", 32.06030, 118.79690},
-    {"济南", "济南市", "Jinan", "Jinan", 36.65120, 117.12010},
+    {"青岛", "青岛市", "Qingdao", "Qingdao", "101120201", 36.06488, 120.38042},
+    {"青口", "青口市", NULL, "Qingdao", "101120201", 36.06488, 120.38042},
+    {"上海", "上海市", "Shanghai", "Shanghai", "101020100", 31.23040, 121.47370},
+    {"北京", "北京市", "Beijing", "Beijing", "101010100", 39.90420, 116.40740},
+    {"深圳", "深圳市", "Shenzhen", "Shenzhen", "101280601", 22.54310, 114.05790},
+    {"广州", "广州市", "Guangzhou", "Guangzhou", "101280101", 23.12910, 113.26440},
+    {"杭州", "杭州市", "Hangzhou", "Hangzhou", "101210101", 30.27410, 120.15510},
+    {"南京", "南京市", "Nanjing", "Nanjing", "101190101", 32.06030, 118.79690},
+    {"济南", "济南市", "Jinan", "Jinan", "101120101", 36.65120, 117.12010},
 };
 
 static bool weather_city_matches(const char *city, const weather_city_preset_t *preset)
@@ -479,6 +480,42 @@ static bool lookup_weather_city_preset(const char *city, double *latitude, doubl
         }
     }
     return false;
+}
+
+static bool looks_like_weather_city_code(const char *city)
+{
+    if (city == NULL || strlen(city) != 9) {
+        return false;
+    }
+    for (size_t i = 0; city[i] != '\0'; i++) {
+        if (!isdigit((unsigned char)city[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool lookup_weather_city_code(const char *city, char *city_code, size_t city_code_size,
+                                     char *display, size_t display_size)
+{
+    for (size_t i = 0; i < sizeof(s_weather_city_presets) / sizeof(s_weather_city_presets[0]);
+         i++) {
+        if (weather_city_matches(city, &s_weather_city_presets[i])) {
+            copy_string(city_code, city_code_size, s_weather_city_presets[i].city_code);
+            copy_string(display, display_size, s_weather_city_presets[i].display);
+            return true;
+        }
+    }
+
+    if (looks_like_weather_city_code(city)) {
+        copy_string(city_code, city_code_size, city);
+        copy_string(display, display_size, "China City");
+        return true;
+    }
+
+    copy_string(city_code, city_code_size, s_weather_city_presets[0].city_code);
+    copy_string(display, display_size, s_weather_city_presets[0].display);
+    return true;
 }
 
 static void build_weather_display_city(const char *city, char *out, size_t out_size)
@@ -1934,50 +1971,6 @@ static void render_pedometer(uint32_t steps, int motion_mg, const char *status_t
     bsp_display_unlock();
 }
 
-static const char *weather_condition_text(int code)
-{
-    switch (code) {
-    case 0:
-        return "晴";
-    case 1:
-    case 2:
-        return "少云";
-    case 3:
-        return "多云";
-    case 45:
-    case 48:
-        return "有雾";
-    case 51:
-    case 53:
-    case 55:
-    case 56:
-    case 57:
-        return "毛毛雨";
-    case 61:
-    case 63:
-    case 65:
-    case 66:
-    case 67:
-    case 80:
-    case 81:
-    case 82:
-        return "降雨";
-    case 71:
-    case 73:
-    case 75:
-    case 77:
-    case 85:
-    case 86:
-        return "降雪";
-    case 95:
-    case 96:
-    case 99:
-        return "雷雨";
-    default:
-        return "天气";
-    }
-}
-
 static const char *weather_icon_symbol(int code)
 {
     if (code == 0) {
@@ -2311,30 +2304,8 @@ static bool json_get_string(const char *json, const char *key, char *out_value, 
     return *position == '"';
 }
 
-static bool json_get_double_from(const char *json, const char *key, double *out_value)
-{
-    const char *position = json_find_value(json, key);
-    if (position == NULL) {
-        return false;
-    }
-
-    while (*position != '\0' &&
-           (isspace((unsigned char)*position) || *position == '[' || *position == '"')) {
-        position++;
-    }
-
-    char *end = NULL;
-    double value = strtod(position, &end);
-    if (end == position) {
-        return false;
-    }
-
-    *out_value = value;
-    return true;
-}
-
-static bool json_get_double_after(const char *json, const char *anchor,
-                                  const char *key, double *out_value)
+static bool json_get_string_after(const char *json, const char *anchor,
+                                  const char *key, char *out_value, size_t out_size)
 {
     char pattern[48];
     int written = snprintf(pattern, sizeof(pattern), "\"%s\"", anchor);
@@ -2346,17 +2317,57 @@ static bool json_get_double_after(const char *json, const char *anchor,
     if (start == NULL) {
         return false;
     }
-    return json_get_double_from(start, key, out_value);
+    return json_get_string(start, key, out_value, out_size);
 }
 
-static bool json_get_int_after(const char *json, const char *anchor,
-                               const char *key, int *out_value)
+static bool text_contains(const char *text, const char *needle)
 {
-    double value = 0.0;
-    if (!json_get_double_after(json, anchor, key, &value)) {
+    return text != NULL && needle != NULL && strstr(text, needle) != NULL;
+}
+
+static int weather_code_from_china_type(const char *type)
+{
+    if (text_contains(type, "雷")) {
+        return 95;
+    }
+    if (text_contains(type, "雪")) {
+        return 71;
+    }
+    if (text_contains(type, "雨")) {
+        return 61;
+    }
+    if (text_contains(type, "雾") || text_contains(type, "霾")) {
+        return 45;
+    }
+    if (text_contains(type, "阴")) {
+        return 3;
+    }
+    if (text_contains(type, "云")) {
+        return 2;
+    }
+    if (text_contains(type, "晴")) {
+        return 0;
+    }
+    return 2;
+}
+
+static bool extract_first_int(const char *text, int *out_value)
+{
+    if (text == NULL || out_value == NULL) {
         return false;
     }
-    *out_value = (int)lround(value);
+    while (*text != '\0' && !isdigit((unsigned char)*text) && *text != '-') {
+        text++;
+    }
+    if (*text == '\0') {
+        return false;
+    }
+    char *end = NULL;
+    long value = strtol(text, &end, 10);
+    if (end == text) {
+        return false;
+    }
+    *out_value = (int)value;
     return true;
 }
 
@@ -2378,29 +2389,6 @@ static void build_weather_query_city(const char *city, char *out, size_t out_siz
         strlen(out) + strlen("市") + 1 < out_size) {
         strcat(out, "市");
     }
-}
-
-static void url_encode_component(const char *src, char *dest, size_t dest_size)
-{
-    size_t out = 0;
-    static const char hex[] = "0123456789ABCDEF";
-    if (dest_size == 0) {
-        return;
-    }
-
-    while (src != NULL && *src != '\0' && out + 1 < dest_size) {
-        unsigned char ch = (unsigned char)*src++;
-        if (isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
-            dest[out++] = (char)ch;
-        } else if (out + 3 < dest_size) {
-            dest[out++] = '%';
-            dest[out++] = hex[ch >> 4];
-            dest[out++] = hex[ch & 0x0F];
-        } else {
-            break;
-        }
-    }
-    dest[out] = '\0';
 }
 
 static bool parse_codex_usage_json(const char *json, codex_usage_t *usage)
@@ -2425,48 +2413,46 @@ static bool parse_codex_usage_json(const char *json, codex_usage_t *usage)
     return true;
 }
 
-static bool parse_weather_geocode_json(const char *json, double *latitude, double *longitude,
-                                       char *city, size_t city_size,
-                                       char *region, size_t region_size)
+static bool parse_china_weather_json(const char *json, weather_data_t *weather,
+                                     const char *display_city)
 {
-    if (!json_get_double_from(json, "latitude", latitude) ||
-        !json_get_double_from(json, "longitude", longitude)) {
+    char temp_text[16];
+    char high_text[32];
+    char low_text[32];
+    char type_text[32];
+    char update_time[24];
+    int high = 0;
+    int low = 0;
+
+    if (!json_get_string_after(json, "data", "wendu", temp_text, sizeof(temp_text)) ||
+        !json_get_string_after(json, "forecast", "high", high_text, sizeof(high_text)) ||
+        !json_get_string_after(json, "forecast", "low", low_text, sizeof(low_text)) ||
+        !json_get_string_after(json, "forecast", "type", type_text, sizeof(type_text))) {
         return false;
     }
 
-    if (!json_get_string(json, "name", city, city_size) || city[0] == '\0') {
-        copy_string(city, city_size, s_weather_city);
-    }
-    if (!json_get_string(json, "admin1", region, region_size) || region[0] == '\0') {
-        copy_string(region, region_size, "中国");
-    }
-    return true;
-}
-
-static bool parse_weather_forecast_json(const char *json, weather_data_t *weather)
-{
-    double current_temp = 0.0;
-    double max_temp = 0.0;
-    double min_temp = 0.0;
-    int code = 0;
-
-    if (!json_get_double_after(json, "current", "temperature_2m", &current_temp) ||
-        !json_get_int_after(json, "current", "weather_code", &code) ||
-        !json_get_double_after(json, "daily", "temperature_2m_max", &max_temp) ||
-        !json_get_double_after(json, "daily", "temperature_2m_min", &min_temp)) {
+    (void)json_get_string_after(json, "cityInfo", "updateTime", update_time,
+                                sizeof(update_time));
+    if (!extract_first_int(high_text, &high) || !extract_first_int(low_text, &low)) {
         return false;
     }
 
-    weather->current_temp_c = (int)lround(current_temp);
-    weather->max_temp_c = (int)lround(max_temp);
-    weather->min_temp_c = (int)lround(min_temp);
-    weather->weather_code = code;
-    copy_string(weather->condition, sizeof(weather->condition), weather_condition_text(code));
-
-    struct tm local_time;
-    get_local_clock(&local_time);
-    snprintf(weather->updated, sizeof(weather->updated), "%02d:%02d Open-Meteo",
-             local_time.tm_hour, local_time.tm_min);
+    weather->current_temp_c = (int)lround(strtod(temp_text, NULL));
+    weather->max_temp_c = high;
+    weather->min_temp_c = low;
+    weather->weather_code = weather_code_from_china_type(type_text);
+    copy_string(weather->condition, sizeof(weather->condition), type_text);
+    copy_string(weather->city, sizeof(weather->city),
+                display_city != NULL && display_city[0] != '\0' ? display_city : "China City");
+    copy_string(weather->region, sizeof(weather->region), "中国");
+    if (update_time[0] != '\0') {
+        snprintf(weather->updated, sizeof(weather->updated), "%s CNWeather", update_time);
+    } else {
+        struct tm local_time;
+        get_local_clock(&local_time);
+        snprintf(weather->updated, sizeof(weather->updated), "%02d:%02d CNWeather",
+                 local_time.tm_hour, local_time.tm_min);
+    }
     weather->valid = true;
     return true;
 }
@@ -2531,13 +2517,14 @@ static esp_err_t fetch_weather(weather_data_t *weather)
 {
     char query_city[WEATHER_CITY_STORAGE_SIZE];
     char display_city[WEATHER_CITY_STORAGE_SIZE];
-    char encoded_city[WEATHER_CITY_STORAGE_SIZE * 3];
+    char city_code[16];
     char url[384];
     http_response_t response;
-    double latitude = 0.0;
-    double longitude = 0.0;
 
     build_weather_query_city(s_weather_city, query_city, sizeof(query_city));
+    (void)lookup_weather_city_code(query_city, city_code, sizeof(city_code),
+                                   display_city, sizeof(display_city));
+
     weather_data_t parsed = {
         .weather_code = 0,
         .current_temp_c = 0,
@@ -2545,43 +2532,17 @@ static esp_err_t fetch_weather(weather_data_t *weather)
         .max_temp_c = 0,
         .valid = false,
     };
-    if (lookup_weather_city_preset(query_city, &latitude, &longitude, display_city,
-                                   sizeof(display_city))) {
-        copy_string(parsed.city, sizeof(parsed.city), display_city);
-        copy_string(parsed.region, sizeof(parsed.region), "中国");
-    } else {
-        render_weather_status("Geo lookup");
-        url_encode_component(query_city, encoded_city, sizeof(encoded_city));
-        snprintf(url, sizeof(url),
-                 "http://geocoding-api.open-meteo.com/v1/search?name=%s&count=1&language=zh&format=json&countryCode=CN",
-                 encoded_city);
 
-        esp_err_t ret = http_get_url(url, WEATHER_HTTP_TIMEOUT_MS, false, &response);
-        if (ret != ESP_OK) {
-            return ret;
-        }
-
-        if (!parse_weather_geocode_json(response.body, &latitude, &longitude,
-                                        parsed.city, sizeof(parsed.city),
-                                        parsed.region, sizeof(parsed.region))) {
-            ESP_LOGW(TAG, "Weather geocode parse failed: %s", response.body);
-            return ESP_FAIL;
-        }
-        build_weather_display_city(parsed.city, display_city, sizeof(display_city));
-        copy_string(parsed.city, sizeof(parsed.city), display_city);
-    }
-
-    render_weather_status("Forecast HTTP");
-    snprintf(url, sizeof(url),
-             "http://api.open-meteo.com/v1/forecast?latitude=%.5f&longitude=%.5f&current=temperature_2m,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min&forecast_days=1&timezone=Asia%%2FShanghai",
-             latitude, longitude);
+    render_weather_status("China HTTP");
+    snprintf(url, sizeof(url), "http://t.weather.itboy.net/api/weather/city/%s",
+             city_code);
     esp_err_t ret = http_get_url(url, WEATHER_HTTP_TIMEOUT_MS, false, &response);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    if (!parse_weather_forecast_json(response.body, &parsed)) {
-        ESP_LOGW(TAG, "Weather forecast parse failed: %s", response.body);
+    if (!parse_china_weather_json(response.body, &parsed, display_city)) {
+        ESP_LOGW(TAG, "China weather parse failed: %s", response.body);
         return ESP_FAIL;
     }
 
@@ -2822,6 +2783,7 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
                              ".card{max-width:520px;margin:auto}.hint{color:#9fb0c0;font-size:14px}</style>"
                              "</head><body><div class='card'><h2>ESP32 Wi-Fi 配网</h2>"
                              "<p class='hint'>手机连接热点 CodexPedometer 后，访问 192.168.4.1。保存后设备会用 STA 连接你选择的 Wi-Fi，AP 会继续保留。</p>"
+                             "<p class='hint'>天气默认使用国内 HTTP 接口。可填城市名，也可填 9 位中国天气城市码。</p>"
                              "<form method='post' action='/save'><label>选择 Wi-Fi</label><select name='ssid'>");
 
     wifi_ap_record_t records[WIFI_SCAN_MAX_AP];
@@ -2860,7 +2822,7 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
                      s_weather_city[0] != '\0' ? s_weather_city : WEATHER_CITY);
     char city_input[180];
     snprintf(city_input, sizeof(city_input),
-             "<input name='weather_city' maxlength='63' value='%s' placeholder='例如 青岛市、上海市、深圳市'>",
+             "<input name='weather_city' maxlength='63' value='%s' placeholder='例如 青岛市、上海市、101120201'>",
              escaped_city);
     httpd_resp_sendstr_chunk(req, city_input);
     httpd_resp_sendstr_chunk(req,
@@ -3217,7 +3179,7 @@ static void weather_task(void *arg)
             ret = fetch_weather(&weather);
             if (ret == ESP_OK) {
                 s_last_weather = weather;
-                render_weather(&s_last_weather, "Open-Meteo");
+                render_weather(&s_last_weather, "CNWeather");
             } else {
                 ESP_LOGW(TAG, "Weather refresh failed: %s", esp_err_to_name(ret));
                 render_weather_status("Weather offline");
