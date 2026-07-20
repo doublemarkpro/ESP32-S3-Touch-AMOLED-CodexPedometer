@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <errno.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -23,6 +24,8 @@
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
 #include "esp_wifi.h"
+#include "lwip/netdb.h"
+#include "lwip/sockets.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -86,7 +89,9 @@
 #define AXP2101_REG_BATT_PERCENT 0xA4
 #define BOARD_TEMP_INVALID (-1000.0f)
 
-#define PEDOMETER_GOAL_STEPS 12000U
+#define PEDOMETER_DEFAULT_GOAL_STEPS 12000U
+#define PEDOMETER_MIN_GOAL_STEPS 1000U
+#define PEDOMETER_MAX_GOAL_STEPS 100000U
 #define PEDOMETER_TASK_DELAY_MS 40
 #define UI_REFRESH_MS 250
 
@@ -98,9 +103,14 @@
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
 #define WEATHER_REFRESH_REQUEST_BIT BIT2
-#define WIFI_MAXIMUM_RETRY 8
+/* Short immediate-retry burst, then long backoff: every STA connect attempt
+ * drags the shared radio off the setup-AP channel for seconds, which is what
+ * makes the CodexPedometer hotspot undiscoverable. */
+#define WIFI_MAXIMUM_RETRY 3
+#define WIFI_RETRY_BACKOFF_MS 30000
+#define WIFI_SCAN_CACHE_MS 60000
 #define WIFI_SETUP_AP_SSID "CodexPedometer"
-#define WIFI_SETUP_AP_PASSWORD "12345678"
+#define WIFI_SETUP_AP_PASSWORD ""
 #define WIFI_SETUP_AP_CHANNEL 6
 #define WIFI_SETUP_AP_MAX_CONN 4
 #define WIFI_NVS_NAMESPACE "wifi_cfg"
@@ -108,6 +118,7 @@
 #define WIFI_NVS_PASSWORD_KEY "pass"
 #define WEATHER_NVS_CITY_KEY "weather_city"
 #define WEATHER_NVS_KEY_KEY "weather_key"
+#define PEDOMETER_NVS_GOAL_KEY "step_goal"
 #define WIFI_SSID_STORAGE_SIZE 33
 #define WIFI_PASSWORD_STORAGE_SIZE 65
 #define WEATHER_CITY_STORAGE_SIZE 64
@@ -131,7 +142,7 @@
 #define WEATHER_POLL_INTERVAL_MS 1800000
 #define WEATHER_HTTP_TIMEOUT_MS 8000
 #define HTTP_RESPONSE_BUFFER_SIZE 4096
-#define SCREENSHOT_CMD_TASK_STACK 4096
+#define SCREENSHOT_CMD_TASK_STACK 3072
 #define DEBUG_AUTO_DELAY_MS 5000
 #define UI_ROUND_VISIBLE_RADIUS (BSP_LCD_H_RES / 2)
 
@@ -336,8 +347,13 @@ static volatile bool s_ntp_sync_in_progress;
 static uint32_t s_last_ntp_attempt_ms;
 static httpd_handle_t s_config_server;
 static wifi_credentials_t s_wifi_credentials;
+static volatile int s_ap_client_count;
+static wifi_ap_record_t s_wifi_scan_cache[WIFI_SCAN_MAX_AP];
+static uint16_t s_wifi_scan_cache_count;
+static uint32_t s_wifi_scan_cache_ms;
 static char s_weather_city[WEATHER_CITY_STORAGE_SIZE];
 static char s_weather_api_key[WEATHER_KEY_STORAGE_SIZE];
+static uint32_t s_pedometer_goal_steps = PEDOMETER_DEFAULT_GOAL_STEPS;
 
 static volatile bool s_reset_requested;
 static uint32_t s_step_count;
@@ -368,6 +384,7 @@ static weather_data_t s_last_weather = {
 static void page_nav_event_cb(lv_event_t *event);
 static void render_time_page(void);
 static void render_weather_status(const char *status_text);
+static void render_pedometer(uint32_t steps, int motion_mg, const char *status_text);
 static void update_time_page_locked(void);
 static void screenshot_console_task(void *arg);
 
@@ -563,6 +580,8 @@ static void load_wifi_credentials(void)
         esp_err_t city_ret = nvs_get_str(nvs, WEATHER_NVS_CITY_KEY, s_weather_city, &city_len);
         esp_err_t key_ret =
             nvs_get_str(nvs, WEATHER_NVS_KEY_KEY, s_weather_api_key, &key_len);
+        uint32_t saved_goal = 0;
+        esp_err_t goal_ret = nvs_get_u32(nvs, PEDOMETER_NVS_GOAL_KEY, &saved_goal);
         if (city_ret == ESP_OK && s_weather_city[0] != '\0') {
             normalize_weather_city(s_weather_city, sizeof(s_weather_city));
             copy_string(s_last_weather.city, sizeof(s_last_weather.city), s_weather_city);
@@ -570,7 +589,13 @@ static void load_wifi_credentials(void)
         if (key_ret != ESP_OK || s_weather_api_key[0] == '\0') {
             copy_string(s_weather_api_key, sizeof(s_weather_api_key), AMAP_WEATHER_KEY);
         }
+        if (goal_ret == ESP_OK && saved_goal >= PEDOMETER_MIN_GOAL_STEPS &&
+            saved_goal <= PEDOMETER_MAX_GOAL_STEPS) {
+            s_pedometer_goal_steps = saved_goal;
+        }
         nvs_close(nvs);
+        ESP_LOGI(TAG, "Weather config from NVS: city=%s key=%s", s_weather_city,
+                 weather_api_key_configured() ? "set" : "missing");
         if (ssid_ret == ESP_OK) {
             if (pass_ret != ESP_OK) {
                 s_wifi_credentials.password[0] = '\0';
@@ -587,6 +612,31 @@ static void load_wifi_credentials(void)
         ESP_LOGI(TAG, "Using fallback Wi-Fi credentials from app_config.h: %s",
                  s_wifi_credentials.ssid);
     }
+}
+
+static esp_err_t save_pedometer_goal(uint32_t goal_steps)
+{
+    if (goal_steps < PEDOMETER_MIN_GOAL_STEPS || goal_steps > PEDOMETER_MAX_GOAL_STEPS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t nvs;
+    esp_err_t ret = nvs_open(WIFI_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = nvs_set_u32(nvs, PEDOMETER_NVS_GOAL_KEY, goal_steps);
+    if (ret == ESP_OK) {
+        ret = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+
+    if (ret == ESP_OK) {
+        s_pedometer_goal_steps = goal_steps;
+        render_pedometer(s_step_count, 0, "Goal saved");
+    }
+    return ret;
 }
 
 static esp_err_t save_weather_city(const char *city)
@@ -636,6 +686,7 @@ static esp_err_t save_weather_api_key(const char *api_key)
 
     if (ret == ESP_OK) {
         copy_string(s_weather_api_key, sizeof(s_weather_api_key), api_key);
+        ESP_LOGI(TAG, "Weather API key saved to NVS");
     }
     return ret;
 }
@@ -1006,7 +1057,7 @@ static void enforce_page_visibility_locked(void)
 
     move_overlay_ui_foreground_locked();
     update_page_dots_locked();
-    set_status_bar_hidden_locked(time_active);
+    set_status_bar_hidden_locked(true);
 }
 
 static void set_active_page_locked(app_page_t page)
@@ -1304,12 +1355,12 @@ static lv_obj_t *create_weather_icon_visual(lv_obj_t *parent)
 {
     lv_obj_t *bg = lv_obj_create(parent);
     lv_obj_remove_style_all(bg);
-    lv_obj_set_size(bg, 74, 74);
-    lv_obj_align(bg, LV_ALIGN_CENTER, 0, UI_MAIN_ICON_CENTER_Y);
+    lv_obj_set_size(bg, 58, 58);
+    lv_obj_align(bg, LV_ALIGN_CENTER, 0, -108);
     lv_obj_set_style_radius(bg, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(bg, lv_color_hex(0xFFD166), 0);
     lv_obj_set_style_bg_opa(bg, LV_OPA_COVER, 0);
-    lv_obj_set_style_shadow_width(bg, 22, 0);
+    lv_obj_set_style_shadow_width(bg, 16, 0);
     lv_obj_set_style_shadow_color(bg, lv_color_hex(0xFFD166), 0);
     lv_obj_set_style_shadow_opa(bg, LV_OPA_40, 0);
     lv_obj_clear_flag(bg, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
@@ -1351,23 +1402,23 @@ static void create_weather_page(lv_obj_t *parent)
 
     lv_obj_t *caption = create_label(s_weather_ui.page, "WEATHER", FONT_TITLE,
                                      lv_color_hex(0xE6EDF5));
-    lv_obj_align(caption, LV_ALIGN_CENTER, 0, UI_CAPTION_CENTER_Y);
+    lv_obj_align(caption, LV_ALIGN_CENTER, 0, -50);
 
     s_weather_ui.temp_label = create_label(s_weather_ui.page, "--°", FONT_STEPS,
                                            lv_color_hex(0xF7FBFF));
     lv_obj_set_width(s_weather_ui.temp_label, 300);
     lv_obj_set_style_text_align(s_weather_ui.temp_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_weather_ui.temp_label, LV_LABEL_LONG_CLIP);
-    lv_obj_align(s_weather_ui.temp_label, LV_ALIGN_CENTER, 0, UI_VALUE_CENTER_Y);
+    lv_obj_align(s_weather_ui.temp_label, LV_ALIGN_CENTER, 0, 6);
 
     s_weather_ui.condition_label = create_label(s_weather_ui.page, "等待天气", FONT_CJK,
                                                 lv_color_hex(0xFFD166));
     lv_obj_set_width(s_weather_ui.condition_label, 280);
     lv_obj_set_style_text_align(s_weather_ui.condition_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_weather_ui.condition_label, LV_LABEL_LONG_DOT);
-    lv_obj_align(s_weather_ui.condition_label, LV_ALIGN_CENTER, 0, UI_GOAL_CENTER_Y);
+    lv_obj_align(s_weather_ui.condition_label, LV_ALIGN_CENTER, 0, 62);
 
-    s_weather_ui.range_label = create_label(s_weather_ui.page, "-- / --", FONT_MEDIUM,
+    s_weather_ui.range_label = create_label(s_weather_ui.page, "", FONT_MEDIUM,
                                             lv_color_hex(0xF7FBFF));
     lv_obj_set_width(s_weather_ui.range_label, 260);
     lv_obj_set_style_text_align(s_weather_ui.range_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -1379,18 +1430,19 @@ static void create_weather_page(lv_obj_t *parent)
     lv_obj_set_width(s_weather_ui.status_label, 320);
     lv_obj_set_style_text_align(s_weather_ui.status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_weather_ui.status_label, LV_LABEL_LONG_DOT);
-    lv_obj_align(s_weather_ui.status_label, LV_ALIGN_CENTER, 0, UI_STATUS_CENTER_Y + 24);
+    lv_obj_align(s_weather_ui.status_label, LV_ALIGN_CENTER, 0, 92);
 
     s_weather_ui.low_value_label =
         create_metric_column(s_weather_ui.page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED,
                              "LOW", "--");
-    s_weather_ui.high_value_label =
-        create_metric_column(s_weather_ui.page, 0, false, METRIC_ICON_LIMIT, "HIGH", "--");
     s_weather_ui.code_value_label =
-        create_metric_column(s_weather_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LEFT,
-                             "CODE", "--");
+        create_metric_column(s_weather_ui.page, 0, false, METRIC_ICON_LEFT,
+                             "UPDATE", "--");
+    s_weather_ui.high_value_label =
+        create_metric_column(s_weather_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT,
+                             "HIGH", "--");
 
-    s_weather_ui.updated_label = create_label(s_weather_ui.page, "Updated boot", FONT_SMALL,
+    s_weather_ui.updated_label = create_label(s_weather_ui.page, "", FONT_SMALL,
                                               lv_color_hex(0x63717F));
     lv_obj_set_width(s_weather_ui.updated_label, 260);
     lv_obj_set_style_text_align(s_weather_ui.updated_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -1415,7 +1467,7 @@ static void create_pedometer_page(lv_obj_t *parent)
     lv_obj_set_style_arc_width(s_pedometer_ui.progress_arc, UI_ARC_WIDTH, LV_PART_INDICATOR);
     lv_obj_set_style_arc_rounded(s_pedometer_ui.progress_arc, true, LV_PART_INDICATOR);
     lv_obj_set_style_arc_color(s_pedometer_ui.progress_arc, lv_color_hex(0x17212B), LV_PART_MAIN);
-    lv_obj_set_style_arc_color(s_pedometer_ui.progress_arc, lv_color_hex(0x18D7F5),
+    lv_obj_set_style_arc_color(s_pedometer_ui.progress_arc, lv_color_hex(0x9DFF35),
                                LV_PART_INDICATOR);
 
     s_pedometer_ui.main_icon = create_main_icon(s_pedometer_ui.page, &ui_icon_steps);
@@ -1471,10 +1523,9 @@ static void create_codex_page(lv_obj_t *parent)
     lv_obj_set_style_arc_color(s_codex_ui.usage_arc, lv_color_hex(0x17212B), LV_PART_MAIN);
     lv_obj_set_style_arc_color(s_codex_ui.usage_arc, lv_color_hex(0xFFD166), LV_PART_INDICATOR);
 
-    s_codex_ui.main_icon = create_main_icon(s_codex_ui.page, &ui_icon_codex);
-
-    lv_obj_t *caption = create_label(s_codex_ui.page, "TOKENS", FONT_TITLE, lv_color_hex(0xE6EDF5));
-    lv_obj_align(caption, LV_ALIGN_CENTER, 0, UI_CAPTION_CENTER_Y);
+    s_codex_ui.main_icon = create_label(s_codex_ui.page, "CODEX", FONT_TITLE,
+                                        lv_color_hex(0xFFD166));
+    lv_obj_align(s_codex_ui.main_icon, LV_ALIGN_CENTER, 0, UI_MAIN_ICON_CENTER_Y);
 
     s_codex_ui.percent_label = create_label(s_codex_ui.page, "0%", FONT_STEPS,
                                               lv_color_hex(0xF7FBFF));
@@ -1483,7 +1534,7 @@ static void create_codex_page(lv_obj_t *parent)
     lv_label_set_long_mode(s_codex_ui.percent_label, LV_LABEL_LONG_CLIP);
     lv_obj_align(s_codex_ui.percent_label, LV_ALIGN_CENTER, 0, UI_VALUE_CENTER_Y);
 
-    s_codex_ui.label_label = create_label(s_codex_ui.page, "Codex usage", FONT_MEDIUM,
+    s_codex_ui.label_label = create_label(s_codex_ui.page, "", FONT_MEDIUM,
                                            lv_color_hex(0xFFD166));
     lv_obj_set_width(s_codex_ui.label_label, 300);
     lv_obj_set_style_text_align(s_codex_ui.label_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -1495,7 +1546,7 @@ static void create_codex_page(lv_obj_t *parent)
     lv_obj_set_width(s_codex_ui.status_label, 340);
     lv_obj_set_style_text_align(s_codex_ui.status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_codex_ui.status_label, LV_LABEL_LONG_DOT);
-    lv_obj_align(s_codex_ui.status_label, LV_ALIGN_CENTER, 0, UI_STATUS_CENTER_Y);
+    lv_obj_align(s_codex_ui.status_label, LV_ALIGN_CENTER, 0, UI_GOAL_CENTER_Y);
 
     s_codex_ui.used_value_label =
         create_metric_column(s_codex_ui.page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED,
@@ -1559,6 +1610,14 @@ static void create_app_ui(void)
     create_status_bar(scr);
     create_page_dots(scr);
     set_active_page_locked(APP_PAGE_TIME);
+}
+
+static void request_full_screen_refresh(void)
+{
+    if (bsp_display_lock(DISPLAY_LOCK_TIMEOUT_MS) == ESP_OK) {
+        lv_obj_invalidate(lv_screen_active());
+        bsp_display_unlock();
+    }
 }
 
 static bool area_inside_square(const lv_area_t *area)
@@ -1969,7 +2028,11 @@ static void clock_task(void *arg)
 
 static void render_pedometer(uint32_t steps, int motion_mg, const char *status_text)
 {
-    uint32_t progress = clamp_u32((steps * 100U) / PEDOMETER_GOAL_STEPS, 100U);
+    uint32_t goal_steps = s_pedometer_goal_steps >= PEDOMETER_MIN_GOAL_STEPS
+                              ? s_pedometer_goal_steps
+                              : PEDOMETER_DEFAULT_GOAL_STEPS;
+    uint32_t progress =
+        clamp_u32((uint32_t)(((uint64_t)steps * 100U) / goal_steps), 100U);
     uint32_t distance_tenths_km = (steps * 7U) / 1000U;
     uint32_t calories = (steps * 4U) / 100U;
 
@@ -1987,7 +2050,20 @@ static void render_pedometer(uint32_t steps, int motion_mg, const char *status_t
     char distance_text[16];
     char calories_text[16];
     char motion_text[16];
-    snprintf(goal_text, sizeof(goal_text), "%lu%% OF 12K", (unsigned long)progress);
+    if (goal_steps >= 1000U) {
+        uint32_t goal_tenths_k = (goal_steps + 50U) / 100U;
+        if ((goal_tenths_k % 10U) == 0U) {
+            snprintf(goal_text, sizeof(goal_text), "%lu%% OF %luK",
+                     (unsigned long)progress, (unsigned long)(goal_tenths_k / 10U));
+        } else {
+            snprintf(goal_text, sizeof(goal_text), "%lu%% OF %lu.%luK",
+                     (unsigned long)progress, (unsigned long)(goal_tenths_k / 10U),
+                     (unsigned long)(goal_tenths_k % 10U));
+        }
+    } else {
+        snprintf(goal_text, sizeof(goal_text), "%lu%% OF %lu",
+                 (unsigned long)progress, (unsigned long)goal_steps);
+    }
     snprintf(distance_text, sizeof(distance_text), "%lu.%lu",
              (unsigned long)(distance_tenths_km / 10U),
              (unsigned long)(distance_tenths_km % 10U));
@@ -2054,26 +2130,29 @@ static void render_weather(const weather_data_t *weather, const char *status_tex
     char range_text[32];
     char low_text[16];
     char high_text[16];
-    char code_text[16];
-    char updated_text[56];
+    char update_short_text[16];
     char display_city[WEATHER_CITY_STORAGE_SIZE];
 
     build_weather_display_city(data->city, display_city, sizeof(display_city));
     if (data->valid) {
         snprintf(temp_text, sizeof(temp_text), "%d°", data->current_temp_c);
-        snprintf(range_text, sizeof(range_text), "%d° / %d°", data->min_temp_c,
-                 data->max_temp_c);
+        range_text[0] = '\0';
         snprintf(low_text, sizeof(low_text), "%d°", data->min_temp_c);
         snprintf(high_text, sizeof(high_text), "%d°", data->max_temp_c);
-        snprintf(code_text, sizeof(code_text), "%d", data->weather_code);
+        const char *space = strchr(data->updated, ' ');
+        size_t update_len = space != NULL ? (size_t)(space - data->updated) : strlen(data->updated);
+        if (update_len >= sizeof(update_short_text)) {
+            update_len = sizeof(update_short_text) - 1;
+        }
+        memcpy(update_short_text, data->updated, update_len);
+        update_short_text[update_len] = '\0';
     } else {
         snprintf(temp_text, sizeof(temp_text), "--°");
-        snprintf(range_text, sizeof(range_text), "-- / --");
+        range_text[0] = '\0';
         snprintf(low_text, sizeof(low_text), "--");
         snprintf(high_text, sizeof(high_text), "--");
-        snprintf(code_text, sizeof(code_text), "--");
+        snprintf(update_short_text, sizeof(update_short_text), "--");
     }
-    snprintf(updated_text, sizeof(updated_text), "Updated %s", data->updated);
 
     if (bsp_display_lock(DISPLAY_LOCK_TIMEOUT_MS) != ESP_OK) {
         return;
@@ -2098,8 +2177,8 @@ static void render_weather(const weather_data_t *weather, const char *status_tex
     set_label_text_if_changed(s_weather_ui.status_label, status_text);
     set_label_text_if_changed(s_weather_ui.low_value_label, low_text);
     set_label_text_if_changed(s_weather_ui.high_value_label, high_text);
-    set_label_text_if_changed(s_weather_ui.code_value_label, code_text);
-    set_label_text_if_changed(s_weather_ui.updated_label, updated_text);
+    set_label_text_if_changed(s_weather_ui.code_value_label, update_short_text);
+    set_label_text_if_changed(s_weather_ui.updated_label, "");
     update_status_bar_locked();
 
     bsp_display_unlock();
@@ -2164,7 +2243,7 @@ static void render_codex_usage(const codex_usage_t *usage, const char *status_te
     snprintf(updated_text, sizeof(updated_text), "Updated %s", usage->updated);
 
     set_label_text_if_changed(s_codex_ui.percent_label, percent_text);
-    set_label_text_if_changed(s_codex_ui.label_label, usage->label);
+    set_label_text_if_changed(s_codex_ui.label_label, "");
     set_label_text_if_changed(s_codex_ui.status_label, status_text);
     set_label_text_if_changed(s_codex_ui.used_value_label, used_text);
     set_label_text_if_changed(s_codex_ui.limit_value_label, limit_text);
@@ -2511,41 +2590,151 @@ static esp_err_t http_event_handler(esp_http_client_event_t *event)
 static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bundle,
                               http_response_t *response)
 {
+    (void)use_crt_bundle;
     memset(response, 0, sizeof(*response));
-    esp_http_client_config_t config = {
-        .url = url,
-        .user_agent = "CodexPedometer/1.0",
-        .method = HTTP_METHOD_GET,
-        .timeout_ms = timeout_ms,
-        .event_handler = http_event_handler,
-        .user_data = response,
-        .buffer_size = HTTP_RESPONSE_BUFFER_SIZE,
-        .buffer_size_tx = 512,
-        .keep_alive_enable = false,
-    };
-    if (use_crt_bundle) {
-        config.crt_bundle_attach = esp_crt_bundle_attach;
+
+    const char *scheme = "http://";
+    size_t scheme_len = strlen(scheme);
+    if (strncmp(url, scheme, scheme_len) != 0) {
+        ESP_LOGW(TAG, "Only plain HTTP is supported by raw weather client");
+        return ESP_ERR_NOT_SUPPORTED;
     }
 
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) {
+    const char *host_start = url + scheme_len;
+    const char *path_start = strchr(host_start, '/');
+    if (path_start == NULL) {
+        path_start = "/";
+    }
+
+    const char *host_end = path_start;
+    const char *port_start = memchr(host_start, ':', (size_t)(host_end - host_start));
+    size_t host_len = (size_t)((port_start != NULL ? port_start : host_end) - host_start);
+    if (host_len == 0 || host_len >= 96) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char host[96];
+    memcpy(host, host_start, host_len);
+    host[host_len] = '\0';
+
+    char port_text[8] = "80";
+    if (port_start != NULL) {
+        size_t port_len = (size_t)(host_end - port_start - 1);
+        if (port_len == 0 || port_len >= sizeof(port_text)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        memcpy(port_text, port_start + 1, port_len);
+        port_text[port_len] = '\0';
+    }
+
+    struct addrinfo hints = {
+        .ai_family = AF_INET,
+        .ai_socktype = SOCK_STREAM,
+    };
+    struct addrinfo *result = NULL;
+    ESP_LOGI(TAG, "Resolving weather host %s", host);
+    int gai_ret = getaddrinfo(host, port_text, &hints, &result);
+    if (gai_ret != 0 || result == NULL) {
+        ESP_LOGW(TAG, "Weather DNS failed for %s: %d", host, gai_ret);
         return ESP_FAIL;
     }
 
-    esp_err_t ret = esp_http_client_perform(client);
-    int status_code = esp_http_client_get_status_code(client);
-    esp_http_client_cleanup(client);
-
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "HTTP request failed: %s", esp_err_to_name(ret));
-        return ret;
+    int sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+    if (sock < 0) {
+        freeaddrinfo(result);
+        ESP_LOGW(TAG, "Weather socket failed: errno=%d", errno);
+        return ESP_FAIL;
     }
+
+    struct timeval tv = {
+        .tv_sec = timeout_ms / 1000,
+        .tv_usec = (timeout_ms % 1000) * 1000,
+    };
+    (void)setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    ESP_LOGI(TAG, "Connecting weather host %s:%s", host, port_text);
+    if (connect(sock, result->ai_addr, result->ai_addrlen) != 0) {
+        ESP_LOGW(TAG, "Weather connect failed: errno=%d", errno);
+        close(sock);
+        freeaddrinfo(result);
+        return ESP_FAIL;
+    }
+    freeaddrinfo(result);
+
+    char request[768];
+    int request_len = snprintf(request, sizeof(request),
+                               "GET %s HTTP/1.1\r\n"
+                               "Host: %s\r\n"
+                               "User-Agent: CodexPedometer/1.0\r\n"
+                               "Connection: close\r\n"
+                               "\r\n",
+                               path_start, host);
+    if (request_len <= 0 || request_len >= (int)sizeof(request)) {
+        close(sock);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int sent_total = 0;
+    while (sent_total < request_len) {
+        int sent = send(sock, request + sent_total, request_len - sent_total, 0);
+        if (sent <= 0) {
+            ESP_LOGW(TAG, "Weather send failed: errno=%d", errno);
+            close(sock);
+            return ESP_FAIL;
+        }
+        sent_total += sent;
+    }
+
+    while (response->length < (int)sizeof(response->body) - 1) {
+        int room = (int)sizeof(response->body) - response->length - 1;
+        int received = recv(sock, response->body + response->length, room, 0);
+        if (received > 0) {
+            response->length += received;
+            response->body[response->length] = '\0';
+            continue;
+        }
+        if (received == 0) {
+            break;
+        }
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            break;
+        }
+        ESP_LOGW(TAG, "Weather recv failed: errno=%d", errno);
+        close(sock);
+        return ESP_FAIL;
+    }
+    close(sock);
+
+    if (response->length == 0) {
+        ESP_LOGW(TAG, "Weather HTTP timeout/no data");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    int status_code = 0;
+    if (sscanf(response->body, "HTTP/%*s %d", &status_code) != 1) {
+        ESP_LOGW(TAG, "Weather HTTP response missing status line");
+        return ESP_FAIL;
+    }
+
+    char *body = strstr(response->body, "\r\n\r\n");
+    if (body == NULL) {
+        ESP_LOGW(TAG, "Weather HTTP response missing body");
+        return ESP_FAIL;
+    }
+    body += 4;
+    size_t header_len = (size_t)(body - response->body);
+    size_t body_len = (size_t)response->length - header_len;
+    memmove(response->body, body, body_len);
+    response->body[body_len] = '\0';
+    response->length = (int)body_len;
 
     if (status_code != 200) {
-        ESP_LOGW(TAG, "HTTP status: %d for %s", status_code, url);
+        ESP_LOGW(TAG, "Weather HTTP status: %d from %s", status_code, host);
         return ESP_FAIL;
     }
 
+    ESP_LOGI(TAG, "Weather HTTP OK, %d bytes", response->length);
     return ESP_OK;
 }
 
@@ -2555,10 +2744,15 @@ static esp_err_t fetch_weather(weather_data_t *weather)
     char display_city[WEATHER_CITY_STORAGE_SIZE];
     char adcode[16];
     char url[512];
-    http_response_t response;
+    http_response_t *response = NULL;
 
     if (!weather_api_key_configured()) {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    response = calloc(1, sizeof(*response));
+    if (response == NULL) {
+        return ESP_ERR_NO_MEM;
     }
 
     build_weather_query_city(s_weather_city, query_city, sizeof(query_city));
@@ -2574,35 +2768,44 @@ static esp_err_t fetch_weather(weather_data_t *weather)
     };
 
     render_weather_status("AMap HTTP");
+    ESP_LOGI(TAG, "Fetching AMap weather for %s (%s)", display_city, adcode);
     snprintf(url, sizeof(url),
-             "https://restapi.amap.com/v3/weather/weatherInfo?city=%s&key=%s&extensions=all&output=JSON",
+             "http://restapi.amap.com/v3/weather/weatherInfo?city=%s&key=%s&extensions=all&output=JSON",
              adcode, s_weather_api_key);
-    esp_err_t ret = http_get_url(url, WEATHER_HTTP_TIMEOUT_MS, true, &response);
+    esp_err_t ret = http_get_url(url, WEATHER_HTTP_TIMEOUT_MS, false, response);
     if (ret != ESP_OK) {
+        free(response);
         return ret;
     }
 
-    if (!parse_amap_weather_json(response.body, &parsed, display_city)) {
-        ESP_LOGW(TAG, "AMap weather parse failed: %s", response.body);
+    if (!parse_amap_weather_json(response->body, &parsed, display_city)) {
+        ESP_LOGW(TAG, "AMap weather parse failed: %s", response->body);
+        free(response);
         return ESP_FAIL;
     }
 
     *weather = parsed;
+    free(response);
     return ESP_OK;
 }
 
 static esp_err_t fetch_codex_usage(codex_usage_t *usage)
 {
-    http_response_t response = {0};
+    http_response_t *response = calloc(1, sizeof(*response));
+    if (response == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
     esp_http_client_config_t config = {
         .url = CODEX_USAGE_URL,
         .timeout_ms = CODEX_HTTP_TIMEOUT_MS,
         .event_handler = http_event_handler,
-        .user_data = &response,
+        .user_data = response,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
+        free(response);
         return ESP_FAIL;
     }
 
@@ -2612,19 +2815,23 @@ static esp_err_t fetch_codex_usage(codex_usage_t *usage)
 
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Codex usage request failed: %s", esp_err_to_name(ret));
+        free(response);
         return ret;
     }
 
     if (status_code != 200) {
         ESP_LOGW(TAG, "Codex usage HTTP status: %d", status_code);
+        free(response);
         return ESP_FAIL;
     }
 
-    if (!parse_codex_usage_json(response.body, usage)) {
-        ESP_LOGW(TAG, "Codex usage JSON parse failed: %s", response.body);
+    if (!parse_codex_usage_json(response->body, usage)) {
+        ESP_LOGW(TAG, "Codex usage JSON parse failed: %s", response->body);
+        free(response);
         return ESP_FAIL;
     }
 
+    free(response);
     return ESP_OK;
 }
 
@@ -2827,26 +3034,44 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
                              "<p class='hint'>天气使用高德开放平台 Web 服务。可填城市名，也可填 6 位高德 adcode，例如青岛 370200。</p>"
                              "<form method='post' action='/save'><label>选择 Wi-Fi</label><select name='ssid'>");
 
-    wifi_ap_record_t records[WIFI_SCAN_MAX_AP];
-    uint16_t ap_count = WIFI_SCAN_MAX_AP;
-    memset(records, 0, sizeof(records));
-    wifi_scan_config_t scan_config = {
-        .show_hidden = false,
-    };
-    esp_err_t ret = esp_wifi_scan_start(&scan_config, true);
-    if (ret == ESP_OK) {
-        ret = esp_wifi_scan_get_ap_records(&ap_count, records);
+    /* A blocking scan pulls the shared radio off the AP channel and can drop
+     * the provisioning client, so keep the dwell short and cache the results
+     * for a while: refreshing the page does not rescan. */
+    uint32_t scan_now = now_ms();
+    bool cache_fresh = s_wifi_scan_cache_count > 0 &&
+                       (scan_now - s_wifi_scan_cache_ms) < WIFI_SCAN_CACHE_MS;
+    if (!cache_fresh) {
+        uint16_t ap_count = WIFI_SCAN_MAX_AP;
+        wifi_scan_config_t scan_config = {
+            .show_hidden = false,
+            .scan_time = {
+                .active = {
+                    .min = 100,
+                    .max = 150,
+                },
+            },
+        };
+        esp_err_t ret = esp_wifi_scan_start(&scan_config, true);
+        if (ret == ESP_OK) {
+            ret = esp_wifi_scan_get_ap_records(&ap_count, s_wifi_scan_cache);
+        }
+        if (ret == ESP_OK && ap_count > 0) {
+            s_wifi_scan_cache_count = ap_count;
+            s_wifi_scan_cache_ms = scan_now;
+        } else {
+            ESP_LOGW(TAG, "Config page Wi-Fi scan failed: %s", esp_err_to_name(ret));
+        }
     }
 
-    if (ret == ESP_OK && ap_count > 0) {
-        for (uint16_t i = 0; i < ap_count; i++) {
+    if (s_wifi_scan_cache_count > 0) {
+        for (uint16_t i = 0; i < s_wifi_scan_cache_count; i++) {
             char ssid[WIFI_SSID_STORAGE_SIZE];
             char escaped[WIFI_SSID_STORAGE_SIZE];
             char option[160];
-            copy_string(ssid, sizeof(ssid), (const char *)records[i].ssid);
+            copy_string(ssid, sizeof(ssid), (const char *)s_wifi_scan_cache[i].ssid);
             html_escape_copy(escaped, sizeof(escaped), ssid);
             snprintf(option, sizeof(option), "<option value='%s'>%s (%d dBm)</option>",
-                     escaped, escaped, records[i].rssi);
+                     escaped, escaped, s_wifi_scan_cache[i].rssi);
             httpd_resp_sendstr_chunk(req, option);
         }
     } else {
@@ -2876,6 +3101,16 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
              "<input name='weather_key' maxlength='79' value='%s' placeholder='在高德开放平台申请 Web服务 Key'>",
              escaped_key);
     httpd_resp_sendstr_chunk(req, key_input);
+
+    char goal_input[220];
+    snprintf(goal_input, sizeof(goal_input),
+             "<label>每日步数目标</label>"
+             "<input name='step_goal' type='number' min='%lu' max='%lu' value='%lu'>",
+             (unsigned long)PEDOMETER_MIN_GOAL_STEPS,
+             (unsigned long)PEDOMETER_MAX_GOAL_STEPS,
+             (unsigned long)s_pedometer_goal_steps);
+    httpd_resp_sendstr_chunk(req, goal_input);
+
     httpd_resp_sendstr_chunk(req,
                              "<button type='submit'>保存并连接</button></form>"
                              "<p class='hint'>当前保存 SSID: ");
@@ -2890,18 +3125,25 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
 
 static esp_err_t config_page_post_handler(httpd_req_t *req)
 {
-    char body[768];
+    size_t body_size = 1024;
+    char *body = calloc(1, body_size);
+    if (body == NULL) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "Out of memory");
+        return ESP_OK;
+    }
     int total = 0;
     int remaining = req->content_len;
-    while (remaining > 0 && total < (int)sizeof(body) - 1) {
+    while (remaining > 0 && total < (int)body_size - 1) {
         int recv_len = httpd_req_recv(req, body + total,
-                                      remaining < (int)sizeof(body) - 1 - total
+                                      remaining < (int)body_size - 1 - total
                                           ? remaining
-                                          : (int)sizeof(body) - 1 - total);
+                                          : (int)body_size - 1 - total);
         if (recv_len <= 0) {
             if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
                 continue;
             }
+            free(body);
             return ESP_FAIL;
         }
         total += recv_len;
@@ -2914,11 +3156,13 @@ static esp_err_t config_page_post_handler(httpd_req_t *req)
     char password[WIFI_PASSWORD_STORAGE_SIZE];
     char weather_city[WEATHER_CITY_STORAGE_SIZE];
     char weather_key[WEATHER_KEY_STORAGE_SIZE];
+    char step_goal_text[16];
     (void)get_form_value(body, "ssid", ssid, sizeof(ssid));
     (void)get_form_value(body, "manual_ssid", manual_ssid, sizeof(manual_ssid));
     (void)get_form_value(body, "password", password, sizeof(password));
     (void)get_form_value(body, "weather_city", weather_city, sizeof(weather_city));
     (void)get_form_value(body, "weather_key", weather_key, sizeof(weather_key));
+    (void)get_form_value(body, "step_goal", step_goal_text, sizeof(step_goal_text));
     if (manual_ssid[0] != '\0') {
         copy_string(ssid, sizeof(ssid), manual_ssid);
     }
@@ -2936,6 +3180,17 @@ static esp_err_t config_page_post_handler(httpd_req_t *req)
     if (ret == ESP_OK && weather_key[0] != '\0') {
         ret = save_weather_api_key(weather_key);
         weather_changed = ret == ESP_OK;
+    }
+    if (ret == ESP_OK && step_goal_text[0] != '\0') {
+        char *end = NULL;
+        unsigned long parsed_goal = strtoul(step_goal_text, &end, 10);
+        if (end != step_goal_text && *end == '\0' &&
+            parsed_goal >= PEDOMETER_MIN_GOAL_STEPS &&
+            parsed_goal <= PEDOMETER_MAX_GOAL_STEPS) {
+            ret = save_pedometer_goal((uint32_t)parsed_goal);
+        } else {
+            ret = ESP_ERR_INVALID_ARG;
+        }
     }
     if (ret == ESP_OK && weather_changed) {
         s_last_weather.valid = false;
@@ -2960,6 +3215,7 @@ static esp_err_t config_page_post_handler(httpd_req_t *req)
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_sendstr(req, "Save failed");
     }
+    free(body);
     return ESP_OK;
 }
 
@@ -2972,6 +3228,7 @@ static esp_err_t start_config_web_server(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.lru_purge_enable = true;
+    config.stack_size = 4096;
     esp_err_t ret = httpd_start(&s_config_server, &config);
     if (ret != ESP_OK) {
         return ret;
@@ -2999,8 +3256,22 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     (void)arg;
     (void)event_data;
 
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        if (wifi_configured()) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
+        s_ap_client_count++;
+        ESP_LOGI(TAG, "Setup AP client joined (%d); STA retries paused", s_ap_client_count);
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        if (s_ap_client_count > 0) {
+            s_ap_client_count--;
+        }
+        ESP_LOGI(TAG, "Setup AP client left (%d)", s_ap_client_count);
+        if (s_ap_client_count == 0 && wifi_configured() && s_wifi_event_group != NULL &&
+            (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) == 0) {
+            s_wifi_retry_num = 0;
+            xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            esp_wifi_connect();
+        }
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        if (wifi_configured() && s_ap_client_count == 0) {
             esp_wifi_connect();
         }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -3009,7 +3280,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             xEventGroupSetBits(s_wifi_event_group, WEATHER_REFRESH_REQUEST_BIT);
         }
         render_weather_status("Wi-Fi reconnecting");
-        if (wifi_configured() && s_wifi_retry_num < WIFI_MAXIMUM_RETRY) {
+        if (s_ap_client_count > 0) {
+            /* A phone is provisioning on the setup AP: keep the radio parked
+             * on the AP channel instead of scanning for the router. */
+            if (s_wifi_event_group != NULL) {
+                xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            }
+        } else if (wifi_configured() && s_wifi_retry_num < WIFI_MAXIMUM_RETRY) {
             esp_wifi_connect();
             s_wifi_retry_num++;
             ESP_LOGI(TAG, "Retry Wi-Fi connection: %d", s_wifi_retry_num);
@@ -3084,6 +3361,9 @@ static esp_err_t start_wifi_station(void)
         ESP_RETURN_ON_ERROR(apply_station_config(), TAG, "set STA config failed");
     }
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "start wifi failed");
+    /* Modem power save makes softAP beaconing irregular; keep it off so the
+     * setup hotspot stays discoverable. */
+    (void)esp_wifi_set_ps(WIFI_PS_NONE);
 
     s_wifi_started = true;
     ESP_RETURN_ON_ERROR(start_config_web_server(), TAG, "start config web failed");
@@ -3197,8 +3477,10 @@ static void codex_usage_task(void *arg)
         } else if ((bits & WIFI_FAIL_BIT) != 0) {
             render_codex_status("Wi-Fi failed");
             render_time_page();
-            vTaskDelay(pdMS_TO_TICKS(5000));
-            reconnect_station();
+            vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_BACKOFF_MS));
+            if (s_ap_client_count == 0) {
+                reconnect_station();
+            }
         } else {
             render_codex_status("Wi-Fi timeout");
             render_time_page();
@@ -3210,6 +3492,7 @@ static void weather_task(void *arg)
 {
     (void)arg;
 
+    ESP_LOGI(TAG, "Weather task started");
     esp_err_t ret = start_wifi_station();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Wi-Fi start failed for weather: %s", esp_err_to_name(ret));
@@ -3220,17 +3503,20 @@ static void weather_task(void *arg)
 
     while (true) {
         if (!wifi_configured() || s_weather_city[0] == '\0') {
+            ESP_LOGW(TAG, "Weather waiting: Wi-Fi or city missing");
             render_weather_status("Open setup AP");
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
         if (!weather_api_key_configured()) {
+            ESP_LOGW(TAG, "Weather waiting: AMap key missing");
             render_weather_status("Set AMap key");
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
 
         if (s_wifi_event_group == NULL) {
+            ESP_LOGW(TAG, "Weather waiting: Wi-Fi event group missing");
             render_weather_status("Wi-Fi not started");
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
@@ -3245,7 +3531,7 @@ static void weather_task(void *arg)
             ret = fetch_weather(&weather);
             if (ret == ESP_OK) {
                 s_last_weather = weather;
-                render_weather(&s_last_weather, "AMap");
+                render_weather(&s_last_weather, "");
             } else {
                 ESP_LOGW(TAG, "Weather refresh failed: %s", esp_err_to_name(ret));
                 render_weather_status("Weather offline");
@@ -3256,9 +3542,13 @@ static void weather_task(void *arg)
                                       pdTRUE, pdFALSE,
                                       pdMS_TO_TICKS(WEATHER_POLL_INTERVAL_MS));
         } else if ((bits & WIFI_FAIL_BIT) != 0) {
+            /* Reconnect attempts are owned by codex_usage_task; driving them
+             * from here too would defeat the retry backoff. */
             render_weather_status("Wi-Fi failed");
-            vTaskDelay(pdMS_TO_TICKS(5000));
-            reconnect_station();
+            (void)xEventGroupWaitBits(s_wifi_event_group,
+                                      WIFI_CONNECTED_BIT | WEATHER_REFRESH_REQUEST_BIT,
+                                      pdFALSE, pdFALSE,
+                                      pdMS_TO_TICKS(WIFI_RETRY_BACKOFF_MS));
         } else {
             render_weather_status("Wi-Fi connecting");
             (void)xEventGroupWaitBits(s_wifi_event_group,
@@ -3290,6 +3580,9 @@ static void app_display_rounder_event_cb(lv_event_t *event)
 static lv_display_t *app_display_start(void)
 {
     esp_lv_adapter_config_t adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG();
+    /* Wi-Fi runs at priority 23 on core 0; keep the LVGL worker on core 1 so
+     * scans cannot starve it while it holds the LVGL lock. */
+    adapter_cfg.task_core_id = 1;
     if (esp_lv_adapter_init(&adapter_cfg) != ESP_OK) {
         ESP_LOGE(TAG, "LVGL adapter init failed");
         return NULL;
@@ -3384,6 +3677,7 @@ void app_main(void)
     render_weather_status(wifi_configured() ? "Wi-Fi not started" : "Edit Wi-Fi config");
     render_pedometer(0, 0, "Waiting for QMI8658");
     render_codex_status(wifi_configured() ? "Wi-Fi not started" : "Edit Wi-Fi config");
+    request_full_screen_refresh();
 
     init_reset_button();
     init_battery_monitor();
@@ -3405,11 +3699,15 @@ void app_main(void)
         render_pedometer(0, 0, "QMI8658 offline");
     }
 
-    if (xTaskCreate(codex_usage_task, "codex_usage_task", 6144, NULL, 4, NULL) != pdPASS) {
-        render_codex_status("Codex task failed");
-    }
-    if (xTaskCreate(weather_task, "weather_task", 8192, NULL, 4, NULL) != pdPASS) {
+    if (xTaskCreate(weather_task, "weather_task", 5120, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Weather task create failed");
         render_weather_status("Weather task failed");
+    } else {
+        ESP_LOGI(TAG, "Weather task created");
+    }
+    if (xTaskCreate(codex_usage_task, "codex_usage_task", 4096, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Codex task create failed");
+        render_codex_status("Codex task failed");
     }
     xTaskCreate(screenshot_console_task, "shot_console", SCREENSHOT_CMD_TASK_STACK, NULL, 2,
                 NULL);
