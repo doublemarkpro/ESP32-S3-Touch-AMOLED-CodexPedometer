@@ -14,6 +14,7 @@
 #include "driver/gpio.h"
 #include "esp_attr.h"
 #include "esp_check.h"
+#include "esp_crt_bundle.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
@@ -104,8 +105,10 @@
 #define WIFI_NVS_NAMESPACE "wifi_cfg"
 #define WIFI_NVS_SSID_KEY "ssid"
 #define WIFI_NVS_PASSWORD_KEY "pass"
+#define WEATHER_NVS_CITY_KEY "weather_city"
 #define WIFI_SSID_STORAGE_SIZE 33
 #define WIFI_PASSWORD_STORAGE_SIZE 65
+#define WEATHER_CITY_STORAGE_SIZE 64
 #define WIFI_SCAN_MAX_AP 16
 
 /* 100 ms tick gives a sweeping second hand; labels and the other hands
@@ -122,7 +125,9 @@
 
 #define CODEX_POLL_INTERVAL_MS 15000
 #define CODEX_HTTP_TIMEOUT_MS 5000
-#define HTTP_RESPONSE_BUFFER_SIZE 1024
+#define WEATHER_POLL_INTERVAL_MS 1800000
+#define WEATHER_HTTP_TIMEOUT_MS 8000
+#define HTTP_RESPONSE_BUFFER_SIZE 2048
 #define SCREENSHOT_CMD_TASK_STACK 4096
 #define DEBUG_AUTO_DELAY_MS 5000
 #define UI_ROUND_VISIBLE_RADIUS (BSP_LCD_H_RES / 2)
@@ -187,6 +192,7 @@
 
 typedef enum {
     APP_PAGE_TIME,
+    APP_PAGE_WEATHER,
     APP_PAGE_PEDOMETER,
     APP_PAGE_CODEX,
     APP_PAGE_COUNT,
@@ -229,6 +235,22 @@ typedef struct {
 
 typedef struct {
     lv_obj_t *page;
+    lv_obj_t *temp_arc;
+    lv_obj_t *icon_bg;
+    lv_obj_t *icon_label;
+    lv_obj_t *city_label;
+    lv_obj_t *temp_label;
+    lv_obj_t *condition_label;
+    lv_obj_t *range_label;
+    lv_obj_t *status_label;
+    lv_obj_t *low_value_label;
+    lv_obj_t *high_value_label;
+    lv_obj_t *code_value_label;
+    lv_obj_t *updated_label;
+} weather_ui_t;
+
+typedef struct {
+    lv_obj_t *page;
     lv_obj_t *progress_arc;
     lv_obj_t *main_icon;
     lv_obj_t *steps_label;
@@ -266,6 +288,18 @@ typedef struct {
 } codex_usage_t;
 
 typedef struct {
+    char city[WEATHER_CITY_STORAGE_SIZE];
+    char region[WEATHER_CITY_STORAGE_SIZE];
+    char condition[32];
+    char updated[40];
+    int weather_code;
+    int current_temp_c;
+    int min_temp_c;
+    int max_temp_c;
+    bool valid;
+} weather_data_t;
+
+typedef struct {
     char body[HTTP_RESPONSE_BUFFER_SIZE];
     int length;
 } http_response_t;
@@ -278,9 +312,11 @@ typedef struct {
 static const char *TAG = "codex_pedometer";
 static status_ui_t s_status_ui;
 static time_ui_t s_time_ui;
+static weather_ui_t s_weather_ui;
 static pedometer_ui_t s_pedometer_ui;
 static codex_ui_t s_codex_ui;
 static lv_obj_t *s_dot_time;
+static lv_obj_t *s_dot_weather;
 static lv_obj_t *s_dot_pedometer;
 static lv_obj_t *s_dot_codex;
 static app_page_t s_current_page = APP_PAGE_TIME;
@@ -297,6 +333,7 @@ static volatile bool s_ntp_sync_in_progress;
 static uint32_t s_last_ntp_attempt_ms;
 static httpd_handle_t s_config_server;
 static wifi_credentials_t s_wifi_credentials;
+static char s_weather_city[WEATHER_CITY_STORAGE_SIZE];
 
 static volatile bool s_reset_requested;
 static uint32_t s_step_count;
@@ -312,9 +349,21 @@ static codex_usage_t s_last_codex_usage = {
     .limit_tokens = 500000,
     .updated = "boot",
 };
+static weather_data_t s_last_weather = {
+    .city = WEATHER_CITY,
+    .region = "中国",
+    .condition = "等待天气",
+    .updated = "boot",
+    .weather_code = 0,
+    .current_temp_c = 0,
+    .min_temp_c = 0,
+    .max_temp_c = 0,
+    .valid = false,
+};
 
 static void page_nav_event_cb(lv_event_t *event);
 static void render_time_page(void);
+static void render_weather_status(const char *status_text);
 static void update_time_page_locked(void);
 static void screenshot_console_task(void *arg);
 
@@ -326,6 +375,17 @@ static uint32_t now_ms(void)
 static uint32_t clamp_u32(uint32_t value, uint32_t max_value)
 {
     return value > max_value ? max_value : value;
+}
+
+static int clamp_int(int value, int min_value, int max_value)
+{
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
 }
 
 static bool config_value_is_set(const char *value, const char *placeholder)
@@ -344,6 +404,11 @@ static bool codex_configured(void)
            config_value_is_set(CODEX_USAGE_URL, "http://YOUR_PC_IP:8765/usage");
 }
 
+static bool weather_configured(void)
+{
+    return wifi_configured() && s_weather_city[0] != '\0';
+}
+
 static void copy_string(char *dest, size_t dest_size, const char *src)
 {
     if (dest_size == 0) {
@@ -359,16 +424,23 @@ static void copy_string(char *dest, size_t dest_size, const char *src)
 static void load_wifi_credentials(void)
 {
     memset(&s_wifi_credentials, 0, sizeof(s_wifi_credentials));
+    copy_string(s_weather_city, sizeof(s_weather_city), WEATHER_CITY);
+    copy_string(s_last_weather.city, sizeof(s_last_weather.city), WEATHER_CITY);
 
     nvs_handle_t nvs;
     esp_err_t ret = nvs_open(WIFI_NVS_NAMESPACE, NVS_READONLY, &nvs);
     if (ret == ESP_OK) {
         size_t ssid_len = sizeof(s_wifi_credentials.ssid);
         size_t pass_len = sizeof(s_wifi_credentials.password);
+        size_t city_len = sizeof(s_weather_city);
         esp_err_t ssid_ret =
             nvs_get_str(nvs, WIFI_NVS_SSID_KEY, s_wifi_credentials.ssid, &ssid_len);
         esp_err_t pass_ret =
             nvs_get_str(nvs, WIFI_NVS_PASSWORD_KEY, s_wifi_credentials.password, &pass_len);
+        esp_err_t city_ret = nvs_get_str(nvs, WEATHER_NVS_CITY_KEY, s_weather_city, &city_len);
+        if (city_ret == ESP_OK && s_weather_city[0] != '\0') {
+            copy_string(s_last_weather.city, sizeof(s_last_weather.city), s_weather_city);
+        }
         nvs_close(nvs);
         if (ssid_ret == ESP_OK) {
             if (pass_ret != ESP_OK) {
@@ -386,6 +458,31 @@ static void load_wifi_credentials(void)
         ESP_LOGI(TAG, "Using fallback Wi-Fi credentials from app_config.h: %s",
                  s_wifi_credentials.ssid);
     }
+}
+
+static esp_err_t save_weather_city(const char *city)
+{
+    if (city == NULL || city[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t nvs;
+    esp_err_t ret = nvs_open(WIFI_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = nvs_set_str(nvs, WEATHER_NVS_CITY_KEY, city);
+    if (ret == ESP_OK) {
+        ret = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+
+    if (ret == ESP_OK) {
+        copy_string(s_weather_city, sizeof(s_weather_city), city);
+        copy_string(s_last_weather.city, sizeof(s_last_weather.city), city);
+    }
+    return ret;
 }
 
 static esp_err_t save_wifi_credentials(const char *ssid, const char *password)
@@ -422,6 +519,8 @@ static const char *page_name(app_page_t page)
     switch (page) {
     case APP_PAGE_TIME:
         return "time";
+    case APP_PAGE_WEATHER:
+        return "weather";
     case APP_PAGE_PEDOMETER:
         return "pedometer";
     case APP_PAGE_CODEX:
@@ -602,6 +701,7 @@ static void move_overlay_ui_foreground_locked(void)
         s_status_ui.title_label,
         s_status_ui.battery_icon,
         s_dot_time,
+        s_dot_weather,
         s_dot_pedometer,
         s_dot_codex,
     };
@@ -626,7 +726,9 @@ static void update_status_bar_locked(void)
     set_label_text_if_changed(s_status_ui.time_label, time_text);
 
     const char *title = "TIME";
-    if (s_current_page == APP_PAGE_PEDOMETER) {
+    if (s_current_page == APP_PAGE_WEATHER) {
+        title = "WEATHER";
+    } else if (s_current_page == APP_PAGE_PEDOMETER) {
         title = "QMI8658";
     } else if (s_current_page == APP_PAGE_CODEX) {
         title = "CODEX";
@@ -697,40 +799,50 @@ static lv_obj_t *create_metric_column(lv_obj_t *parent, int32_t x_ofs, bool with
 
 static void update_page_dots_locked(void)
 {
-    if (s_dot_time == NULL || s_dot_pedometer == NULL || s_dot_codex == NULL) {
+    if (s_dot_time == NULL || s_dot_weather == NULL ||
+        s_dot_pedometer == NULL || s_dot_codex == NULL) {
         return;
     }
 
     bool time_active = s_current_page == APP_PAGE_TIME;
+    bool weather_active = s_current_page == APP_PAGE_WEATHER;
     bool pedometer_active = s_current_page == APP_PAGE_PEDOMETER;
     bool codex_active = s_current_page == APP_PAGE_CODEX;
 
     lv_obj_set_size(s_dot_time, time_active ? 22 : 5, 5);
+    lv_obj_set_size(s_dot_weather, weather_active ? 22 : 5, 5);
     lv_obj_set_size(s_dot_pedometer, pedometer_active ? 22 : 5, 5);
     lv_obj_set_size(s_dot_codex, codex_active ? 22 : 5, 5);
     lv_obj_set_style_bg_color(s_dot_time,
                               lv_color_hex(time_active ? 0xF7FBFF : 0x32404E), 0);
+    lv_obj_set_style_bg_color(s_dot_weather,
+                              lv_color_hex(weather_active ? 0xFFD166 : 0x32404E), 0);
     lv_obj_set_style_bg_color(s_dot_pedometer,
                               lv_color_hex(pedometer_active ? 0x18D7F5 : 0x32404E), 0);
     lv_obj_set_style_bg_color(s_dot_codex,
                               lv_color_hex(codex_active ? 0xFFD166 : 0x32404E), 0);
-    lv_obj_align(s_dot_time, LV_ALIGN_BOTTOM_MID, -32, -8);
-    lv_obj_align(s_dot_pedometer, LV_ALIGN_BOTTOM_MID, 0, -8);
-    lv_obj_align(s_dot_codex, LV_ALIGN_BOTTOM_MID, 32, -8);
+    lv_obj_align(s_dot_time, LV_ALIGN_BOTTOM_MID, -48, -8);
+    lv_obj_align(s_dot_weather, LV_ALIGN_BOTTOM_MID, -16, -8);
+    lv_obj_align(s_dot_pedometer, LV_ALIGN_BOTTOM_MID, 16, -8);
+    lv_obj_align(s_dot_codex, LV_ALIGN_BOTTOM_MID, 48, -8);
 }
 
 static void enforce_page_visibility_locked(void)
 {
     bool time_active = s_current_page == APP_PAGE_TIME;
+    bool weather_active = s_current_page == APP_PAGE_WEATHER;
     bool pedometer_active = s_current_page == APP_PAGE_PEDOMETER;
     bool codex_active = s_current_page == APP_PAGE_CODEX;
 
     set_obj_tree_hidden(s_time_ui.page, !time_active);
+    set_obj_tree_hidden(s_weather_ui.page, !weather_active);
     set_obj_tree_hidden(s_pedometer_ui.page, !pedometer_active);
     set_obj_tree_hidden(s_codex_ui.page, !codex_active);
 
     if (time_active && s_time_ui.page != NULL) {
         lv_obj_move_foreground(s_time_ui.page);
+    } else if (weather_active && s_weather_ui.page != NULL) {
+        lv_obj_move_foreground(s_weather_ui.page);
     } else if (pedometer_active && s_pedometer_ui.page != NULL) {
         lv_obj_move_foreground(s_pedometer_ui.page);
     } else if (codex_active && s_codex_ui.page != NULL) {
@@ -1033,6 +1145,104 @@ static void create_time_page(lv_obj_t *parent)
     lv_obj_clear_flag(cap_inner, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 }
 
+static lv_obj_t *create_weather_icon_visual(lv_obj_t *parent)
+{
+    lv_obj_t *bg = lv_obj_create(parent);
+    lv_obj_remove_style_all(bg);
+    lv_obj_set_size(bg, 74, 74);
+    lv_obj_align(bg, LV_ALIGN_CENTER, 0, UI_MAIN_ICON_CENTER_Y);
+    lv_obj_set_style_radius(bg, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(bg, lv_color_hex(0xFFD166), 0);
+    lv_obj_set_style_bg_opa(bg, LV_OPA_COVER, 0);
+    lv_obj_set_style_shadow_width(bg, 22, 0);
+    lv_obj_set_style_shadow_color(bg, lv_color_hex(0xFFD166), 0);
+    lv_obj_set_style_shadow_opa(bg, LV_OPA_40, 0);
+    lv_obj_clear_flag(bg, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
+    s_weather_ui.icon_label = create_label(bg, LV_SYMBOL_BULLET, FONT_TITLE,
+                                           lv_color_hex(0x111820));
+    lv_obj_center(s_weather_ui.icon_label);
+    return bg;
+}
+
+static void create_weather_page(lv_obj_t *parent)
+{
+    s_weather_ui.page = create_page(parent);
+
+    s_weather_ui.temp_arc = lv_arc_create(s_weather_ui.page);
+    lv_obj_set_size(s_weather_ui.temp_arc, UI_ARC_SIZE, UI_ARC_SIZE);
+    lv_obj_align(s_weather_ui.temp_arc, LV_ALIGN_TOP_MID, 0, UI_ARC_TOP);
+    lv_arc_set_range(s_weather_ui.temp_arc, -30, 45);
+    lv_arc_set_value(s_weather_ui.temp_arc, 0);
+    lv_arc_set_rotation(s_weather_ui.temp_arc, 135);
+    lv_arc_set_bg_angles(s_weather_ui.temp_arc, 0, 270);
+    lv_obj_remove_style(s_weather_ui.temp_arc, NULL, LV_PART_KNOB);
+    lv_obj_clear_flag(s_weather_ui.temp_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(s_weather_ui.temp_arc, UI_ARC_WIDTH, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_weather_ui.temp_arc, UI_ARC_WIDTH, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(s_weather_ui.temp_arc, true, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_weather_ui.temp_arc, lv_color_hex(0x17212B), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_weather_ui.temp_arc, lv_color_hex(0xFFD166),
+                               LV_PART_INDICATOR);
+
+    s_weather_ui.city_label = create_label(s_weather_ui.page, WEATHER_CITY, FONT_CJK,
+                                           lv_color_hex(0x8DDFFF));
+    lv_obj_set_width(s_weather_ui.city_label, 280);
+    lv_obj_set_style_text_align(s_weather_ui.city_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_weather_ui.city_label, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_weather_ui.city_label, LV_ALIGN_CENTER, 0, -154);
+
+    s_weather_ui.icon_bg = create_weather_icon_visual(s_weather_ui.page);
+
+    lv_obj_t *caption = create_label(s_weather_ui.page, "WEATHER", FONT_TITLE,
+                                     lv_color_hex(0xE6EDF5));
+    lv_obj_align(caption, LV_ALIGN_CENTER, 0, UI_CAPTION_CENTER_Y);
+
+    s_weather_ui.temp_label = create_label(s_weather_ui.page, "--°", FONT_STEPS,
+                                           lv_color_hex(0xF7FBFF));
+    lv_obj_set_width(s_weather_ui.temp_label, 300);
+    lv_obj_set_style_text_align(s_weather_ui.temp_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_weather_ui.temp_label, LV_LABEL_LONG_CLIP);
+    lv_obj_align(s_weather_ui.temp_label, LV_ALIGN_CENTER, 0, UI_VALUE_CENTER_Y);
+
+    s_weather_ui.condition_label = create_label(s_weather_ui.page, "等待天气", FONT_CJK,
+                                                lv_color_hex(0xFFD166));
+    lv_obj_set_width(s_weather_ui.condition_label, 280);
+    lv_obj_set_style_text_align(s_weather_ui.condition_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_weather_ui.condition_label, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_weather_ui.condition_label, LV_ALIGN_CENTER, 0, UI_GOAL_CENTER_Y);
+
+    s_weather_ui.range_label = create_label(s_weather_ui.page, "-- / --", FONT_MEDIUM,
+                                            lv_color_hex(0xF7FBFF));
+    lv_obj_set_width(s_weather_ui.range_label, 260);
+    lv_obj_set_style_text_align(s_weather_ui.range_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_weather_ui.range_label, LV_LABEL_LONG_CLIP);
+    lv_obj_align(s_weather_ui.range_label, LV_ALIGN_CENTER, 0, UI_STATUS_CENTER_Y);
+
+    s_weather_ui.status_label = create_label(s_weather_ui.page, "Open setup AP", FONT_SMALL,
+                                             lv_color_hex(0x92A0AD));
+    lv_obj_set_width(s_weather_ui.status_label, 320);
+    lv_obj_set_style_text_align(s_weather_ui.status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_weather_ui.status_label, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_weather_ui.status_label, LV_ALIGN_CENTER, 0, UI_STATUS_CENTER_Y + 24);
+
+    s_weather_ui.low_value_label =
+        create_metric_column(s_weather_ui.page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED,
+                             "LOW", "--");
+    s_weather_ui.high_value_label =
+        create_metric_column(s_weather_ui.page, 0, false, METRIC_ICON_LIMIT, "HIGH", "--");
+    s_weather_ui.code_value_label =
+        create_metric_column(s_weather_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LEFT,
+                             "CODE", "--");
+
+    s_weather_ui.updated_label = create_label(s_weather_ui.page, "Updated boot", FONT_SMALL,
+                                              lv_color_hex(0x63717F));
+    lv_obj_set_width(s_weather_ui.updated_label, 260);
+    lv_obj_set_style_text_align(s_weather_ui.updated_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_weather_ui.updated_label, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_weather_ui.updated_label, LV_ALIGN_CENTER, 0, UI_UPDATED_CENTER_Y);
+}
+
 static void create_pedometer_page(lv_obj_t *parent)
 {
     s_pedometer_ui.page = create_page(parent);
@@ -1158,6 +1368,13 @@ static void create_page_dots(lv_obj_t *parent)
     lv_obj_set_style_border_width(s_dot_time, 0, 0);
     lv_obj_clear_flag(s_dot_time, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
+    s_dot_weather = lv_obj_create(parent);
+    lv_obj_set_size(s_dot_weather, 5, 5);
+    lv_obj_set_style_radius(s_dot_weather, 3, 0);
+    lv_obj_set_style_bg_opa(s_dot_weather, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_dot_weather, 0, 0);
+    lv_obj_clear_flag(s_dot_weather, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
     s_dot_pedometer = lv_obj_create(parent);
     lv_obj_set_size(s_dot_pedometer, 5, 5);
     lv_obj_set_style_radius(s_dot_pedometer, 3, 0);
@@ -1180,8 +1397,9 @@ static void create_app_ui(void)
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-    create_pedometer_page(scr);
     create_codex_page(scr);
+    create_pedometer_page(scr);
+    create_weather_page(scr);
     create_time_page(scr);
     create_status_bar(scr);
     create_page_dots(scr);
@@ -1322,6 +1540,14 @@ static void dump_layout_report(void)
     print_area_report("OBJ", "weekday_value", s_time_ui.weekday_label, false);
     print_area_report("OBJ", "date_day", s_time_ui.day_label, false);
 
+    print_area_report("ARC", "weather_arc", s_weather_ui.temp_arc, false);
+    print_area_report("OBJ", "weather_icon_bg", s_weather_ui.icon_bg, false);
+    print_area_report("OBJ", "weather_city", s_weather_ui.city_label, false);
+    print_area_report("OBJ", "weather_temp", s_weather_ui.temp_label, true);
+    print_area_report("OBJ", "weather_condition", s_weather_ui.condition_label, false);
+    print_area_report("OBJ", "weather_range", s_weather_ui.range_label, false);
+    print_area_report("OBJ", "weather_status", s_weather_ui.status_label, false);
+
     print_area_report("ARC", "pedometer_arc", s_pedometer_ui.progress_arc, false);
     print_area_report("OBJ", "pedometer_icon", s_pedometer_ui.main_icon, false);
     print_area_report("OBJ", "steps_value", s_pedometer_ui.steps_label, true);
@@ -1340,6 +1566,7 @@ static void dump_layout_report(void)
     print_area_report("OBJ", "limit_value", s_codex_ui.limit_value_label, true);
     print_area_report("OBJ", "left_value", s_codex_ui.left_value_label, true);
     print_area_report("OBJ", "page_dot_time", s_dot_time, false);
+    print_area_report("OBJ", "page_dot_weather", s_dot_weather, false);
     print_area_report("OBJ", "page_dot_pedometer", s_dot_pedometer, false);
     print_area_report("OBJ", "page_dot_codex", s_dot_codex, false);
 
@@ -1349,6 +1576,9 @@ static void dump_layout_report(void)
     print_label_text_report("temperature", s_time_ui.temp_label);
     print_label_text_report("weekday", s_time_ui.weekday_label);
     print_label_text_report("date_day", s_time_ui.day_label);
+    print_label_text_report("weather_city", s_weather_ui.city_label);
+    print_label_text_report("weather_temp", s_weather_ui.temp_label);
+    print_label_text_report("weather_condition", s_weather_ui.condition_label);
     print_label_text_report("steps_value", s_pedometer_ui.steps_label);
     print_label_text_report("codex_percent", s_codex_ui.percent_label);
     print_label_text_report("codex_status", s_codex_ui.status_label);
@@ -1620,6 +1850,153 @@ static void render_pedometer(uint32_t steps, int motion_mg, const char *status_t
     bsp_display_unlock();
 }
 
+static const char *weather_condition_text(int code)
+{
+    switch (code) {
+    case 0:
+        return "晴";
+    case 1:
+    case 2:
+        return "少云";
+    case 3:
+        return "多云";
+    case 45:
+    case 48:
+        return "有雾";
+    case 51:
+    case 53:
+    case 55:
+    case 56:
+    case 57:
+        return "毛毛雨";
+    case 61:
+    case 63:
+    case 65:
+    case 66:
+    case 67:
+    case 80:
+    case 81:
+    case 82:
+        return "降雨";
+    case 71:
+    case 73:
+    case 75:
+    case 77:
+    case 85:
+    case 86:
+        return "降雪";
+    case 95:
+    case 96:
+    case 99:
+        return "雷雨";
+    default:
+        return "天气";
+    }
+}
+
+static const char *weather_icon_symbol(int code)
+{
+    if (code == 0) {
+        return LV_SYMBOL_BULLET;
+    }
+    if (code == 45 || code == 48) {
+        return LV_SYMBOL_BARS;
+    }
+    if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) {
+        return LV_SYMBOL_TINT;
+    }
+    if ((code >= 71 && code <= 77) || code == 85 || code == 86) {
+        return "*";
+    }
+    if (code >= 95) {
+        return LV_SYMBOL_CHARGE;
+    }
+    return LV_SYMBOL_IMAGE;
+}
+
+static uint32_t weather_accent_color(int code)
+{
+    if (code == 0) {
+        return 0xFFD166;
+    }
+    if (code == 45 || code == 48) {
+        return 0xA1AAB5;
+    }
+    if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) {
+        return 0x18D7F5;
+    }
+    if ((code >= 71 && code <= 77) || code == 85 || code == 86) {
+        return 0xD9F4FF;
+    }
+    if (code >= 95) {
+        return 0xFFD60A;
+    }
+    return 0x8EA4B8;
+}
+
+static void render_weather(const weather_data_t *weather, const char *status_text)
+{
+    const weather_data_t *data = weather != NULL ? weather : &s_last_weather;
+    uint32_t accent = weather_accent_color(data->weather_code);
+
+    char temp_text[16];
+    char range_text[32];
+    char low_text[16];
+    char high_text[16];
+    char code_text[16];
+    char updated_text[56];
+
+    if (data->valid) {
+        snprintf(temp_text, sizeof(temp_text), "%d°", data->current_temp_c);
+        snprintf(range_text, sizeof(range_text), "%d° / %d°", data->min_temp_c,
+                 data->max_temp_c);
+        snprintf(low_text, sizeof(low_text), "%d°", data->min_temp_c);
+        snprintf(high_text, sizeof(high_text), "%d°", data->max_temp_c);
+        snprintf(code_text, sizeof(code_text), "%d", data->weather_code);
+    } else {
+        snprintf(temp_text, sizeof(temp_text), "--°");
+        snprintf(range_text, sizeof(range_text), "-- / --");
+        snprintf(low_text, sizeof(low_text), "--");
+        snprintf(high_text, sizeof(high_text), "--");
+        snprintf(code_text, sizeof(code_text), "--");
+    }
+    snprintf(updated_text, sizeof(updated_text), "Updated %s", data->updated);
+
+    if (bsp_display_lock(DISPLAY_LOCK_TIMEOUT_MS) != ESP_OK) {
+        return;
+    }
+
+    if (lv_arc_get_value(s_weather_ui.temp_arc) !=
+        clamp_int(data->current_temp_c, -30, 45)) {
+        lv_arc_set_value(s_weather_ui.temp_arc, clamp_int(data->current_temp_c, -30, 45));
+    }
+    lv_obj_set_style_arc_color(s_weather_ui.temp_arc, lv_color_hex(accent),
+                               LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_weather_ui.icon_bg, lv_color_hex(accent), 0);
+    lv_obj_set_style_shadow_color(s_weather_ui.icon_bg, lv_color_hex(accent), 0);
+
+    set_label_text_if_changed(s_weather_ui.icon_label,
+                              data->valid ? weather_icon_symbol(data->weather_code)
+                                          : LV_SYMBOL_REFRESH);
+    set_label_text_if_changed(s_weather_ui.city_label, data->city);
+    set_label_text_if_changed(s_weather_ui.temp_label, temp_text);
+    set_label_text_if_changed(s_weather_ui.condition_label, data->condition);
+    set_label_text_if_changed(s_weather_ui.range_label, range_text);
+    set_label_text_if_changed(s_weather_ui.status_label, status_text);
+    set_label_text_if_changed(s_weather_ui.low_value_label, low_text);
+    set_label_text_if_changed(s_weather_ui.high_value_label, high_text);
+    set_label_text_if_changed(s_weather_ui.code_value_label, code_text);
+    set_label_text_if_changed(s_weather_ui.updated_label, updated_text);
+    update_status_bar_locked();
+
+    bsp_display_unlock();
+}
+
+static void render_weather_status(const char *status_text)
+{
+    render_weather(&s_last_weather, status_text);
+}
+
 static void format_compact_u64(uint64_t value, char *buffer, size_t buffer_size)
 {
     if (value >= 1000000ULL) {
@@ -1848,6 +2225,98 @@ static bool json_get_string(const char *json, const char *key, char *out_value, 
     return *position == '"';
 }
 
+static bool json_get_double_from(const char *json, const char *key, double *out_value)
+{
+    const char *position = json_find_value(json, key);
+    if (position == NULL) {
+        return false;
+    }
+
+    while (*position != '\0' &&
+           (isspace((unsigned char)*position) || *position == '[' || *position == '"')) {
+        position++;
+    }
+
+    char *end = NULL;
+    double value = strtod(position, &end);
+    if (end == position) {
+        return false;
+    }
+
+    *out_value = value;
+    return true;
+}
+
+static bool json_get_double_after(const char *json, const char *anchor,
+                                  const char *key, double *out_value)
+{
+    char pattern[48];
+    int written = snprintf(pattern, sizeof(pattern), "\"%s\"", anchor);
+    if (written <= 0 || written >= (int)sizeof(pattern)) {
+        return false;
+    }
+
+    const char *start = strstr(json, pattern);
+    if (start == NULL) {
+        return false;
+    }
+    return json_get_double_from(start, key, out_value);
+}
+
+static bool json_get_int_after(const char *json, const char *anchor,
+                               const char *key, int *out_value)
+{
+    double value = 0.0;
+    if (!json_get_double_after(json, anchor, key, &value)) {
+        return false;
+    }
+    *out_value = (int)lround(value);
+    return true;
+}
+
+static bool has_non_ascii(const char *text)
+{
+    while (text != NULL && *text != '\0') {
+        if ((unsigned char)*text >= 0x80) {
+            return true;
+        }
+        text++;
+    }
+    return false;
+}
+
+static void build_weather_query_city(const char *city, char *out, size_t out_size)
+{
+    copy_string(out, out_size, city != NULL && city[0] != '\0' ? city : WEATHER_CITY);
+    if (has_non_ascii(out) && strstr(out, "市") == NULL &&
+        strlen(out) + strlen("市") + 1 < out_size) {
+        strcat(out, "市");
+    }
+}
+
+static void url_encode_component(const char *src, char *dest, size_t dest_size)
+{
+    size_t out = 0;
+    static const char hex[] = "0123456789ABCDEF";
+    if (dest_size == 0) {
+        return;
+    }
+
+    while (src != NULL && *src != '\0' && out + 1 < dest_size) {
+        unsigned char ch = (unsigned char)*src++;
+        if (isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+            dest[out++] = (char)ch;
+        } else if (out + 3 < dest_size) {
+            dest[out++] = '%';
+            dest[out++] = hex[ch >> 4];
+            dest[out++] = hex[ch & 0x0F];
+        } else {
+            break;
+        }
+    }
+    dest[out] = '\0';
+}
+
 static bool parse_codex_usage_json(const char *json, codex_usage_t *usage)
 {
     codex_usage_t parsed = {
@@ -1870,6 +2339,52 @@ static bool parse_codex_usage_json(const char *json, codex_usage_t *usage)
     return true;
 }
 
+static bool parse_weather_geocode_json(const char *json, double *latitude, double *longitude,
+                                       char *city, size_t city_size,
+                                       char *region, size_t region_size)
+{
+    if (!json_get_double_from(json, "latitude", latitude) ||
+        !json_get_double_from(json, "longitude", longitude)) {
+        return false;
+    }
+
+    if (!json_get_string(json, "name", city, city_size) || city[0] == '\0') {
+        copy_string(city, city_size, s_weather_city);
+    }
+    if (!json_get_string(json, "admin1", region, region_size) || region[0] == '\0') {
+        copy_string(region, region_size, "中国");
+    }
+    return true;
+}
+
+static bool parse_weather_forecast_json(const char *json, weather_data_t *weather)
+{
+    double current_temp = 0.0;
+    double max_temp = 0.0;
+    double min_temp = 0.0;
+    int code = 0;
+
+    if (!json_get_double_after(json, "current", "temperature_2m", &current_temp) ||
+        !json_get_int_after(json, "current", "weather_code", &code) ||
+        !json_get_double_after(json, "daily", "temperature_2m_max", &max_temp) ||
+        !json_get_double_after(json, "daily", "temperature_2m_min", &min_temp)) {
+        return false;
+    }
+
+    weather->current_temp_c = (int)lround(current_temp);
+    weather->max_temp_c = (int)lround(max_temp);
+    weather->min_temp_c = (int)lround(min_temp);
+    weather->weather_code = code;
+    copy_string(weather->condition, sizeof(weather->condition), weather_condition_text(code));
+
+    struct tm local_time;
+    get_local_clock(&local_time);
+    snprintf(weather->updated, sizeof(weather->updated), "%02d:%02d Open-Meteo",
+             local_time.tm_hour, local_time.tm_min);
+    weather->valid = true;
+    return true;
+}
+
 static esp_err_t http_event_handler(esp_http_client_event_t *event)
 {
     http_response_t *response = (http_response_t *)event->user_data;
@@ -1882,6 +2397,93 @@ static esp_err_t http_event_handler(esp_http_client_event_t *event)
             response->body[response->length] = '\0';
         }
     }
+    return ESP_OK;
+}
+
+static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bundle,
+                              http_response_t *response)
+{
+    memset(response, 0, sizeof(*response));
+    esp_http_client_config_t config = {
+        .url = url,
+        .timeout_ms = timeout_ms,
+        .event_handler = http_event_handler,
+        .user_data = response,
+    };
+    if (use_crt_bundle) {
+        config.crt_bundle_attach = esp_crt_bundle_attach;
+    }
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        return ESP_FAIL;
+    }
+
+    esp_err_t ret = esp_http_client_perform(client);
+    int status_code = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "HTTP request failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    if (status_code != 200) {
+        ESP_LOGW(TAG, "HTTP status: %d for %s", status_code, url);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t fetch_weather(weather_data_t *weather)
+{
+    char query_city[WEATHER_CITY_STORAGE_SIZE];
+    char encoded_city[WEATHER_CITY_STORAGE_SIZE * 3];
+    char url[384];
+    http_response_t response;
+    double latitude = 0.0;
+    double longitude = 0.0;
+
+    build_weather_query_city(s_weather_city, query_city, sizeof(query_city));
+    url_encode_component(query_city, encoded_city, sizeof(encoded_city));
+    snprintf(url, sizeof(url),
+             "https://geocoding-api.open-meteo.com/v1/search?name=%s&count=1&language=zh&format=json&countryCode=CN",
+             encoded_city);
+
+    esp_err_t ret = http_get_url(url, WEATHER_HTTP_TIMEOUT_MS, true, &response);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    weather_data_t parsed = {
+        .weather_code = 0,
+        .current_temp_c = 0,
+        .min_temp_c = 0,
+        .max_temp_c = 0,
+        .valid = false,
+    };
+    if (!parse_weather_geocode_json(response.body, &latitude, &longitude,
+                                    parsed.city, sizeof(parsed.city),
+                                    parsed.region, sizeof(parsed.region))) {
+        ESP_LOGW(TAG, "Weather geocode parse failed: %s", response.body);
+        return ESP_FAIL;
+    }
+
+    snprintf(url, sizeof(url),
+             "https://api.open-meteo.com/v1/forecast?latitude=%.5f&longitude=%.5f&current=temperature_2m,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min&forecast_days=1&timezone=Asia%%2FShanghai",
+             latitude, longitude);
+    ret = http_get_url(url, WEATHER_HTTP_TIMEOUT_MS, true, &response);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    if (!parse_weather_forecast_json(response.body, &parsed)) {
+        ESP_LOGW(TAG, "Weather forecast parse failed: %s", response.body);
+        return ESP_FAIL;
+    }
+
+    *weather = parsed;
     return ESP_OK;
 }
 
@@ -2147,6 +2749,16 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
                              "</select><label>或手动输入 SSID</label>"
                              "<input name='manual_ssid' maxlength='32' placeholder='可留空，默认使用上面的选择'>"
                              "<label>Wi-Fi 密码</label><input name='password' maxlength='64' type='password'>"
+                             "<label>天气城市</label>");
+    char escaped_city[WEATHER_CITY_STORAGE_SIZE];
+    html_escape_copy(escaped_city, sizeof(escaped_city),
+                     s_weather_city[0] != '\0' ? s_weather_city : WEATHER_CITY);
+    char city_input[180];
+    snprintf(city_input, sizeof(city_input),
+             "<input name='weather_city' maxlength='63' value='%s' placeholder='例如 青岛市、上海市、深圳市'>",
+             escaped_city);
+    httpd_resp_sendstr_chunk(req, city_input);
+    httpd_resp_sendstr_chunk(req,
                              "<button type='submit'>保存并连接</button></form>"
                              "<p class='hint'>当前保存 SSID: ");
     char escaped_current[WIFI_SSID_STORAGE_SIZE];
@@ -2160,7 +2772,7 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
 
 static esp_err_t config_page_post_handler(httpd_req_t *req)
 {
-    char body[256];
+    char body[384];
     int total = 0;
     int remaining = req->content_len;
     while (remaining > 0 && total < (int)sizeof(body) - 1) {
@@ -2182,16 +2794,32 @@ static esp_err_t config_page_post_handler(httpd_req_t *req)
     char ssid[WIFI_SSID_STORAGE_SIZE];
     char manual_ssid[WIFI_SSID_STORAGE_SIZE];
     char password[WIFI_PASSWORD_STORAGE_SIZE];
+    char weather_city[WEATHER_CITY_STORAGE_SIZE];
     (void)get_form_value(body, "ssid", ssid, sizeof(ssid));
     (void)get_form_value(body, "manual_ssid", manual_ssid, sizeof(manual_ssid));
     (void)get_form_value(body, "password", password, sizeof(password));
+    (void)get_form_value(body, "weather_city", weather_city, sizeof(weather_city));
     if (manual_ssid[0] != '\0') {
         copy_string(ssid, sizeof(ssid), manual_ssid);
     }
 
-    esp_err_t ret = save_wifi_credentials(ssid, password);
+    esp_err_t ret = ESP_OK;
+    bool wifi_changed = ssid[0] != '\0';
+    if (wifi_changed) {
+        ret = save_wifi_credentials(ssid, password);
+    }
+    if (ret == ESP_OK && weather_city[0] != '\0') {
+        ret = save_weather_city(weather_city);
+        s_last_weather.valid = false;
+        copy_string(s_last_weather.condition, sizeof(s_last_weather.condition), "等待天气");
+        copy_string(s_last_weather.updated, sizeof(s_last_weather.updated), "city saved");
+        render_weather_status("Weather saved");
+    }
+
     if (ret == ESP_OK) {
-        reconnect_station();
+        if (wifi_changed) {
+            reconnect_station();
+        }
         httpd_resp_set_type(req, "text/html; charset=utf-8");
         httpd_resp_sendstr(req,
                            "<!doctype html><html><head><meta charset='utf-8'>"
@@ -2444,6 +3072,47 @@ static void codex_usage_task(void *arg)
     }
 }
 
+static void weather_task(void *arg)
+{
+    (void)arg;
+
+    esp_err_t ret = start_wifi_station();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi start failed for weather: %s", esp_err_to_name(ret));
+        render_weather_status("Wi-Fi start failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    while (true) {
+        if (!weather_configured()) {
+            render_weather_status("Open setup AP");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+
+        EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                               WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE,
+                                               pdFALSE, pdMS_TO_TICKS(30000));
+        if ((bits & WIFI_CONNECTED_BIT) != 0) {
+            weather_data_t weather;
+            ret = fetch_weather(&weather);
+            if (ret == ESP_OK) {
+                s_last_weather = weather;
+                render_weather(&s_last_weather, "Open-Meteo");
+            } else {
+                render_weather_status("Weather offline");
+            }
+            vTaskDelay(pdMS_TO_TICKS(WEATHER_POLL_INTERVAL_MS));
+        } else if ((bits & WIFI_FAIL_BIT) != 0) {
+            render_weather_status("Wi-Fi failed");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+        } else {
+            render_weather_status("Wi-Fi timeout");
+        }
+    }
+}
+
 static void app_display_rounder_event_cb(lv_event_t *event)
 {
     lv_area_t *area = (lv_area_t *)lv_event_get_param(event);
@@ -2556,11 +3225,18 @@ void app_main(void)
         bsp_display_unlock();
     }
     render_time_page();
+    render_weather_status(wifi_configured() ? "Wi-Fi not started" : "Edit Wi-Fi config");
     render_pedometer(0, 0, "Waiting for QMI8658");
     render_codex_status(wifi_configured() ? "Wi-Fi not started" : "Edit Wi-Fi config");
 
     init_reset_button();
     init_battery_monitor();
+    ret = start_wifi_station();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi start failed at boot: %s", esp_err_to_name(ret));
+        render_weather_status("Wi-Fi start failed");
+        render_codex_status("Wi-Fi start failed");
+    }
     xTaskCreate(clock_task, "clock_task", 4096, NULL, 3, NULL);
 
     qmi8658_dev_t *dev = NULL;
@@ -2574,6 +3250,7 @@ void app_main(void)
     }
 
     xTaskCreate(codex_usage_task, "codex_usage_task", 6144, NULL, 4, NULL);
+    xTaskCreate(weather_task, "weather_task", 6144, NULL, 4, NULL);
     xTaskCreate(screenshot_console_task, "shot_console", SCREENSHOT_CMD_TASK_STACK, NULL, 2,
                 NULL);
 }

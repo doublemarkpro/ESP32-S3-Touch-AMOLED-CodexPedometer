@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS main.c ui_icons.c
     INCLUDE_DIRS .
-    PRIV_REQUIRES driver nvs_flash lvgl__lvgl waveshare__qmi8658 esp_wifi esp_http_client esp_http_server esp_netif esp_event
+    PRIV_REQUIRES driver nvs_flash lvgl__lvgl waveshare__qmi8658 esp_wifi esp_http_client esp_http_server esp_netif esp_event mbedtls
 )
 
 idf_component_get_property(LVGL_LIB lvgl__lvgl COMPONENT_LIB)
