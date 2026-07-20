@@ -103,6 +103,7 @@
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
 #define WEATHER_REFRESH_REQUEST_BIT BIT2
+#define CODEX_REFRESH_REQUEST_BIT BIT3
 /* Short immediate-retry burst, then long backoff: every STA connect attempt
  * drags the shared radio off the setup-AP channel for seconds, which is what
  * makes the CodexPedometer hotspot undiscoverable. */
@@ -562,6 +563,13 @@ static void request_weather_refresh(void)
 {
     if (s_wifi_event_group != NULL) {
         xEventGroupSetBits(s_wifi_event_group, WEATHER_REFRESH_REQUEST_BIT);
+    }
+}
+
+static void request_codex_refresh(void)
+{
+    if (s_wifi_event_group != NULL) {
+        xEventGroupSetBits(s_wifi_event_group, CODEX_REFRESH_REQUEST_BIT);
     }
 }
 
@@ -1142,6 +1150,8 @@ static void page_nav_event_cb(lv_event_t *event)
                 s_ntp_resync_requested = true;
             } else if (s_current_page == APP_PAGE_WEATHER) {
                 request_weather_refresh();
+            } else if (s_current_page == APP_PAGE_CODEX) {
+                request_codex_refresh();
             }
         } else {
             set_relative_page_locked(1);
@@ -3647,6 +3657,7 @@ static void codex_usage_task(void *arg)
             }
 
             if (codex_configured()) {
+                render_codex_status("Codex updating");
                 codex_usage_t usage;
                 ret = fetch_codex_usage(&usage);
                 if (ret == ESP_OK) {
@@ -3658,7 +3669,10 @@ static void codex_usage_task(void *arg)
             } else {
                 render_codex_status("Edit CODEX URL");
             }
-            vTaskDelay(pdMS_TO_TICKS(CODEX_POLL_INTERVAL_MS));
+            /* Sleep until the next poll or a manual refresh (long press). */
+            (void)xEventGroupWaitBits(s_wifi_event_group, CODEX_REFRESH_REQUEST_BIT,
+                                      pdTRUE, pdFALSE,
+                                      pdMS_TO_TICKS(CODEX_POLL_INTERVAL_MS));
         } else if ((bits & WIFI_FAIL_BIT) != 0) {
             render_codex_status("Wi-Fi failed");
             render_time_page();
