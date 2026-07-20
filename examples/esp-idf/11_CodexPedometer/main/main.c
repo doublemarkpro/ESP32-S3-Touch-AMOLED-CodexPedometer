@@ -52,8 +52,27 @@
 /* Draw buffers must live in internal RAM: the ESP32-S3 SPI driver cannot DMA
  * from PSRAM and would malloc an internal bounce buffer per flush, which
  * starts failing once Wi-Fi has claimed internal heap. 466 x 20 x 2 bytes
- * x 2 buffers = ~37 KB reserved once at boot. */
-#define APP_DRAW_BUFFER_HEIGHT 20
+ * x 2 buffers = ~26 KB reserved once at boot. Height is kept modest so task
+ * stacks (which must be internal) always fit alongside the LVGL widgets. */
+#define APP_DRAW_BUFFER_HEIGHT 14
+
+/* Whole-UI rotation is done in the CO5300 panel (MADCTL) so it costs nothing.
+ * The touch flags below must match; if the direction ends up wrong, use
+ * BSP_DISPLAY_ROTATE_270 with swap_xy=1, mirror_x=0, mirror_y=1 instead. */
+#define APP_DISPLAY_ROTATION BSP_DISPLAY_ROTATE_90
+#define APP_TOUCH_SWAP_XY 1
+#define APP_TOUCH_MIRROR_X 1
+#define APP_TOUCH_MIRROR_Y 0
+
+/* Pull-down settings panel with persisted UI preferences. */
+#define SETTINGS_NVS_NAMESPACE "ui_cfg"
+#define SETTINGS_NVS_BRIGHTNESS_KEY "bright"
+#define SETTINGS_NVS_VOLUME_KEY "volume"
+#define SETTINGS_NVS_STANDBY_EN_KEY "stby_en"
+#define SETTINGS_NVS_STANDBY_MIN_KEY "stby_min"
+#define SETTINGS_BRIGHTNESS_MIN 10
+#define SETTINGS_STANDBY_MIN_MINUTES 1
+#define SETTINGS_STANDBY_MAX_MINUTES 10
 
 /* Infograph-style watch face geometry (466 x 466 round panel). */
 #define WATCH_CENTER_X (BSP_LCD_H_RES / 2)
@@ -368,6 +387,27 @@ static lv_point_precise_t s_second_hand_points[2];
 static volatile int s_battery_percent = -1;
 static volatile float s_board_temp_c = BOARD_TEMP_INVALID;
 static volatile bool s_ntp_resync_requested;
+
+typedef struct {
+    lv_obj_t *panel;
+    lv_obj_t *brightness_label;
+    lv_obj_t *brightness_slider;
+    lv_obj_t *volume_label;
+    lv_obj_t *volume_slider;
+    lv_obj_t *standby_checkbox;
+    lv_obj_t *standby_slider;
+} settings_ui_t;
+
+static settings_ui_t s_settings_ui;
+static bool s_settings_visible;
+static lv_point_t s_settings_press_point;
+static bool s_settings_press_active;
+static uint8_t s_cfg_brightness = 80;
+static uint8_t s_cfg_volume = 60;
+static bool s_cfg_standby_enabled;
+static uint8_t s_cfg_standby_minutes = 3;
+static volatile uint32_t s_last_activity_ms;
+static volatile bool s_screen_off;
 static i2c_master_dev_handle_t s_axp2101_dev;
 static codex_usage_t s_last_codex_usage = {
     .label = "Codex usage",
@@ -391,6 +431,7 @@ static void page_nav_event_cb(lv_event_t *event);
 static void render_time_page(void);
 static void render_weather_status(const char *status_text);
 static esp_err_t request_ntp_sync(void);
+static void show_settings_panel(bool show);
 static void render_pedometer(uint32_t steps, int motion_mg, const char *status_text);
 static void update_time_page_locked(void);
 static void screenshot_console_task(void *arg);
@@ -570,6 +611,53 @@ static void request_codex_refresh(void)
 {
     if (s_wifi_event_group != NULL) {
         xEventGroupSetBits(s_wifi_event_group, CODEX_REFRESH_REQUEST_BIT);
+    }
+}
+
+static void load_ui_settings(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        return;
+    }
+
+    uint8_t value = 0;
+    if (nvs_get_u8(nvs, SETTINGS_NVS_BRIGHTNESS_KEY, &value) == ESP_OK &&
+        value >= SETTINGS_BRIGHTNESS_MIN && value <= 100) {
+        s_cfg_brightness = value;
+    }
+    if (nvs_get_u8(nvs, SETTINGS_NVS_VOLUME_KEY, &value) == ESP_OK && value <= 100) {
+        s_cfg_volume = value;
+    }
+    if (nvs_get_u8(nvs, SETTINGS_NVS_STANDBY_EN_KEY, &value) == ESP_OK) {
+        s_cfg_standby_enabled = value != 0;
+    }
+    if (nvs_get_u8(nvs, SETTINGS_NVS_STANDBY_MIN_KEY, &value) == ESP_OK &&
+        value >= SETTINGS_STANDBY_MIN_MINUTES && value <= SETTINGS_STANDBY_MAX_MINUTES) {
+        s_cfg_standby_minutes = value;
+    }
+    nvs_close(nvs);
+}
+
+static void save_ui_settings(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
+        return;
+    }
+    (void)nvs_set_u8(nvs, SETTINGS_NVS_BRIGHTNESS_KEY, s_cfg_brightness);
+    (void)nvs_set_u8(nvs, SETTINGS_NVS_VOLUME_KEY, s_cfg_volume);
+    (void)nvs_set_u8(nvs, SETTINGS_NVS_STANDBY_EN_KEY, s_cfg_standby_enabled ? 1 : 0);
+    (void)nvs_set_u8(nvs, SETTINGS_NVS_STANDBY_MIN_KEY, s_cfg_standby_minutes);
+    (void)nvs_commit(nvs);
+    nvs_close(nvs);
+}
+
+static void wake_screen(void)
+{
+    if (s_screen_off) {
+        s_screen_off = false;
+        (void)bsp_display_brightness_set(s_cfg_brightness);
     }
 }
 
@@ -1118,6 +1206,13 @@ static void page_nav_event_cb(lv_event_t *event)
     }
 
     if (code == LV_EVENT_PRESSED) {
+        s_last_activity_ms = now_ms();
+        if (s_screen_off) {
+            /* First touch only wakes the screen; swallow it. */
+            wake_screen();
+            s_page_press_active = false;
+            return;
+        }
         lv_indev_get_point(indev, &s_page_press_point);
         s_page_press_active = true;
         s_page_press_start_ms = now_ms();
@@ -1143,6 +1238,10 @@ static void page_nav_event_cb(lv_event_t *event)
         } else {
             set_relative_page_locked(-1);
         }
+    } else if (dy >= PAGE_SWIPE_MIN_PX && abs_dy > abs_dx &&
+               abs_dx <= PAGE_SWIPE_MAX_OFF_AXIS_PX) {
+        /* Swipe down: open the settings panel, phone style. */
+        show_settings_panel(true);
     } else if (abs_dx < PAGE_SWIPE_MIN_PX && abs_dy < PAGE_SWIPE_MIN_PX) {
         uint32_t press_elapsed_ms = now_ms() - s_page_press_start_ms;
         if (press_elapsed_ms >= PAGE_LONG_PRESS_MS) {
@@ -1505,7 +1604,7 @@ static lv_obj_t *create_weather_icon_visual(lv_obj_t *parent)
     lv_obj_t *canvas = lv_canvas_create(parent);
     lv_canvas_set_buffer(canvas, buf, WEATHER_ICON_SIZE, WEATHER_ICON_SIZE,
                          LV_COLOR_FORMAT_RGB565);
-    lv_obj_align(canvas, LV_ALIGN_CENTER, 0, -108);
+    lv_obj_align(canvas, LV_ALIGN_CENTER, 0, -124);
     lv_obj_clear_flag(canvas, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
     draw_weather_icon(canvas, -1);
     return canvas;
@@ -1531,12 +1630,13 @@ static void create_weather_page(lv_obj_t *parent)
     lv_obj_set_style_arc_color(s_weather_ui.temp_arc, lv_color_hex(0xFFD166),
                                LV_PART_INDICATOR);
 
-    s_weather_ui.city_label = create_label(s_weather_ui.page, "Qingdao", FONT_MEDIUM,
+    /* City sits below the condition text so the icon has the top to itself. */
+    s_weather_ui.city_label = create_label(s_weather_ui.page, "Qingdao", FONT_CJK,
                                            lv_color_hex(0x8DDFFF));
     lv_obj_set_width(s_weather_ui.city_label, 280);
     lv_obj_set_style_text_align(s_weather_ui.city_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_weather_ui.city_label, LV_LABEL_LONG_DOT);
-    lv_obj_align(s_weather_ui.city_label, LV_ALIGN_CENTER, 0, -154);
+    lv_obj_align(s_weather_ui.city_label, LV_ALIGN_CENTER, 0, 80);
 
     s_weather_ui.icon_bg = create_weather_icon_visual(s_weather_ui.page);
 
@@ -1551,12 +1651,12 @@ static void create_weather_page(lv_obj_t *parent)
     lv_label_set_long_mode(s_weather_ui.temp_label, LV_LABEL_LONG_CLIP);
     lv_obj_align(s_weather_ui.temp_label, LV_ALIGN_CENTER, 0, 6);
 
-    s_weather_ui.condition_label = create_label(s_weather_ui.page, "等待天气", FONT_CJK,
+    s_weather_ui.condition_label = create_label(s_weather_ui.page, "--", FONT_CJK,
                                                 lv_color_hex(0xFFD166));
     lv_obj_set_width(s_weather_ui.condition_label, 280);
     lv_obj_set_style_text_align(s_weather_ui.condition_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_weather_ui.condition_label, LV_LABEL_LONG_DOT);
-    lv_obj_align(s_weather_ui.condition_label, LV_ALIGN_CENTER, 0, 62);
+    lv_obj_align(s_weather_ui.condition_label, LV_ALIGN_CENTER, 0, 54);
 
     s_weather_ui.range_label = create_label(s_weather_ui.page, "", FONT_MEDIUM,
                                             lv_color_hex(0xF7FBFF));
@@ -1570,7 +1670,7 @@ static void create_weather_page(lv_obj_t *parent)
     lv_obj_set_width(s_weather_ui.status_label, 320);
     lv_obj_set_style_text_align(s_weather_ui.status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_weather_ui.status_label, LV_LABEL_LONG_DOT);
-    lv_obj_align(s_weather_ui.status_label, LV_ALIGN_CENTER, 0, 92);
+    lv_obj_align(s_weather_ui.status_label, LV_ALIGN_CENTER, 0, 106);
 
     s_weather_ui.low_value_label =
         create_metric_column(s_weather_ui.page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED,
@@ -1736,6 +1836,186 @@ static void create_page_dots(lv_obj_t *parent)
     lv_obj_clear_flag(s_dot_codex, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 }
 
+static void settings_update_labels(void)
+{
+    char text[32];
+    snprintf(text, sizeof(text), "BRIGHTNESS %d%%", s_cfg_brightness);
+    set_label_text_if_changed(s_settings_ui.brightness_label, text);
+    snprintf(text, sizeof(text), "VOLUME %d%%", s_cfg_volume);
+    set_label_text_if_changed(s_settings_ui.volume_label, text);
+    if (s_settings_ui.standby_checkbox != NULL) {
+        snprintf(text, sizeof(text), "STANDBY %d MIN", s_cfg_standby_minutes);
+        lv_checkbox_set_text(s_settings_ui.standby_checkbox, text);
+    }
+}
+
+static void show_settings_panel(bool show)
+{
+    if (s_settings_ui.panel == NULL) {
+        return;
+    }
+    s_settings_visible = show;
+    set_obj_hidden(s_settings_ui.panel, !show);
+    if (show) {
+        settings_update_labels();
+        lv_obj_move_foreground(s_settings_ui.panel);
+    }
+}
+
+static void settings_brightness_event_cb(lv_event_t *event)
+{
+    s_last_activity_ms = now_ms();
+    int32_t value = lv_slider_get_value(s_settings_ui.brightness_slider);
+    s_cfg_brightness = (uint8_t)value;
+    (void)bsp_display_brightness_set((int)value);
+    settings_update_labels();
+    if (lv_event_get_code(event) == LV_EVENT_RELEASED) {
+        save_ui_settings();
+    }
+}
+
+static void settings_volume_event_cb(lv_event_t *event)
+{
+    s_last_activity_ms = now_ms();
+    s_cfg_volume = (uint8_t)lv_slider_get_value(s_settings_ui.volume_slider);
+    settings_update_labels();
+    if (lv_event_get_code(event) == LV_EVENT_RELEASED) {
+        save_ui_settings();
+    }
+}
+
+static void settings_standby_switch_event_cb(lv_event_t *event)
+{
+    (void)event;
+    s_last_activity_ms = now_ms();
+    s_cfg_standby_enabled = lv_obj_has_state(s_settings_ui.standby_checkbox, LV_STATE_CHECKED);
+    save_ui_settings();
+}
+
+static void settings_standby_slider_event_cb(lv_event_t *event)
+{
+    s_last_activity_ms = now_ms();
+    s_cfg_standby_minutes = (uint8_t)lv_slider_get_value(s_settings_ui.standby_slider);
+    settings_update_labels();
+    if (lv_event_get_code(event) == LV_EVENT_RELEASED) {
+        save_ui_settings();
+    }
+}
+
+/* Swipe up anywhere on the panel background to close it. */
+static void settings_panel_event_cb(lv_event_t *event)
+{
+    lv_event_code_t code = lv_event_get_code(event);
+    lv_indev_t *indev = lv_event_get_indev(event);
+    if (indev == NULL) {
+        indev = lv_indev_active();
+    }
+    if (indev == NULL) {
+        return;
+    }
+
+    s_last_activity_ms = now_ms();
+    if (code == LV_EVENT_PRESSED) {
+        wake_screen();
+        lv_indev_get_point(indev, &s_settings_press_point);
+        s_settings_press_active = true;
+        return;
+    }
+    if (code == LV_EVENT_PRESS_LOST) {
+        s_settings_press_active = false;
+        return;
+    }
+    if (code != LV_EVENT_RELEASED || !s_settings_press_active) {
+        return;
+    }
+    s_settings_press_active = false;
+
+    lv_point_t release_point;
+    lv_indev_get_point(indev, &release_point);
+    int dy = (int)release_point.y - (int)s_settings_press_point.y;
+    if (-dy >= PAGE_SWIPE_MIN_PX) {
+        show_settings_panel(false);
+    }
+}
+
+static lv_obj_t *create_settings_slider(lv_obj_t *parent, int32_t y, int32_t min_value,
+                                        int32_t max_value, int32_t value, lv_event_cb_t cb)
+{
+    lv_obj_t *slider = lv_slider_create(parent);
+    lv_obj_set_size(slider, 240, 14);
+    lv_obj_align(slider, LV_ALIGN_TOP_MID, 0, y);
+    lv_slider_set_range(slider, min_value, max_value);
+    lv_slider_set_value(slider, value, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(0x2A2E33), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(slider, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(0x18D7F5), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(0xF2F2F7), LV_PART_KNOB);
+    lv_obj_add_event_cb(slider, cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(slider, cb, LV_EVENT_RELEASED, NULL);
+    return slider;
+}
+
+static void create_settings_panel(lv_obj_t *parent)
+{
+    lv_obj_t *panel = lv_obj_create(parent);
+    lv_obj_remove_style_all(panel);
+    lv_obj_set_size(panel, BSP_LCD_H_RES, BSP_LCD_V_RES);
+    lv_obj_set_pos(panel, 0, 0);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(0x05070A), 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_add_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(panel, settings_panel_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(panel, settings_panel_event_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(panel, settings_panel_event_cb, LV_EVENT_PRESS_LOST, NULL);
+    s_settings_ui.panel = panel;
+
+    lv_obj_t *title = create_label(panel, "SETTINGS", FONT_TITLE, lv_color_hex(0xF7FBFF));
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 62);
+
+    s_settings_ui.brightness_label = create_label(panel, "BRIGHTNESS", FONT_SMALL,
+                                                  lv_color_hex(0x9AA7B5));
+    lv_obj_align(s_settings_ui.brightness_label, LV_ALIGN_TOP_MID, 0, 116);
+    s_settings_ui.brightness_slider =
+        create_settings_slider(panel, 142, SETTINGS_BRIGHTNESS_MIN, 100, s_cfg_brightness,
+                               settings_brightness_event_cb);
+
+    s_settings_ui.volume_label = create_label(panel, "VOLUME", FONT_SMALL,
+                                              lv_color_hex(0x9AA7B5));
+    lv_obj_align(s_settings_ui.volume_label, LV_ALIGN_TOP_MID, 0, 190);
+    s_settings_ui.volume_slider =
+        create_settings_slider(panel, 216, 0, 100, s_cfg_volume, settings_volume_event_cb);
+
+    s_settings_ui.standby_checkbox = lv_checkbox_create(panel);
+    lv_checkbox_set_text(s_settings_ui.standby_checkbox, "STANDBY 3 MIN");
+    lv_obj_align(s_settings_ui.standby_checkbox, LV_ALIGN_TOP_MID, 0, 262);
+    lv_obj_set_style_text_color(s_settings_ui.standby_checkbox, lv_color_hex(0xF7FBFF), 0);
+    lv_obj_set_style_text_font(s_settings_ui.standby_checkbox, FONT_SMALL, 0);
+    lv_obj_set_style_border_color(s_settings_ui.standby_checkbox, lv_color_hex(0x657181),
+                                  LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_settings_ui.standby_checkbox, lv_color_hex(0x101820),
+                              LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_settings_ui.standby_checkbox, lv_color_hex(0x18D7F5),
+                              LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (s_cfg_standby_enabled) {
+        lv_obj_add_state(s_settings_ui.standby_checkbox, LV_STATE_CHECKED);
+    }
+    lv_obj_add_event_cb(s_settings_ui.standby_checkbox, settings_standby_switch_event_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+
+    s_settings_ui.standby_slider =
+        create_settings_slider(panel, 306, SETTINGS_STANDBY_MIN_MINUTES,
+                               SETTINGS_STANDBY_MAX_MINUTES, s_cfg_standby_minutes,
+                               settings_standby_slider_event_cb);
+
+    lv_obj_t *hint = create_label(panel, "Swipe up to close", FONT_SMALL,
+                                  lv_color_hex(0x63717F));
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 362);
+
+    settings_update_labels();
+    set_obj_hidden(panel, true);
+}
+
 static void create_app_ui(void)
 {
     lv_obj_t *scr = lv_screen_active();
@@ -1749,6 +2029,7 @@ static void create_app_ui(void)
     create_time_page(scr);
     create_status_bar(scr);
     create_page_dots(scr);
+    create_settings_panel(scr);
     set_active_page_locked(APP_PAGE_TIME);
 }
 
@@ -2169,6 +2450,13 @@ static void clock_task(void *arg)
             (void)request_ntp_sync();
         }
 
+        if (s_cfg_standby_enabled && !s_screen_off &&
+            (current_ms - s_last_activity_ms) >=
+                (uint32_t)s_cfg_standby_minutes * 60000U) {
+            s_screen_off = true;
+            (void)bsp_display_brightness_set(0);
+        }
+
         render_time_page();
         vTaskDelay(pdMS_TO_TICKS(CLOCK_TASK_DELAY_MS));
     }
@@ -2227,6 +2515,90 @@ static void render_pedometer(uint32_t steps, int motion_mg, const char *status_t
     update_status_bar_locked();
 
     bsp_display_unlock();
+}
+
+static uint32_t utf8_next_codepoint(const char *text, size_t *index)
+{
+    const unsigned char *p = (const unsigned char *)text + *index;
+    uint32_t cp;
+    int len;
+
+    if (p[0] == 0) {
+        return 0;
+    }
+    if (p[0] < 0x80) {
+        cp = p[0];
+        len = 1;
+    } else if ((p[0] & 0xE0) == 0xC0) {
+        cp = p[0] & 0x1F;
+        len = 2;
+    } else if ((p[0] & 0xF0) == 0xE0) {
+        cp = p[0] & 0x0F;
+        len = 3;
+    } else if ((p[0] & 0xF8) == 0xF0) {
+        cp = p[0] & 0x07;
+        len = 4;
+    } else {
+        (*index)++;
+        return 0xFFFD;
+    }
+
+    for (int k = 1; k < len; k++) {
+        if ((p[k] & 0xC0) != 0x80) {
+            *index += (size_t)k;
+            return 0xFFFD;
+        }
+        cp = (cp << 6) | (uint32_t)(p[k] & 0x3F);
+    }
+    *index += (size_t)len;
+    return cp;
+}
+
+/* The bundled CJK font is a subset (it lacks 云/阴/雷/雾 among others), so
+ * verify every glyph before trusting a server-provided Chinese string. */
+static bool text_glyphs_available(const lv_font_t *font, const char *text)
+{
+    size_t i = 0;
+    for (;;) {
+        uint32_t cp = utf8_next_codepoint(text, &i);
+        if (cp == 0) {
+            return true;
+        }
+        if (cp < 0x80) {
+            continue;
+        }
+        lv_font_glyph_dsc_t dsc;
+        if (!lv_font_get_glyph_dsc(font, &dsc, cp, ' ') ||
+            (dsc.box_w == 0 && dsc.adv_w == 0)) {
+            return false;
+        }
+    }
+}
+
+static const char *weather_condition_en(int code)
+{
+    if (code == 0) {
+        return "Sunny";
+    }
+    if (code == 2) {
+        return "Cloudy";
+    }
+    if (code == 3) {
+        return "Overcast";
+    }
+    if (code == 45 || code == 48) {
+        return "Foggy";
+    }
+    if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) {
+        return "Rain";
+    }
+    if ((code >= 71 && code <= 77) || code == 85 || code == 86) {
+        return "Snow";
+    }
+    if (code >= 95) {
+        return "Storm";
+    }
+    return "Cloudy";
 }
 
 static uint32_t weather_accent_color(int code)
@@ -2299,9 +2671,16 @@ static void render_weather(const weather_data_t *weather, const char *status_tex
         last_icon_code = icon_code;
         draw_weather_icon(s_weather_ui.icon_bg, icon_code);
     }
+    const char *condition_text = "--";
+    if (data->valid) {
+        condition_text = text_glyphs_available(FONT_CJK, data->condition)
+                             ? data->condition
+                             : weather_condition_en(data->weather_code);
+    }
+
     set_label_text_if_changed(s_weather_ui.city_label, display_city);
     set_label_text_if_changed(s_weather_ui.temp_label, temp_text);
-    set_label_text_if_changed(s_weather_ui.condition_label, data->condition);
+    set_label_text_if_changed(s_weather_ui.condition_label, condition_text);
     set_label_text_if_changed(s_weather_ui.range_label, range_text);
     set_label_text_if_changed(s_weather_ui.status_label, status_text);
     set_label_text_if_changed(s_weather_ui.low_value_label, low_text);
@@ -3801,6 +4180,9 @@ static lv_display_t *app_display_start(void)
         ESP_LOGE(TAG, "LCD panel init failed");
         return NULL;
     }
+    if (bsp_display_rotation_set(APP_DISPLAY_ROTATION) != ESP_OK) {
+        ESP_LOGW(TAG, "Panel rotation set failed");
+    }
 
     const esp_lv_adapter_display_config_t display_cfg = {
         .panel = panel,
@@ -3828,9 +4210,9 @@ static lv_display_t *app_display_start(void)
 
     const bsp_display_cfg_t touch_bsp_cfg = {
         .touch_flags = {
-            .swap_xy = 0,
-            .mirror_x = 1,
-            .mirror_y = 1,
+            .swap_xy = APP_TOUCH_SWAP_XY,
+            .mirror_x = APP_TOUCH_MIRROR_X,
+            .mirror_y = APP_TOUCH_MIRROR_Y,
         },
     };
     esp_lcd_touch_handle_t touch = NULL;
@@ -3865,13 +4247,16 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     load_wifi_credentials();
+    load_ui_settings();
     set_default_clock();
+    s_last_activity_ms = now_ms();
 
     if (app_display_start() == NULL) {
         ESP_LOGE(TAG, "Display start failed");
         return;
     }
     ESP_ERROR_CHECK(bsp_display_backlight_on());
+    (void)bsp_display_brightness_set(s_cfg_brightness);
 
     if (bsp_display_lock(DISPLAY_LOCK_TIMEOUT_MS) == ESP_OK) {
         create_app_ui();
