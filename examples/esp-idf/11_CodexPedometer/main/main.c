@@ -2218,6 +2218,11 @@ static void dump_layout_report(void)
     print_label_text_report("codex_status", s_codex_ui.status_label);
     print_label_text_report("status_time", s_status_ui.time_label);
 
+    printf("MEM internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u\n",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
     printf("__LVGL_LAYOUT_END__\n");
     fflush(stdout);
     funlockfile(stdout);
@@ -4182,11 +4187,11 @@ static lv_display_t *app_display_start(void)
     if (bsp_display_rotation_set(APP_DISPLAY_ROTATION) != ESP_OK) {
         ESP_LOGW(TAG, "Panel rotation set failed");
     }
-    /* The CO5300 visible window sits 6 columns into GRAM (BSP sets gap 6,0).
-     * After the MADCTL axis swap that physical column offset belongs on Y;
-     * leaving it on X paints past one edge and leaves a stripe of
-     * uninitialized (green) GRAM on two others. */
-    (void)esp_lcd_panel_set_gap(panel, 0, 6);
+    /* The CO5300 GRAM is 480 lines on this axis with a 466-line visible
+     * window offset by 6. After the MADCTL swap + mirror the offset counts
+     * from the opposite end: 480 - 466 - 6 = 8. A wrong value leaves stripes
+     * of uninitialized (green) GRAM at the display edge. */
+    (void)esp_lcd_panel_set_gap(panel, 0, 8);
 
     const esp_lv_adapter_display_config_t display_cfg = {
         .panel = panel,
