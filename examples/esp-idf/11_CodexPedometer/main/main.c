@@ -422,6 +422,8 @@ static void copy_string(char *dest, size_t dest_size, const char *src)
     snprintf(dest, dest_size, "%s", src);
 }
 
+static bool has_non_ascii(const char *text);
+
 static void normalize_weather_city(char *city, size_t city_size)
 {
     if (city == NULL || city_size == 0 || city[0] == '\0') {
@@ -429,10 +431,67 @@ static void normalize_weather_city(char *city, size_t city_size)
     }
 
     /* Keep old/bad saved values from making Open-Meteo resolve to the wrong
-     * place. The display font contains the proper "岛" glyph; the alias is
-     * only for persisted config that was already wrong. */
+     * place. */
     if (strcmp(city, "青口") == 0 || strcmp(city, "青口市") == 0) {
         copy_string(city, city_size, "青岛市");
+    }
+}
+
+typedef struct {
+    const char *match_a;
+    const char *match_b;
+    const char *match_c;
+    const char *display;
+    double latitude;
+    double longitude;
+} weather_city_preset_t;
+
+static const weather_city_preset_t s_weather_city_presets[] = {
+    {"青岛", "青岛市", "Qingdao", "Qingdao", 36.06488, 120.38042},
+    {"青口", "青口市", NULL, "Qingdao", 36.06488, 120.38042},
+    {"上海", "上海市", "Shanghai", "Shanghai", 31.23040, 121.47370},
+    {"北京", "北京市", "Beijing", "Beijing", 39.90420, 116.40740},
+    {"深圳", "深圳市", "Shenzhen", "Shenzhen", 22.54310, 114.05790},
+    {"广州", "广州市", "Guangzhou", "Guangzhou", 23.12910, 113.26440},
+    {"杭州", "杭州市", "Hangzhou", "Hangzhou", 30.27410, 120.15510},
+    {"南京", "南京市", "Nanjing", "Nanjing", 32.06030, 118.79690},
+    {"济南", "济南市", "Jinan", "Jinan", 36.65120, 117.12010},
+};
+
+static bool weather_city_matches(const char *city, const weather_city_preset_t *preset)
+{
+    return city != NULL &&
+           ((preset->match_a != NULL && strcmp(city, preset->match_a) == 0) ||
+            (preset->match_b != NULL && strcmp(city, preset->match_b) == 0) ||
+            (preset->match_c != NULL && strcmp(city, preset->match_c) == 0));
+}
+
+static bool lookup_weather_city_preset(const char *city, double *latitude, double *longitude,
+                                       char *display, size_t display_size)
+{
+    for (size_t i = 0; i < sizeof(s_weather_city_presets) / sizeof(s_weather_city_presets[0]);
+         i++) {
+        if (weather_city_matches(city, &s_weather_city_presets[i])) {
+            *latitude = s_weather_city_presets[i].latitude;
+            *longitude = s_weather_city_presets[i].longitude;
+            copy_string(display, display_size, s_weather_city_presets[i].display);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void build_weather_display_city(const char *city, char *out, size_t out_size)
+{
+    double unused_latitude = 0.0;
+    double unused_longitude = 0.0;
+    if (lookup_weather_city_preset(city, &unused_latitude, &unused_longitude, out, out_size)) {
+        return;
+    }
+    if (has_non_ascii(city)) {
+        copy_string(out, out_size, "China City");
+    } else {
+        copy_string(out, out_size, city != NULL && city[0] != '\0' ? city : "Weather");
     }
 }
 
@@ -1210,11 +1269,10 @@ static void create_weather_page(lv_obj_t *parent)
     lv_obj_set_style_arc_color(s_weather_ui.temp_arc, lv_color_hex(0xFFD166),
                                LV_PART_INDICATOR);
 
-    s_weather_ui.city_label = create_label(s_weather_ui.page, WEATHER_CITY, FONT_CJK,
+    s_weather_ui.city_label = create_label(s_weather_ui.page, "Qingdao", FONT_MEDIUM,
                                            lv_color_hex(0x8DDFFF));
     lv_obj_set_width(s_weather_ui.city_label, 280);
     lv_obj_set_style_text_align(s_weather_ui.city_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_transform_scale(s_weather_ui.city_label, 320, 0);
     lv_label_set_long_mode(s_weather_ui.city_label, LV_LABEL_LONG_DOT);
     lv_obj_align(s_weather_ui.city_label, LV_ALIGN_CENTER, 0, -154);
 
@@ -1971,7 +2029,9 @@ static void render_weather(const weather_data_t *weather, const char *status_tex
     char high_text[16];
     char code_text[16];
     char updated_text[56];
+    char display_city[WEATHER_CITY_STORAGE_SIZE];
 
+    build_weather_display_city(data->city, display_city, sizeof(display_city));
     if (data->valid) {
         snprintf(temp_text, sizeof(temp_text), "%d°", data->current_temp_c);
         snprintf(range_text, sizeof(range_text), "%d° / %d°", data->min_temp_c,
@@ -2004,7 +2064,7 @@ static void render_weather(const weather_data_t *weather, const char *status_tex
     set_label_text_if_changed(s_weather_ui.icon_label,
                               data->valid ? weather_icon_symbol(data->weather_code)
                                           : LV_SYMBOL_REFRESH);
-    set_label_text_if_changed(s_weather_ui.city_label, data->city);
+    set_label_text_if_changed(s_weather_ui.city_label, display_city);
     set_label_text_if_changed(s_weather_ui.temp_label, temp_text);
     set_label_text_if_changed(s_weather_ui.condition_label, data->condition);
     set_label_text_if_changed(s_weather_ui.range_label, range_text);
@@ -2432,9 +2492,14 @@ static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bund
     memset(response, 0, sizeof(*response));
     esp_http_client_config_t config = {
         .url = url,
+        .user_agent = "CodexPedometer/1.0",
+        .method = HTTP_METHOD_GET,
         .timeout_ms = timeout_ms,
         .event_handler = http_event_handler,
         .user_data = response,
+        .buffer_size = HTTP_RESPONSE_BUFFER_SIZE,
+        .buffer_size_tx = 512,
+        .keep_alive_enable = false,
     };
     if (use_crt_bundle) {
         config.crt_bundle_attach = esp_crt_bundle_attach;
@@ -2465,6 +2530,7 @@ static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bund
 static esp_err_t fetch_weather(weather_data_t *weather)
 {
     char query_city[WEATHER_CITY_STORAGE_SIZE];
+    char display_city[WEATHER_CITY_STORAGE_SIZE];
     char encoded_city[WEATHER_CITY_STORAGE_SIZE * 3];
     char url[384];
     http_response_t response;
@@ -2472,16 +2538,6 @@ static esp_err_t fetch_weather(weather_data_t *weather)
     double longitude = 0.0;
 
     build_weather_query_city(s_weather_city, query_city, sizeof(query_city));
-    url_encode_component(query_city, encoded_city, sizeof(encoded_city));
-    snprintf(url, sizeof(url),
-             "https://geocoding-api.open-meteo.com/v1/search?name=%s&count=1&language=zh&format=json&countryCode=CN",
-             encoded_city);
-
-    esp_err_t ret = http_get_url(url, WEATHER_HTTP_TIMEOUT_MS, true, &response);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
     weather_data_t parsed = {
         .weather_code = 0,
         .current_temp_c = 0,
@@ -2489,18 +2545,37 @@ static esp_err_t fetch_weather(weather_data_t *weather)
         .max_temp_c = 0,
         .valid = false,
     };
-    if (!parse_weather_geocode_json(response.body, &latitude, &longitude,
-                                    parsed.city, sizeof(parsed.city),
-                                    parsed.region, sizeof(parsed.region))) {
-        ESP_LOGW(TAG, "Weather geocode parse failed: %s", response.body);
-        return ESP_FAIL;
-    }
-    copy_string(parsed.city, sizeof(parsed.city), query_city);
+    if (lookup_weather_city_preset(query_city, &latitude, &longitude, display_city,
+                                   sizeof(display_city))) {
+        copy_string(parsed.city, sizeof(parsed.city), display_city);
+        copy_string(parsed.region, sizeof(parsed.region), "中国");
+    } else {
+        render_weather_status("Geo lookup");
+        url_encode_component(query_city, encoded_city, sizeof(encoded_city));
+        snprintf(url, sizeof(url),
+                 "http://geocoding-api.open-meteo.com/v1/search?name=%s&count=1&language=zh&format=json&countryCode=CN",
+                 encoded_city);
 
+        esp_err_t ret = http_get_url(url, WEATHER_HTTP_TIMEOUT_MS, false, &response);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+
+        if (!parse_weather_geocode_json(response.body, &latitude, &longitude,
+                                        parsed.city, sizeof(parsed.city),
+                                        parsed.region, sizeof(parsed.region))) {
+            ESP_LOGW(TAG, "Weather geocode parse failed: %s", response.body);
+            return ESP_FAIL;
+        }
+        build_weather_display_city(parsed.city, display_city, sizeof(display_city));
+        copy_string(parsed.city, sizeof(parsed.city), display_city);
+    }
+
+    render_weather_status("Forecast HTTP");
     snprintf(url, sizeof(url),
-             "https://api.open-meteo.com/v1/forecast?latitude=%.5f&longitude=%.5f&current=temperature_2m,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min&forecast_days=1&timezone=Asia%%2FShanghai",
+             "http://api.open-meteo.com/v1/forecast?latitude=%.5f&longitude=%.5f&current=temperature_2m,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min&forecast_days=1&timezone=Asia%%2FShanghai",
              latitude, longitude);
-    ret = http_get_url(url, WEATHER_HTTP_TIMEOUT_MS, true, &response);
+    esp_err_t ret = http_get_url(url, WEATHER_HTTP_TIMEOUT_MS, false, &response);
     if (ret != ESP_OK) {
         return ret;
     }
