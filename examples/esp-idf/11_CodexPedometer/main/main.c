@@ -182,6 +182,7 @@
 #define UI_METRIC_VALUE_CENTER_Y 133
 #define UI_METRIC_LABEL_CENTER_Y 155
 #define UI_UPDATED_CENTER_Y 172
+#define PAGE_DOTS_VISIBLE 0
 #define PAGE_NAV_DEBOUNCE_MS 250
 #define PAGE_SWIPE_MIN_PX 45
 /* Holding a page this long (without moving) forces a manual sync: NTP on the
@@ -1038,7 +1039,7 @@ static void update_status_bar_locked(void)
     } else if (s_current_page == APP_PAGE_PEDOMETER) {
         title = "QMI8658";
     } else if (s_current_page == APP_PAGE_CODEX) {
-        title = "CODEX";
+        title = "Codex";
     }
     set_label_text_if_changed(s_status_ui.title_label, title);
 }
@@ -1110,6 +1111,19 @@ static void update_page_dots_locked(void)
         s_dot_pedometer == NULL || s_dot_codex == NULL) {
         return;
     }
+
+    if (!PAGE_DOTS_VISIBLE) {
+        set_obj_hidden(s_dot_time, true);
+        set_obj_hidden(s_dot_weather, true);
+        set_obj_hidden(s_dot_pedometer, true);
+        set_obj_hidden(s_dot_codex, true);
+        return;
+    }
+
+    set_obj_hidden(s_dot_time, false);
+    set_obj_hidden(s_dot_weather, false);
+    set_obj_hidden(s_dot_pedometer, false);
+    set_obj_hidden(s_dot_codex, false);
 
     bool time_active = s_current_page == APP_PAGE_TIME;
     bool weather_active = s_current_page == APP_PAGE_WEATHER;
@@ -1762,7 +1776,7 @@ static void create_codex_page(lv_obj_t *parent)
     lv_obj_set_style_arc_color(s_codex_ui.usage_arc, lv_color_hex(0x17212B), LV_PART_MAIN);
     lv_obj_set_style_arc_color(s_codex_ui.usage_arc, lv_color_hex(0xFFD166), LV_PART_INDICATOR);
 
-    s_codex_ui.main_icon = create_label(s_codex_ui.page, "CODEX", FONT_TITLE,
+    s_codex_ui.main_icon = create_label(s_codex_ui.page, "Codex", FONT_TITLE,
                                         lv_color_hex(0xFFD166));
     lv_obj_align(s_codex_ui.main_icon, LV_ALIGN_CENTER, 0, UI_MAIN_ICON_CENTER_Y);
 
@@ -1773,12 +1787,12 @@ static void create_codex_page(lv_obj_t *parent)
     lv_label_set_long_mode(s_codex_ui.percent_label, LV_LABEL_LONG_CLIP);
     lv_obj_align(s_codex_ui.percent_label, LV_ALIGN_CENTER, 0, UI_VALUE_CENTER_Y);
 
-    s_codex_ui.label_label = create_label(s_codex_ui.page, "", FONT_MEDIUM,
-                                           lv_color_hex(0xFFD166));
+    s_codex_ui.label_label = create_label(s_codex_ui.page, "", FONT_SMALL,
+                                           lv_color_hex(0x92A0AD));
     lv_obj_set_width(s_codex_ui.label_label, 300);
     lv_obj_set_style_text_align(s_codex_ui.label_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_codex_ui.label_label, LV_LABEL_LONG_DOT);
-    lv_obj_align(s_codex_ui.label_label, LV_ALIGN_CENTER, 0, UI_GOAL_CENTER_Y);
+    lv_obj_align(s_codex_ui.label_label, LV_ALIGN_CENTER, 0, UI_STATUS_CENTER_Y);
 
     s_codex_ui.status_label = create_label(s_codex_ui.page, "Wi-Fi not configured", FONT_SMALL,
                                             lv_color_hex(0x92A0AD));
@@ -2726,6 +2740,31 @@ static void format_compact_u64(uint64_t value, char *buffer, size_t buffer_size)
     }
 }
 
+static void format_codex_reset_text(const char *updated, char *buffer, size_t buffer_size)
+{
+    if (buffer_size == 0) {
+        return;
+    }
+    buffer[0] = '\0';
+    if (updated == NULL || updated[0] == '\0') {
+        return;
+    }
+
+    const char *reset = strstr(updated, "reset ");
+    if (reset == NULL) {
+        reset = strstr(updated, "Reset ");
+    }
+    if (reset == NULL) {
+        return;
+    }
+
+    reset += strlen("reset ");
+    while (*reset == ' ' || *reset == ',') {
+        reset++;
+    }
+    snprintf(buffer, buffer_size, "Reset %s", reset);
+}
+
 static void render_codex_usage(const codex_usage_t *usage, const char *status_text)
 {
     uint64_t used = usage->used_tokens;
@@ -2750,17 +2789,21 @@ static void render_codex_usage(const codex_usage_t *usage, const char *status_te
     }
 
     char percent_text[16];
-    char updated_text[56];
+    char reset_text[48];
     snprintf(percent_text, sizeof(percent_text), "%lu%%", (unsigned long)percent);
-    snprintf(updated_text, sizeof(updated_text), "Updated %s", usage->updated);
+    format_codex_reset_text(usage->updated, reset_text, sizeof(reset_text));
+
+    bool online = strcmp(status_text, "Online") == 0;
 
     set_label_text_if_changed(s_codex_ui.percent_label, percent_text);
-    set_label_text_if_changed(s_codex_ui.label_label, "");
+    set_label_text_if_changed(s_codex_ui.label_label, online ? reset_text : "");
     set_label_text_if_changed(s_codex_ui.status_label, status_text);
+    lv_obj_set_style_text_color(s_codex_ui.status_label,
+                                lv_color_hex(online ? 0x9DFF35 : 0x92A0AD), 0);
     set_label_text_if_changed(s_codex_ui.used_value_label, used_text);
     set_label_text_if_changed(s_codex_ui.limit_value_label, limit_text);
     set_label_text_if_changed(s_codex_ui.left_value_label, left_text);
-    set_label_text_if_changed(s_codex_ui.updated_label, updated_text);
+    set_label_text_if_changed(s_codex_ui.updated_label, "");
     update_status_bar_locked();
 
     bsp_display_unlock();
@@ -4045,7 +4088,7 @@ static void codex_usage_task(void *arg)
                 ret = fetch_codex_usage(&usage);
                 if (ret == ESP_OK) {
                     s_last_codex_usage = usage;
-                    render_codex_usage(&s_last_codex_usage, "Bridge online");
+                    render_codex_usage(&s_last_codex_usage, "Online");
                 } else {
                     render_codex_status("Bridge offline");
                 }
