@@ -55,6 +55,8 @@
  * x 2 buffers = ~26 KB reserved once at boot. Height is kept modest so task
  * stacks (which must be internal) always fit alongside the LVGL widgets. */
 #define APP_DRAW_BUFFER_HEIGHT 14
+#define CO5300_GRAM_RES 480
+#define PANEL_CLEAR_ROWS 13
 
 /* Whole-UI rotation is done in the CO5300 panel (MADCTL) so it costs nothing.
  * The touch flags below must match the panel orientation. */
@@ -359,6 +361,7 @@ static lv_obj_t *s_dot_codex;
 static app_page_t s_current_page = APP_PAGE_TIME;
 static uint32_t s_last_page_nav_ms;
 static lv_point_t s_page_press_point;
+static lv_point_t s_page_last_point;
 static bool s_page_press_active;
 static uint32_t s_page_press_start_ms;
 
@@ -428,6 +431,7 @@ static weather_data_t s_last_weather = {
 };
 
 static void page_nav_event_cb(lv_event_t *event);
+static void set_active_page_locked(app_page_t page);
 static void render_time_page(void);
 static void render_weather_status(const char *status_text);
 static esp_err_t request_ntp_sync(void);
@@ -904,15 +908,9 @@ static void set_obj_hidden(lv_obj_t *obj, bool hidden)
 
 static void set_obj_tree_hidden(lv_obj_t *obj, bool hidden)
 {
-    if (obj == NULL) {
-        return;
-    }
-
+    /* A hidden parent already suppresses its complete subtree. Keeping the
+     * child flags untouched lets LVGL invalidate the full-page root once. */
     set_obj_hidden(obj, hidden);
-    uint32_t child_count = lv_obj_get_child_count(obj);
-    for (uint32_t i = 0; i < child_count; i++) {
-        set_obj_tree_hidden(lv_obj_get_child(obj, i), hidden);
-    }
 }
 
 static lv_obj_t *create_icon_image(lv_obj_t *parent, const lv_image_dsc_t *source)
@@ -1079,7 +1077,9 @@ static lv_obj_t *create_page(lv_obj_t *parent)
     lv_obj_align(page, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(page, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_event_cb(page, page_nav_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(page, page_nav_event_cb, LV_EVENT_PRESSING, NULL);
     lv_obj_add_event_cb(page, page_nav_event_cb, LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(page, page_nav_event_cb, LV_EVENT_PRESS_LOST, NULL);
     return page;
@@ -1175,6 +1175,15 @@ static void enforce_page_visibility_locked(void)
     set_status_bar_hidden_locked(true);
 }
 
+static app_page_t relative_page(app_page_t base, int delta)
+{
+    int page = (int)base + delta;
+    while (page < 0) {
+        page += APP_PAGE_COUNT;
+    }
+    return (app_page_t)(page % APP_PAGE_COUNT);
+}
+
 static void set_active_page_locked(app_page_t page)
 {
     s_current_page = page;
@@ -1183,22 +1192,18 @@ static void set_active_page_locked(app_page_t page)
         update_time_page_locked();
     }
     update_status_bar_locked();
+    /* Page arcs touch the round bezel. Redraw the complete screen so their
+     * antialiased edge pixels cannot survive after the page is hidden. */
+    lv_obj_invalidate(lv_screen_active());
 }
 
 static void set_relative_page_locked(int delta)
 {
     uint32_t current_ms = now_ms();
-    if ((current_ms - s_last_page_nav_ms) < PAGE_NAV_DEBOUNCE_MS) {
-        return;
+    if ((current_ms - s_last_page_nav_ms) >= PAGE_NAV_DEBOUNCE_MS) {
+        s_last_page_nav_ms = current_ms;
+        set_active_page_locked(relative_page(s_current_page, delta));
     }
-    s_last_page_nav_ms = current_ms;
-
-    int page = (int)s_current_page + delta;
-    while (page < 0) {
-        page += APP_PAGE_COUNT;
-    }
-    page %= APP_PAGE_COUNT;
-    set_active_page_locked((app_page_t)page);
 }
 
 static void page_nav_event_cb(lv_event_t *event)
@@ -1209,35 +1214,46 @@ static void page_nav_event_cb(lv_event_t *event)
         indev = lv_indev_active();
     }
 
-    if (code == LV_EVENT_PRESS_LOST) {
-        s_page_press_active = false;
-        return;
-    }
-
-    if (indev == NULL) {
-        return;
-    }
-
     if (code == LV_EVENT_PRESSED) {
         s_last_activity_ms = now_ms();
-        if (s_screen_off) {
+        if (s_screen_off && indev != NULL) {
             /* First touch only wakes the screen; swallow it. */
             wake_screen();
             s_page_press_active = false;
             return;
         }
+        if (indev == NULL) {
+            s_page_press_active = false;
+            return;
+        }
         lv_indev_get_point(indev, &s_page_press_point);
+        s_page_last_point = s_page_press_point;
         s_page_press_active = true;
         s_page_press_start_ms = now_ms();
         return;
     }
 
-    if (code != LV_EVENT_RELEASED || !s_page_press_active) {
+    if (!s_page_press_active) {
         return;
     }
 
-    lv_point_t release_point;
-    lv_indev_get_point(indev, &release_point);
+    if (code == LV_EVENT_PRESSING) {
+        if (indev == NULL) {
+            return;
+        }
+
+        lv_indev_get_point(indev, &s_page_last_point);
+        return;
+    }
+
+    if (code != LV_EVENT_RELEASED && code != LV_EVENT_PRESS_LOST) {
+        return;
+    }
+
+    if (code == LV_EVENT_RELEASED && indev != NULL) {
+        lv_indev_get_point(indev, &s_page_last_point);
+    }
+    lv_point_t release_point = s_page_last_point;
     s_page_press_active = false;
 
     int dx = (int)release_point.x - (int)s_page_press_point.x;
@@ -1245,17 +1261,17 @@ static void page_nav_event_cb(lv_event_t *event)
     int abs_dx = abs(dx);
     int abs_dy = abs(dy);
 
-    if (abs_dx >= PAGE_SWIPE_MIN_PX && abs_dx > abs_dy && abs_dy <= PAGE_SWIPE_MAX_OFF_AXIS_PX) {
-        if (dx < 0) {
-            set_relative_page_locked(1);
-        } else {
-            set_relative_page_locked(-1);
-        }
+    bool horizontal_commit = abs_dx >= PAGE_SWIPE_MIN_PX && abs_dx > abs_dy &&
+                             abs_dy <= PAGE_SWIPE_MAX_OFF_AXIS_PX;
+
+    if (horizontal_commit) {
+        set_relative_page_locked(dx < 0 ? 1 : -1);
     } else if (dy >= PAGE_SWIPE_MIN_PX && abs_dy > abs_dx &&
                abs_dx <= PAGE_SWIPE_MAX_OFF_AXIS_PX) {
         /* Swipe down: open the settings panel, phone style. */
         show_settings_panel(true);
-    } else if (abs_dx < PAGE_SWIPE_MIN_PX && abs_dy < PAGE_SWIPE_MIN_PX) {
+    } else if (code == LV_EVENT_RELEASED && abs_dx < PAGE_SWIPE_MIN_PX &&
+               abs_dy < PAGE_SWIPE_MIN_PX) {
         uint32_t press_elapsed_ms = now_ms() - s_page_press_start_ms;
         if (press_elapsed_ms >= PAGE_LONG_PRESS_MS) {
             if (s_current_page == APP_PAGE_TIME) {
@@ -2035,6 +2051,8 @@ static void create_app_ui(void)
     lv_obj_clean(scr);
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
 
     create_codex_page(scr);
     create_pedometer_page(scr);
@@ -4199,6 +4217,31 @@ static void app_display_rounder_event_cb(lv_event_t *event)
     area->y2 |= 1;
 }
 
+static esp_err_t clear_full_panel_gram(esp_lcd_panel_handle_t panel)
+{
+    const size_t row_bytes = CO5300_GRAM_RES * (BSP_LCD_BITS_PER_PIXEL / 8);
+    const size_t buffer_bytes = row_bytes * PANEL_CLEAR_ROWS;
+    void *black = heap_caps_calloc(1, buffer_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (black == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t result = esp_lcd_panel_set_gap(panel, 0, 0);
+    for (int y = 0; result == ESP_OK && y < CO5300_GRAM_RES; y += PANEL_CLEAR_ROWS) {
+        int rows = CO5300_GRAM_RES - y;
+        if (rows > PANEL_CLEAR_ROWS) {
+            rows = PANEL_CLEAR_ROWS;
+        }
+        result = esp_lcd_panel_draw_bitmap(panel, 0, y, CO5300_GRAM_RES, y + rows, black);
+    }
+
+    /* QSPI color transfers are queued. Keep the DMA buffer alive until the
+     * final batch has drained before returning it to the internal heap. */
+    vTaskDelay(pdMS_TO_TICKS(80));
+    free(black);
+    return result;
+}
+
 /*
  * bsp_display_start() hardcodes PSRAM draw buffers. The ESP32-S3 SPI driver
  * cannot DMA from PSRAM, so every flush would malloc an internal bounce
@@ -4227,13 +4270,14 @@ static lv_display_t *app_display_start(void)
         ESP_LOGE(TAG, "LCD panel init failed");
         return NULL;
     }
+    if (clear_full_panel_gram(panel) != ESP_OK) {
+        ESP_LOGW(TAG, "Full CO5300 GRAM clear failed");
+    }
     if (bsp_display_rotation_set(APP_DISPLAY_ROTATION) != ESP_OK) {
         ESP_LOGW(TAG, "Panel rotation set failed");
     }
-    /* The CO5300 GRAM is 480 lines on this axis with a 466-line visible
-     * window offset by 6. After the MADCTL swap + mirror the offset counts
-     * from the opposite end: 480 - 466 - 6 = 8. A wrong value leaves stripes
-     * of uninitialized (green) GRAM at the display edge. */
+    /* MADCTL swaps the module's calibrated X offset onto Y and mirrors it.
+     * The untouched GRAM outside this 466 x 466 window was cleared above. */
     (void)esp_lcd_panel_set_gap(panel, 0, 8);
 
     const esp_lv_adapter_display_config_t display_cfg = {
