@@ -185,7 +185,8 @@
 #define UI_METRIC_LABEL_CENTER_Y 155
 #define UI_UPDATED_CENTER_Y 172
 #define PAGE_DOTS_VISIBLE 0
-#define PAGE_NAV_DEBOUNCE_MS 250
+#define PAGE_NAV_DEBOUNCE_MS 320
+#define PAGE_ANIM_MS 240
 #define PAGE_SWIPE_MIN_PX 45
 /* Holding a page this long (without moving) forces a manual sync: NTP on the
  * clock page, weather refresh on the weather page. */
@@ -1197,12 +1198,75 @@ static void set_active_page_locked(app_page_t page)
     lv_obj_invalidate(lv_screen_active());
 }
 
+/*
+ * Page transitions cross-fade via the backlight PWM instead of moving pixels:
+ * the 14-row draw buffer + PSRAM dial image + no-TE panel make a full-screen
+ * slide tear and stutter, whereas dimming the backlight to black, switching
+ * the page in that dark instant, and brightening again costs zero rendering
+ * and cannot tear. It also matches the "old fades out, new fades in" request.
+ */
+static uint8_t s_page_fade_var;
+static app_page_t s_page_fade_target;
+
+static void page_fade_exec_cb(void *var, int32_t value)
+{
+    (void)var;
+    if (!s_screen_off) {
+        (void)bsp_display_brightness_set((int)value);
+    }
+}
+
+static void page_fade_up(void)
+{
+    lv_anim_t up;
+    lv_anim_init(&up);
+    lv_anim_set_var(&up, &s_page_fade_var);
+    lv_anim_set_values(&up, 0, s_cfg_brightness);
+    lv_anim_set_duration(&up, PAGE_ANIM_MS / 2);
+    lv_anim_set_exec_cb(&up, page_fade_exec_cb);
+    lv_anim_set_path_cb(&up, lv_anim_path_ease_out);
+    lv_anim_start(&up);
+}
+
+/* Reached full black: swap the page (invisible) then fade back up. */
+static void page_fade_dark_ready_cb(lv_anim_t *anim)
+{
+    (void)anim;
+    set_active_page_locked(s_page_fade_target);
+    page_fade_up();
+}
+
+static void set_active_page_animated(app_page_t page, int dir)
+{
+    (void)dir;
+    if (page == s_current_page) {
+        return;
+    }
+    if (s_screen_off) {
+        set_active_page_locked(page);
+        return;
+    }
+
+    lv_anim_delete(&s_page_fade_var, page_fade_exec_cb);
+    s_page_fade_target = page;
+
+    lv_anim_t down;
+    lv_anim_init(&down);
+    lv_anim_set_var(&down, &s_page_fade_var);
+    lv_anim_set_values(&down, s_cfg_brightness, 0);
+    lv_anim_set_duration(&down, PAGE_ANIM_MS / 2);
+    lv_anim_set_exec_cb(&down, page_fade_exec_cb);
+    lv_anim_set_path_cb(&down, lv_anim_path_ease_in);
+    lv_anim_set_completed_cb(&down, page_fade_dark_ready_cb);
+    lv_anim_start(&down);
+}
+
 static void set_relative_page_locked(int delta)
 {
     uint32_t current_ms = now_ms();
     if ((current_ms - s_last_page_nav_ms) >= PAGE_NAV_DEBOUNCE_MS) {
         s_last_page_nav_ms = current_ms;
-        set_active_page_locked(relative_page(s_current_page, delta));
+        set_active_page_animated(relative_page(s_current_page, delta), delta);
     }
 }
 
