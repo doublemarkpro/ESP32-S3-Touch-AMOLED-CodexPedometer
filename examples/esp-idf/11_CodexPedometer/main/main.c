@@ -160,6 +160,10 @@
 
 #define CODEX_POLL_INTERVAL_MS 15000
 #define CODEX_HTTP_TIMEOUT_MS 5000
+/* The agent page stands in for a status lamp, so it polls far more often
+ * than the quota page. */
+#define AGENT_POLL_INTERVAL_MS 2000
+#define AGENT_HTTP_TIMEOUT_MS 3000
 #define WEATHER_POLL_INTERVAL_MS 1800000
 #define WEATHER_RETRY_INTERVAL_MS 60000
 #define WEATHER_HTTP_TIMEOUT_MS 8000
@@ -236,8 +240,21 @@ typedef enum {
     APP_PAGE_WEATHER,
     APP_PAGE_PEDOMETER,
     APP_PAGE_CODEX,
+    APP_PAGE_AGENT,
     APP_PAGE_COUNT,
 } app_page_t;
+
+/* Mirrors the AgentCore-Light state model so this page can stand in for a
+ * three-colour AI status lamp: green = idle/done, yellow = busy, amber =
+ * waiting on the user, red = the turn errored. */
+typedef enum {
+    AGENT_STATE_UNKNOWN,
+    AGENT_STATE_IDLE,
+    AGENT_STATE_WORKING,
+    AGENT_STATE_WAITING,
+    AGENT_STATE_ERROR,
+    AGENT_STATE_DONE,
+} agent_state_t;
 
 typedef enum {
     METRIC_ICON_PIN,
@@ -315,6 +332,31 @@ typedef struct {
 } codex_ui_t;
 
 typedef struct {
+    lv_obj_t *page;
+    lv_obj_t *ring;
+    lv_obj_t *title_label;
+    lv_obj_t *state_label;
+    lv_obj_t *detail_label;
+    lv_obj_t *target_label;
+    lv_obj_t *codex_value_label;
+    lv_obj_t *claude_value_label;
+    lv_obj_t *elapsed_value_label;
+    lv_obj_t *updated_label;
+} agent_ui_t;
+
+typedef struct {
+    agent_state_t state;
+    agent_state_t codex_state;
+    agent_state_t claude_state;
+    char agent[24];
+    char project[40];
+    char detail[48];
+    char updated[24];
+    uint32_t elapsed_s;
+    bool valid;
+} agent_status_t;
+
+typedef struct {
     float gravity_g;
     bool armed;
     uint32_t last_step_ms;
@@ -355,6 +397,18 @@ static time_ui_t s_time_ui;
 static weather_ui_t s_weather_ui;
 static pedometer_ui_t s_pedometer_ui;
 static codex_ui_t s_codex_ui;
+static agent_ui_t s_agent_ui;
+static agent_status_t s_agent_status = {
+    .state = AGENT_STATE_UNKNOWN,
+    .codex_state = AGENT_STATE_UNKNOWN,
+    .claude_state = AGENT_STATE_UNKNOWN,
+    .agent = "",
+    .project = "",
+    .detail = "",
+    .updated = "",
+    .elapsed_s = 0,
+    .valid = false,
+};
 static lv_obj_t *s_dot_time;
 static lv_obj_t *s_dot_weather;
 static lv_obj_t *s_dot_pedometer;
@@ -437,6 +491,10 @@ static void render_time_page(void);
 static void render_weather_status(const char *status_text);
 static esp_err_t request_ntp_sync(void);
 static void show_settings_panel(bool show);
+static bool json_get_string(const char *json, const char *key, char *out_value, size_t out_size);
+static bool json_get_u64(const char *json, const char *key, uint64_t *out_value);
+static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bundle,
+                              http_response_t *response);
 static void render_pedometer(uint32_t steps, int motion_mg, const char *status_text);
 static void update_time_page_locked(void);
 static void screenshot_console_task(void *arg);
@@ -476,6 +534,12 @@ static bool codex_configured(void)
 {
     return wifi_configured() &&
            config_value_is_set(CODEX_USAGE_URL, "http://YOUR_PC_IP:8765/usage");
+}
+
+static bool agent_status_configured(void)
+{
+    return wifi_configured() &&
+           config_value_is_set(AGENT_STATUS_URL, "http://YOUR_PC_IP:8766/status");
 }
 
 static bool weather_api_key_configured(void)
@@ -838,6 +902,8 @@ static const char *page_name(app_page_t page)
         return "pedometer";
     case APP_PAGE_CODEX:
         return "codex";
+    case APP_PAGE_AGENT:
+        return "agent";
     default:
         return "unknown";
     }
@@ -1039,6 +1105,8 @@ static void update_status_bar_locked(void)
         title = "QMI8658";
     } else if (s_current_page == APP_PAGE_CODEX) {
         title = "Codex";
+    } else if (s_current_page == APP_PAGE_AGENT) {
+        title = "AI";
     }
     set_label_text_if_changed(s_status_ui.title_label, title);
 }
@@ -1155,11 +1223,13 @@ static void enforce_page_visibility_locked(void)
     bool weather_active = s_current_page == APP_PAGE_WEATHER;
     bool pedometer_active = s_current_page == APP_PAGE_PEDOMETER;
     bool codex_active = s_current_page == APP_PAGE_CODEX;
+    bool agent_active = s_current_page == APP_PAGE_AGENT;
 
     set_obj_tree_hidden(s_time_ui.page, !time_active);
     set_obj_tree_hidden(s_weather_ui.page, !weather_active);
     set_obj_tree_hidden(s_pedometer_ui.page, !pedometer_active);
     set_obj_tree_hidden(s_codex_ui.page, !codex_active);
+    set_obj_tree_hidden(s_agent_ui.page, !agent_active);
 
     if (time_active && s_time_ui.page != NULL) {
         lv_obj_move_foreground(s_time_ui.page);
@@ -1169,6 +1239,8 @@ static void enforce_page_visibility_locked(void)
         lv_obj_move_foreground(s_pedometer_ui.page);
     } else if (codex_active && s_codex_ui.page != NULL) {
         lv_obj_move_foreground(s_codex_ui.page);
+    } else if (agent_active && s_agent_ui.page != NULL) {
+        lv_obj_move_foreground(s_agent_ui.page);
     }
 
     move_overlay_ui_foreground_locked();
@@ -1342,7 +1414,8 @@ static void page_nav_event_cb(lv_event_t *event)
                 s_ntp_resync_requested = true;
             } else if (s_current_page == APP_PAGE_WEATHER) {
                 request_weather_refresh();
-            } else if (s_current_page == APP_PAGE_CODEX) {
+            } else if (s_current_page == APP_PAGE_CODEX ||
+                       s_current_page == APP_PAGE_AGENT) {
                 request_codex_refresh();
             }
         } else {
@@ -1898,6 +1971,148 @@ static void create_codex_page(lv_obj_t *parent)
     lv_obj_align(s_codex_ui.updated_label, LV_ALIGN_CENTER, 0, UI_UPDATED_CENTER_Y);
 }
 
+static uint32_t agent_state_color(agent_state_t state)
+{
+    switch (state) {
+    case AGENT_STATE_IDLE:
+    case AGENT_STATE_DONE:
+        return 0x30D158;
+    case AGENT_STATE_WORKING:
+        return 0xFFD60A;
+    case AGENT_STATE_WAITING:
+        return 0xFF9F0A;
+    case AGENT_STATE_ERROR:
+        return 0xFF453A;
+    default:
+        return 0x5A6673;
+    }
+}
+
+static const char *agent_state_text(agent_state_t state)
+{
+    switch (state) {
+    case AGENT_STATE_IDLE:
+        return "IDLE";
+    case AGENT_STATE_WORKING:
+        return "WORKING";
+    case AGENT_STATE_WAITING:
+        return "WAITING";
+    case AGENT_STATE_ERROR:
+        return "ERROR";
+    case AGENT_STATE_DONE:
+        return "DONE";
+    default:
+        return "--";
+    }
+}
+
+static const char *agent_state_short(agent_state_t state)
+{
+    switch (state) {
+    case AGENT_STATE_IDLE:
+        return "idle";
+    case AGENT_STATE_WORKING:
+        return "busy";
+    case AGENT_STATE_WAITING:
+        return "wait";
+    case AGENT_STATE_ERROR:
+        return "err";
+    case AGENT_STATE_DONE:
+        return "done";
+    default:
+        return "--";
+    }
+}
+
+static agent_state_t agent_state_from_text(const char *text)
+{
+    if (text == NULL) {
+        return AGENT_STATE_UNKNOWN;
+    }
+    if (strcmp(text, "working") == 0 || strcmp(text, "busy") == 0) {
+        return AGENT_STATE_WORKING;
+    }
+    if (strcmp(text, "waiting") == 0) {
+        return AGENT_STATE_WAITING;
+    }
+    if (strcmp(text, "error") == 0) {
+        return AGENT_STATE_ERROR;
+    }
+    if (strcmp(text, "done") == 0) {
+        return AGENT_STATE_DONE;
+    }
+    if (strcmp(text, "idle") == 0) {
+        return AGENT_STATE_IDLE;
+    }
+    return AGENT_STATE_UNKNOWN;
+}
+
+/*
+ * The ring is a solid colour band rather than a progress arc: it is the
+ * status lamp. Everything else follows the layout of the other data pages.
+ */
+static void create_agent_page(lv_obj_t *parent)
+{
+    s_agent_ui.page = create_page(parent);
+
+    s_agent_ui.ring = lv_arc_create(s_agent_ui.page);
+    lv_obj_set_size(s_agent_ui.ring, UI_ARC_SIZE, UI_ARC_SIZE);
+    lv_obj_align(s_agent_ui.ring, LV_ALIGN_TOP_MID, 0, UI_ARC_TOP);
+    lv_arc_set_range(s_agent_ui.ring, 0, 100);
+    lv_arc_set_value(s_agent_ui.ring, 100);
+    lv_arc_set_rotation(s_agent_ui.ring, 135);
+    lv_arc_set_bg_angles(s_agent_ui.ring, 0, 270);
+    lv_obj_remove_style(s_agent_ui.ring, NULL, LV_PART_KNOB);
+    lv_obj_clear_flag(s_agent_ui.ring, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(s_agent_ui.ring, UI_ARC_WIDTH, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_agent_ui.ring, UI_ARC_WIDTH, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(s_agent_ui.ring, true, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_agent_ui.ring, lv_color_hex(0x17212B), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_agent_ui.ring, lv_color_hex(agent_state_color(AGENT_STATE_UNKNOWN)),
+                               LV_PART_INDICATOR);
+
+    s_agent_ui.title_label = create_label(s_agent_ui.page, "AI STATUS", FONT_TITLE,
+                                          lv_color_hex(0xE6EDF5));
+    lv_obj_align(s_agent_ui.title_label, LV_ALIGN_CENTER, 0, UI_MAIN_ICON_CENTER_Y);
+
+    s_agent_ui.state_label = create_label(s_agent_ui.page, "--", FONT_VALUE,
+                                          lv_color_hex(0xF7FBFF));
+    lv_obj_set_width(s_agent_ui.state_label, 320);
+    lv_obj_set_style_text_align(s_agent_ui.state_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_agent_ui.state_label, LV_LABEL_LONG_CLIP);
+    lv_obj_align(s_agent_ui.state_label, LV_ALIGN_CENTER, 0, UI_VALUE_CENTER_Y);
+
+    s_agent_ui.target_label = create_label(s_agent_ui.page, "", FONT_SMALL,
+                                           lv_color_hex(0x9AA7B5));
+    lv_obj_set_width(s_agent_ui.target_label, 320);
+    lv_obj_set_style_text_align(s_agent_ui.target_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_agent_ui.target_label, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_agent_ui.target_label, LV_ALIGN_CENTER, 0, UI_GOAL_CENTER_Y);
+
+    s_agent_ui.detail_label = create_label(s_agent_ui.page, "Bridge offline", FONT_SMALL,
+                                           lv_color_hex(0x92A0AD));
+    lv_obj_set_width(s_agent_ui.detail_label, 340);
+    lv_obj_set_style_text_align(s_agent_ui.detail_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_agent_ui.detail_label, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_agent_ui.detail_label, LV_ALIGN_CENTER, 0, UI_STATUS_CENTER_Y);
+
+    s_agent_ui.codex_value_label =
+        create_metric_column(s_agent_ui.page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED,
+                             "CODEX", "--");
+    s_agent_ui.claude_value_label =
+        create_metric_column(s_agent_ui.page, 0, false, METRIC_ICON_LEFT, "CLAUDE", "--");
+    s_agent_ui.elapsed_value_label =
+        create_metric_column(s_agent_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT,
+                             "FOR", "--");
+
+    s_agent_ui.updated_label = create_label(s_agent_ui.page, "", FONT_SMALL,
+                                            lv_color_hex(0x63717F));
+    lv_obj_set_width(s_agent_ui.updated_label, 280);
+    lv_obj_set_style_text_align(s_agent_ui.updated_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_agent_ui.updated_label, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_agent_ui.updated_label, LV_ALIGN_CENTER, 0, UI_UPDATED_CENTER_Y);
+}
+
 static void create_page_dots(lv_obj_t *parent)
 {
     s_dot_time = lv_obj_create(parent);
@@ -2118,6 +2333,7 @@ static void create_app_ui(void)
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
 
+    create_agent_page(scr);
     create_codex_page(scr);
     create_pedometer_page(scr);
     create_weather_page(scr);
@@ -2894,6 +3110,135 @@ static void render_codex_usage(const codex_usage_t *usage, const char *status_te
 static void render_codex_status(const char *status_text)
 {
     render_codex_usage(&s_last_codex_usage, status_text);
+}
+
+static void format_elapsed_short(uint32_t seconds, char *buffer, size_t buffer_size)
+{
+    if (seconds >= 3600U) {
+        snprintf(buffer, buffer_size, "%luh", (unsigned long)(seconds / 3600U));
+    } else if (seconds >= 60U) {
+        snprintf(buffer, buffer_size, "%lum", (unsigned long)(seconds / 60U));
+    } else {
+        snprintf(buffer, buffer_size, "%lus", (unsigned long)seconds);
+    }
+}
+
+static void render_agent_status(const agent_status_t *status, const char *fallback_detail)
+{
+    const agent_status_t *data = status != NULL ? status : &s_agent_status;
+    agent_state_t state = data->valid ? data->state : AGENT_STATE_UNKNOWN;
+    uint32_t accent = agent_state_color(state);
+
+    char target_text[72];
+    char elapsed_text[12];
+    if (data->valid && (data->agent[0] != '\0' || data->project[0] != '\0')) {
+        if (data->agent[0] != '\0' && data->project[0] != '\0') {
+            snprintf(target_text, sizeof(target_text), "%s · %s", data->agent, data->project);
+        } else {
+            snprintf(target_text, sizeof(target_text), "%s",
+                     data->agent[0] != '\0' ? data->agent : data->project);
+        }
+    } else {
+        target_text[0] = '\0';
+    }
+    if (data->valid) {
+        format_elapsed_short(data->elapsed_s, elapsed_text, sizeof(elapsed_text));
+    } else {
+        snprintf(elapsed_text, sizeof(elapsed_text), "--");
+    }
+
+    const char *detail_text = fallback_detail;
+    if (detail_text == NULL) {
+        detail_text = (data->valid && data->detail[0] != '\0') ? data->detail : "";
+    }
+
+    if (bsp_display_lock(DISPLAY_LOCK_TIMEOUT_MS) != ESP_OK) {
+        return;
+    }
+
+    lv_obj_set_style_arc_color(s_agent_ui.ring, lv_color_hex(accent), LV_PART_INDICATOR);
+    lv_obj_set_style_text_color(s_agent_ui.state_label, lv_color_hex(accent), 0);
+
+    set_label_text_if_changed(s_agent_ui.state_label, agent_state_text(state));
+    set_label_text_if_changed(s_agent_ui.target_label, target_text);
+    set_label_text_if_changed(s_agent_ui.detail_label, detail_text);
+    set_label_text_if_changed(s_agent_ui.codex_value_label,
+                              agent_state_short(data->valid ? data->codex_state
+                                                            : AGENT_STATE_UNKNOWN));
+    set_label_text_if_changed(s_agent_ui.claude_value_label,
+                              agent_state_short(data->valid ? data->claude_state
+                                                            : AGENT_STATE_UNKNOWN));
+    set_label_text_if_changed(s_agent_ui.elapsed_value_label, elapsed_text);
+    set_label_text_if_changed(s_agent_ui.updated_label, data->valid ? data->updated : "");
+    update_status_bar_locked();
+
+    bsp_display_unlock();
+}
+
+static void render_agent_detail(const char *detail_text)
+{
+    render_agent_status(&s_agent_status, detail_text);
+}
+
+static bool parse_agent_status_json(const char *json, agent_status_t *status)
+{
+    agent_status_t parsed = {
+        .state = AGENT_STATE_UNKNOWN,
+        .codex_state = AGENT_STATE_UNKNOWN,
+        .claude_state = AGENT_STATE_UNKNOWN,
+        .elapsed_s = 0,
+        .valid = false,
+    };
+
+    char text[32];
+    if (!json_get_string(json, "state", text, sizeof(text))) {
+        return false;
+    }
+    parsed.state = agent_state_from_text(text);
+
+    if (json_get_string(json, "codex", text, sizeof(text))) {
+        parsed.codex_state = agent_state_from_text(text);
+    }
+    if (json_get_string(json, "claude", text, sizeof(text))) {
+        parsed.claude_state = agent_state_from_text(text);
+    }
+
+    (void)json_get_string(json, "agent", parsed.agent, sizeof(parsed.agent));
+    (void)json_get_string(json, "project", parsed.project, sizeof(parsed.project));
+    (void)json_get_string(json, "detail", parsed.detail, sizeof(parsed.detail));
+    (void)json_get_string(json, "updated", parsed.updated, sizeof(parsed.updated));
+
+    uint64_t elapsed = 0;
+    if (json_get_u64(json, "elapsed", &elapsed)) {
+        parsed.elapsed_s = (uint32_t)elapsed;
+    }
+
+    parsed.valid = true;
+    *status = parsed;
+    return true;
+}
+
+static esp_err_t fetch_agent_status(agent_status_t *status)
+{
+    http_response_t *response = calloc(1, sizeof(*response));
+    if (response == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t ret = http_get_url(AGENT_STATUS_URL, AGENT_HTTP_TIMEOUT_MS, false, response);
+    if (ret != ESP_OK) {
+        free(response);
+        return ret;
+    }
+
+    if (!parse_agent_status_json(response->body, status)) {
+        ESP_LOGW(TAG, "Agent status parse failed: %s", response->body);
+        free(response);
+        return ESP_FAIL;
+    }
+
+    free(response);
+    return ESP_OK;
 }
 
 static void IRAM_ATTR reset_button_isr(void *arg)
@@ -4144,6 +4489,9 @@ static void codex_usage_task(void *arg)
         return;
     }
 
+    uint32_t last_codex_fetch_ms = 0;
+    bool codex_fetched_once = false;
+
     while (true) {
         if (!wifi_configured()) {
             render_codex_status("Open setup AP");
@@ -4164,23 +4512,47 @@ static void codex_usage_task(void *arg)
                 render_time_page();
             }
 
-            if (codex_configured()) {
-                render_codex_status("Codex updating");
-                codex_usage_t usage;
-                ret = fetch_codex_usage(&usage);
-                if (ret == ESP_OK) {
-                    s_last_codex_usage = usage;
-                    render_codex_usage(&s_last_codex_usage, "Online");
+            /* Quota is expensive to fetch, so keep it on the slow cadence and
+             * let the agent status poll run on every (fast) loop pass. */
+            uint32_t now = now_ms();
+            bool codex_due = !codex_fetched_once ||
+                             (now - last_codex_fetch_ms) >= CODEX_POLL_INTERVAL_MS;
+            if (codex_due) {
+                codex_fetched_once = true;
+                last_codex_fetch_ms = now;
+                if (codex_configured()) {
+                    render_codex_status("Codex updating");
+                    codex_usage_t usage;
+                    ret = fetch_codex_usage(&usage);
+                    if (ret == ESP_OK) {
+                        s_last_codex_usage = usage;
+                        render_codex_usage(&s_last_codex_usage, "Online");
+                    } else {
+                        render_codex_status("Bridge offline");
+                    }
                 } else {
-                    render_codex_status("Bridge offline");
+                    render_codex_status("Edit CODEX URL");
+                }
+            }
+
+            if (agent_status_configured()) {
+                agent_status_t agent;
+                if (fetch_agent_status(&agent) == ESP_OK) {
+                    s_agent_status = agent;
+                    render_agent_status(&s_agent_status, NULL);
+                } else {
+                    s_agent_status.valid = false;
+                    render_agent_detail("Bridge offline");
                 }
             } else {
-                render_codex_status("Edit CODEX URL");
+                s_agent_status.valid = false;
+                render_agent_detail("Edit AGENT URL");
             }
+
             /* Sleep until the next poll or a manual refresh (long press). */
             (void)xEventGroupWaitBits(s_wifi_event_group, CODEX_REFRESH_REQUEST_BIT,
                                       pdTRUE, pdFALSE,
-                                      pdMS_TO_TICKS(CODEX_POLL_INTERVAL_MS));
+                                      pdMS_TO_TICKS(AGENT_POLL_INTERVAL_MS));
         } else if ((bits & WIFI_FAIL_BIT) != 0) {
             render_codex_status("Wi-Fi failed");
             render_time_page();
