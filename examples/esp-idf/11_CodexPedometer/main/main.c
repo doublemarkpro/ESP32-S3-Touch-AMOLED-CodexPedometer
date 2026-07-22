@@ -164,9 +164,6 @@
  * than the quota page. */
 #define AGENT_POLL_INTERVAL_MS 2000
 #define AGENT_HTTP_TIMEOUT_MS 3000
-/* Lamp animation tick. The ring is nearly full-screen, so opacity steps are
- * coarse and deduplicated: a change lands at most ~2.5 times a second. */
-#define AGENT_PULSE_TICK_MS 200
 #define WEATHER_POLL_INTERVAL_MS 1800000
 #define WEATHER_RETRY_INTERVAL_MS 60000
 #define WEATHER_HTTP_TIMEOUT_MS 8000
@@ -496,6 +493,7 @@ static void render_time_page(void);
 static void render_weather_status(const char *status_text);
 static esp_err_t request_ntp_sync(void);
 static void show_settings_panel(bool show);
+static void agent_refresh_lamp(void);
 static bool json_get_string(const char *json, const char *key, char *out_value, size_t out_size);
 static bool json_get_u64(const char *json, const char *key, uint64_t *out_value);
 static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bundle,
@@ -1251,6 +1249,7 @@ static void enforce_page_visibility_locked(void)
     move_overlay_ui_foreground_locked();
     update_page_dots_locked();
     set_status_bar_hidden_locked(true);
+    agent_refresh_lamp();
 }
 
 static app_page_t relative_page(app_page_t base, int delta)
@@ -2054,50 +2053,80 @@ static agent_state_t agent_state_from_text(const char *text)
 
 /*
  * Lamp behaviour, matching the three-colour status light this page replaces:
- * waiting-on-you and errored blink, a finished turn breathes slowly, and
- * idle/working sit solid. Driven by a coarse timer rather than a smooth
- * animation because the ring covers almost the whole screen - every opacity
- * change repaints it, so changes are deduplicated and kept infrequent.
+ * waiting-on-you and errored blink, a finished turn breathes, idle/working
+ * sit solid. Unlike the clock face this page carries no full-screen image -
+ * just a thin arc and a few labels - so a real animation is affordable here
+ * and the breathe can run smooth instead of stepping.
  */
-static uint8_t s_agent_pulse_phase;
-static lv_opa_t s_agent_pulse_applied = LV_OPA_COVER;
+typedef enum {
+    AGENT_LAMP_SOLID,
+    AGENT_LAMP_BLINK,
+    AGENT_LAMP_BREATHE,
+} agent_lamp_mode_t;
 
-static void agent_apply_pulse_opa(lv_opa_t opa)
-{
-    if (opa == s_agent_pulse_applied || s_agent_ui.ring == NULL) {
-        return;
-    }
-    s_agent_pulse_applied = opa;
-    lv_obj_set_style_arc_opa(s_agent_ui.ring, opa, LV_PART_INDICATOR);
-    lv_obj_set_style_text_opa(s_agent_ui.state_label, opa, 0);
-}
+static agent_lamp_mode_t s_agent_lamp_mode = AGENT_LAMP_SOLID;
+static uint8_t s_agent_lamp_anim_var;
 
-static void agent_pulse_timer_cb(lv_timer_t *timer)
+static void agent_lamp_opa_exec_cb(void *var, int32_t value)
 {
-    (void)timer;
+    (void)var;
     if (s_agent_ui.ring == NULL) {
         return;
     }
+    lv_obj_set_style_arc_opa(s_agent_ui.ring, (lv_opa_t)value, LV_PART_INDICATOR);
+    lv_obj_set_style_text_opa(s_agent_ui.state_label, (lv_opa_t)value, 0);
+}
 
-    /* Only the visible page is worth animating. */
-    if (s_current_page != APP_PAGE_AGENT) {
-        agent_apply_pulse_opa(LV_OPA_COVER);
+/* Restarting on every 2 s poll would reset the phase and look stuttery, so
+ * the animation is only rebuilt when the mode actually changes. */
+static void agent_set_lamp_mode(agent_lamp_mode_t mode)
+{
+    if (mode == s_agent_lamp_mode || s_agent_ui.ring == NULL) {
+        return;
+    }
+    s_agent_lamp_mode = mode;
+    lv_anim_delete(&s_agent_lamp_anim_var, agent_lamp_opa_exec_cb);
+
+    if (mode == AGENT_LAMP_SOLID) {
+        agent_lamp_opa_exec_cb(NULL, LV_OPA_COVER);
         return;
     }
 
-    agent_state_t state = s_agent_status.valid ? s_agent_status.state : AGENT_STATE_UNKNOWN;
-    s_agent_pulse_phase++;
+    lv_anim_t anim;
+    lv_anim_init(&anim);
+    lv_anim_set_var(&anim, &s_agent_lamp_anim_var);
+    lv_anim_set_exec_cb(&anim, agent_lamp_opa_exec_cb);
+    lv_anim_set_repeat_count(&anim, LV_ANIM_REPEAT_INFINITE);
 
-    lv_opa_t opa = LV_OPA_COVER;
-    if (state == AGENT_STATE_WAITING || state == AGENT_STATE_ERROR) {
-        /* Blink: ~400 ms lit, ~400 ms dimmed. */
-        opa = (s_agent_pulse_phase & 0x02) ? LV_OPA_30 : LV_OPA_COVER;
-    } else if (state == AGENT_STATE_DONE) {
-        /* Breathe over ~3.2 s, stepping every other tick. */
-        static const lv_opa_t breathe[8] = {255, 225, 195, 165, 135, 165, 195, 225};
-        opa = breathe[(s_agent_pulse_phase >> 1) & 0x07];
+    if (mode == AGENT_LAMP_BLINK) {
+        /* A blink is meant to be hard on/off, so step rather than fade. */
+        lv_anim_set_values(&anim, LV_OPA_COVER, LV_OPA_20);
+        lv_anim_set_duration(&anim, 380);
+        lv_anim_set_reverse_duration(&anim, 380);
+        lv_anim_set_path_cb(&anim, lv_anim_path_step);
+    } else {
+        lv_anim_set_values(&anim, LV_OPA_COVER, 70);
+        lv_anim_set_duration(&anim, 1300);
+        lv_anim_set_reverse_duration(&anim, 1300);
+        lv_anim_set_path_cb(&anim, lv_anim_path_ease_in_out);
     }
-    agent_apply_pulse_opa(opa);
+    lv_anim_start(&anim);
+}
+
+static void agent_refresh_lamp(void)
+{
+    agent_state_t state = s_agent_status.valid ? s_agent_status.state : AGENT_STATE_UNKNOWN;
+    agent_lamp_mode_t mode = AGENT_LAMP_SOLID;
+
+    /* Only animate the page you are actually looking at. */
+    if (s_current_page == APP_PAGE_AGENT) {
+        if (state == AGENT_STATE_WAITING || state == AGENT_STATE_ERROR) {
+            mode = AGENT_LAMP_BLINK;
+        } else if (state == AGENT_STATE_DONE) {
+            mode = AGENT_LAMP_BREATHE;
+        }
+    }
+    agent_set_lamp_mode(mode);
 }
 
 /*
@@ -2166,7 +2195,6 @@ static void create_agent_page(lv_obj_t *parent)
         create_metric_column(s_agent_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT,
                              "FOR", "--");
 
-    lv_timer_create(agent_pulse_timer_cb, AGENT_PULSE_TICK_MS, NULL);
 }
 
 static void create_page_dots(lv_obj_t *parent)
@@ -3226,6 +3254,7 @@ static void render_agent_status(const agent_status_t *status, const char *fallba
                                                             : AGENT_STATE_UNKNOWN));
     set_label_text_if_changed(s_agent_ui.elapsed_value_label, elapsed_text);
     set_label_text_if_changed(s_agent_ui.updated_label, data->valid ? data->updated : "");
+    agent_refresh_lamp();
     update_status_bar_locked();
 
     bsp_display_unlock();
