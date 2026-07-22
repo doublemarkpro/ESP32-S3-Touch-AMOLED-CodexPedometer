@@ -13,6 +13,9 @@
     <a href="examples/arduino/">🔧 Arduino Examples</a> ·
     <a href="docs/">📚 Documentation</a>
   </p>
+  <p>
+    <img alt="CodexPedometer watch UI preview" src="docs/assets/codexpedometer-preview.png">
+  </p>
 </div>
 
 ---
