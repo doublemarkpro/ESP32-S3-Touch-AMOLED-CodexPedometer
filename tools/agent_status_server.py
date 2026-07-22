@@ -71,6 +71,14 @@ def record_event(name: str, state: str, project: str = "", detail: str = "") -> 
     if state not in STATES:
         state = "working"
 
+    # One line per incoming hook: without this there is no way to tell a hook
+    # that never fired from one that fired with the wrong state.
+    print(
+        f"{time.strftime('%H:%M:%S')}  {name:<7} -> {state:<8}"
+        f" {('[' + detail + ']') if detail else ''}",
+        flush=True,
+    )
+
     with _lock:
         agent = _agents.get(name) or _blank(name)
         if agent["state"] != state:
