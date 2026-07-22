@@ -17,40 +17,43 @@
 
 ---
 
-## ✨ Overview
+## ✨ 项目概览 / Overview
 
-This repository provides example software, source-built firmware packages,
-factory recovery firmware, schematics, and documentation for the Waveshare
-ESP32-S3-Touch-AMOLED-1.75.
+这是基于微雪 Waveshare `ESP32-S3-Touch-AMOLED-1.75` 开发板整理的开源工程。
+仓库保留官方示例、原理图、固件资料，并新增一个完整的 ESP-IDF 智能手表风格
+Demo：`11_CodexPedometer`。
+
+This repository is based on the Waveshare `ESP32-S3-Touch-AMOLED-1.75`
+development board. It keeps the original examples, schematics, firmware notes,
+and adds a full ESP-IDF watch-style demo named `11_CodexPedometer`.
 
 The board combines an ESP32-S3 with a high-resolution AMOLED display,
 capacitive touch, motion sensing, power management, real-time clock, audio,
 and storage interfaces in a compact development platform.
 
-## CodexPedometer Smart Watch Demo
+## CodexPedometer 智能手表 Demo / Smart Watch Demo
 
-This fork adds a full ESP-IDF watch-style demo at
-[`examples/esp-idf/11_CodexPedometer`](examples/esp-idf/11_CodexPedometer/).
+Demo 入口：
+[`examples/esp-idf/11_CodexPedometer`](examples/esp-idf/11_CodexPedometer/)
 
-It turns the board into a compact round watch UI with:
+它把这块 1.75 英寸圆形 AMOLED 开发板做成一个小型桌面手表/状态屏，目前包含：
 
-- analog clock page with NTP time sync and Chinese date labels
-- weather page using AMap Web Service weather data
-- QMI8658 pedometer page with distance, kcal, and movement counters
-- Codex quota page that polls a local PC bridge
-- AI agent status page that shows Codex / Claude activity as a Wi-Fi status lamp
-- phone-style setup portal at `http://192.168.4.1`
-- Windows helper bridge for Codex usage and agent lifecycle status
-- optional 3D-printable battery shell draft under
-  [`mechanical/esp32_s3_touch_amoled_case`](mechanical/esp32_s3_touch_amoled_case/)
+- 时间表盘：NTP 同步、中文日期、模拟指针
+- 天气页面：通过高德 Web 服务获取城市天气
+- 计步页面：使用 QMI8658 计步，显示距离、热量、运动量
+- Codex 额度页面：通过本机 bridge 查询 Codex 用量/额度
+- AI 状态页面：显示 Codex / Claude 是否工作、等待用户、出错或完成
+- 手机配网页面：设备热点 `CodexPedometer` + `http://192.168.4.1`
+- Windows 本地桥接服务：Codex 用量、AI agent 状态、hook 事件记录
 
-Recent work includes the AI status page, smooth status breathing/blinking,
-diagnostic hook logging, duplicate bridge-instance protection, hidden startup
-launch, Codex project-name reporting, and cleaner waiting/error/done states.
+Recent changes include the AI status page, smooth breathing/blinking status
+lights, diagnostic hook logging, duplicate bridge-instance protection, hidden
+startup launch, Codex project-name reporting, and cleaner waiting/error/done
+states.
 
-### Quick Start
+### 快速开始 / Quick Start
 
-Use ESP-IDF v6.0.2 or newer. Open an ESP-IDF terminal and build the demo:
+推荐使用 ESP-IDF `v6.0.2` 或更新版本。打开 ESP-IDF 终端后：
 
 ```powershell
 cd examples\esp-idf\11_CodexPedometer
@@ -59,111 +62,133 @@ idf.py build
 idf.py -p COM4 flash monitor
 ```
 
-Replace `COM4` with your board port. In VS Code, open the
-`examples/esp-idf/11_CodexPedometer` folder directly, select target `esp32s3`,
-then use ESP-IDF Build / Flash.
+把 `COM4` 换成你的开发板串口。VS Code 用户建议直接打开
+`examples/esp-idf/11_CodexPedometer` 这个工程目录，选择 target `esp32s3`，
+再使用 ESP-IDF 插件的 Build / Flash。
 
-### Device Setup Portal
+Replace `COM4` with your board port. In VS Code, open
+`examples/esp-idf/11_CodexPedometer` directly, select target `esp32s3`, then use
+the ESP-IDF Build / Flash commands.
 
-On first boot the firmware starts an open AP named `CodexPedometer`.
-Connect a phone or PC to that AP and open:
+### 设备配网页面 / Device Setup Portal
+
+首次启动时，固件会开启一个开放热点：
+
+```text
+CodexPedometer
+```
+
+手机或电脑连接这个热点后，打开：
 
 ```text
 http://192.168.4.1
 ```
 
-The setup page lets you save:
+页面里可以配置：
 
-- Wi-Fi SSID and password
-- weather city, for example `青岛市`, `上海市`, or an AMap adcode such as `370200`
-- AMap Web Service Key
-- Codex usage bridge URL
-- AI agent status bridge URL
-- pedometer step target
+- Wi-Fi 名称和密码
+- 天气城市，例如 `青岛市`、`上海市`，或高德 adcode，例如 `370200`
+- 高德 Web 服务 Key
+- Codex 用量 bridge URL
+- AI agent 状态 bridge URL
+- 计步目标步数
 
-The values are stored in NVS, so normal users do not need to edit firmware
-source before flashing. The default placeholders live in
-[`app_config.h`](examples/esp-idf/11_CodexPedometer/main/app_config.h).
+这些值会保存到 NVS，后续重启仍然有效。正常使用不需要把私人 Wi-Fi 密码写进
+源码。默认占位配置在：
+[`app_config.h`](examples/esp-idf/11_CodexPedometer/main/app_config.h)
 
-### Codex Usage Bridge
+The setup portal saves values into NVS, so users normally do not need to edit
+private Wi-Fi credentials into the firmware source.
 
-The Codex quota page polls a small local HTTP bridge running on your PC:
+### Codex 用量桥 / Codex Usage Bridge
+
+Codex 额度页面会轮询电脑上的本地 HTTP bridge。启动方式：
 
 ```powershell
 python tools\codex_usage_server.py
 ```
 
-It listens on:
+默认监听：
 
 ```text
 http://<your-pc-lan-ip>:8765/usage
 ```
 
-The bridge tries to read real Codex quota data through Codex Desktop's
-`codex app-server --stdio` account APIs. If that is unavailable, it falls back
-to [`tools/codex_usage.json`](tools/codex_usage.json), so the watch UI still has
-predictable data during development.
+这个 bridge 会优先通过 Codex Desktop 的 `codex app-server --stdio` 读取真实
+Codex rate limit / usage 信息。如果当前环境读不到真实数据，会回退到
+[`tools/codex_usage.json`](tools/codex_usage.json)，方便开发调试。
 
-Point the device setup portal's Codex URL at:
+然后在设备配网页面的 Codex URL 中填入：
 
 ```text
 http://<your-pc-lan-ip>:8765/usage
 ```
 
-### AI Agent Status Bridge
+The bridge reads real Codex account data when available and falls back to a
+local JSON file for predictable development behavior.
 
-The AI status page polls:
+### AI 状态桥 / AI Agent Status Bridge
+
+AI 状态页会轮询：
 
 ```text
 http://<your-pc-lan-ip>:8766/status
 ```
 
-Start the bridge manually:
+手动启动：
 
 ```powershell
 python tools\agent_status_server.py
 ```
 
-Install it to start automatically at Windows logon:
+设置为 Windows 登录后自动启动：
 
 ```powershell
 python tools\agent_status_server.py --install
 ```
 
-Remove the autostart entry:
+取消自启动：
 
 ```powershell
 python tools\agent_status_server.py --uninstall
 ```
 
-The installer first tries to create a Windows scheduled task named
-`AgentStatusBridge`. If Windows refuses that, it falls back to a hidden startup
-folder launcher. Runtime output goes to `tools/agent_status.log`, which is
-ignored by Git. A second bridge instance refuses to bind the port, so duplicate
-startup entries fail loudly instead of splitting hook events between two
-processes.
+自启动安装逻辑：
 
-Print hook examples:
+- 优先创建 Windows 计划任务 `AgentStatusBridge`
+- 如果权限不足，则回退到启动文件夹里的隐藏 `.vbs` 启动器
+- 运行日志写入 `tools/agent_status.log`，该文件已被 Git 忽略
+- 如果重复启动，第二个实例会拒绝监听端口，避免 hook 事件被多个进程抢走
+
+打印 hook 配置示例：
 
 ```powershell
 python tools\agent_status_server.py --print-hooks
 ```
 
-For Codex hooks, call the shim:
+Codex hook 可以调用：
 
 ```text
 py -3 tools\codex_hook.py --state working
 py -3 tools\codex_hook.py --state done
 ```
 
-For Claude Code, merge the printed hook JSON into `~/.claude/settings.json`.
-Supported states are `idle`, `working`, `waiting`, `error`, and `done`.
+Claude Code 用户可以把 `--print-hooks` 打印出的 JSON 合并到
+`~/.claude/settings.json`。支持状态：`idle`、`working`、`waiting`、`error`、
+`done`。
 
-### Open Source Configuration Notes
+For English readers: run `python tools\agent_status_server.py --print-hooks` for
+ready-to-copy Claude Code hook snippets. Codex and other tools can report state
+through `tools\codex_hook.py` or by calling `/event` directly.
 
-Do not commit personal Wi-Fi passwords, AMap keys, Codex bridge IPs, runtime
-logs, or captured screenshots. Use the setup portal or local-only edits for
-private values. The committed defaults are placeholders by design.
+### 开源配置注意事项 / Open Source Notes
+
+请不要提交个人 Wi-Fi 密码、高德 Key、Codex bridge 内网 IP、运行日志或截图。
+这类信息请通过 `192.168.4.1` 配网页面写入设备 NVS，或仅保存在本地未提交配置中。
+仓库里的默认值都是占位符。
+
+Do not commit personal Wi-Fi passwords, AMap keys, bridge IPs, runtime logs, or
+captured screenshots. The committed defaults are placeholders by design.
 
 ## 🖥️ Hardware Overview
 
