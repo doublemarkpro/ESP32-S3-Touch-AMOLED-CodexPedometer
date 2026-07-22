@@ -75,7 +75,7 @@ def record_event(name: str, state: str, project: str = "", detail: str = "") -> 
     # that never fired from one that fired with the wrong state.
     print(
         f"{time.strftime('%H:%M:%S')}  {name:<7} -> {state:<8}"
-        f" {('[' + detail + ']') if detail else ''}",
+        f" project={project or '-':<24} {('[' + detail + ']') if detail else ''}",
         flush=True,
     )
 

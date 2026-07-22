@@ -20,7 +20,7 @@ import threading
 import urllib.parse
 import urllib.request
 
-BRIDGE = "http://127.0.0.1:8766/event"
+BRIDGE = os.environ.get("AGENT_BRIDGE_URL", "http://127.0.0.1:8766/event")
 STDIN_WAIT_SECONDS = 0.4
 HTTP_TIMEOUT_SECONDS = 1.5
 
@@ -69,6 +69,10 @@ def main() -> int:
         fields["project"] = project
     if detail:
         fields["detail"] = detail
+    elif not project:
+        # Make a silent shim distinguishable from one that never ran: seeing
+        # this in the bridge log means the hook fired but stdin carried no cwd.
+        fields["detail"] = "shim-nocwd"
 
     try:
         urllib.request.urlopen(
