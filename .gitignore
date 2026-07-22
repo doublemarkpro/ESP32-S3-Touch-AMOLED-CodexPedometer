@@ -17,3 +17,7 @@
 release-artifacts/
 releases/dist/
 releases/downloads/
+
+# Runtime log written by tools/agent_status_server.py
+tools/agent_status.log
+tools/agent_status.log.old
