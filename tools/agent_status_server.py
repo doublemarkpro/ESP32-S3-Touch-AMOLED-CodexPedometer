@@ -135,12 +135,7 @@ class Handler(BaseHTTPRequestHandler):
         # Hooks that cannot POST can drive the bridge with a plain GET:
         #   /event?agent=claude&state=working&project=x&detail=y
         if path == "/event":
-            query = self.path.split("?", 1)[1] if "?" in self.path else ""
-            fields: dict[str, str] = {}
-            for part in query.split("&"):
-                if "=" in part:
-                    key, _, value = part.partition("=")
-                    fields[key] = _unquote(value)
+            fields = _parse_query(self.path)
             record_event(
                 fields.get("agent", "agent"),
                 fields.get("state", "working"),
@@ -163,12 +158,23 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body = {}
 
-        # Claude Code sends hook_event_name/cwd; a plain {agent,state} body
-        # from any other tool works too.
-        agent = body.get("agent") or body.get("source") or "claude"
-        state = body.get("state") or _state_from_hook(body.get("hook_event_name", ""))
-        project = body.get("project") or os.path.basename(str(body.get("cwd", "")).rstrip("/\\"))
-        detail = body.get("detail") or body.get("tool_name") or ""
+        # Query params win over the body: Codex hooks name the event on the
+        # command line rather than in stdin, so the URL carries agent/state
+        # while the piped JSON still supplies cwd and tool_name.
+        query = _parse_query(self.path)
+
+        agent = query.get("agent") or body.get("agent") or body.get("source") or "claude"
+        state = (
+            query.get("state")
+            or body.get("state")
+            or _state_from_hook(query.get("event") or body.get("hook_event_name", ""))
+        )
+        project = (
+            query.get("project")
+            or body.get("project")
+            or os.path.basename(str(body.get("cwd", "")).rstrip("/\\"))
+        )
+        detail = query.get("detail") or body.get("detail") or body.get("tool_name") or ""
 
         record_event(agent, state, project, detail)
         self._send({"ok": True, "status": build_status()})
@@ -177,10 +183,11 @@ class Handler(BaseHTTPRequestHandler):
         return  # the watch polls constantly; keep the console readable
 
 
-def _unquote(value: str) -> str:
-    from urllib.parse import unquote_plus
+def _parse_query(path: str) -> dict[str, str]:
+    from urllib.parse import parse_qsl
 
-    return unquote_plus(value)
+    query = path.split("?", 1)[1] if "?" in path else ""
+    return {key: value for key, value in parse_qsl(query, keep_blank_values=False)}
 
 
 def _state_from_hook(event: str) -> str:

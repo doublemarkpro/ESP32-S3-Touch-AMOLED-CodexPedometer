@@ -164,6 +164,9 @@
  * than the quota page. */
 #define AGENT_POLL_INTERVAL_MS 2000
 #define AGENT_HTTP_TIMEOUT_MS 3000
+/* Lamp animation tick. The ring is nearly full-screen, so opacity steps are
+ * coarse and deduplicated: a change lands at most ~2.5 times a second. */
+#define AGENT_PULSE_TICK_MS 200
 #define WEATHER_POLL_INTERVAL_MS 1800000
 #define WEATHER_RETRY_INTERVAL_MS 60000
 #define WEATHER_HTTP_TIMEOUT_MS 8000
@@ -2050,6 +2053,54 @@ static agent_state_t agent_state_from_text(const char *text)
 }
 
 /*
+ * Lamp behaviour, matching the three-colour status light this page replaces:
+ * waiting-on-you and errored blink, a finished turn breathes slowly, and
+ * idle/working sit solid. Driven by a coarse timer rather than a smooth
+ * animation because the ring covers almost the whole screen - every opacity
+ * change repaints it, so changes are deduplicated and kept infrequent.
+ */
+static uint8_t s_agent_pulse_phase;
+static lv_opa_t s_agent_pulse_applied = LV_OPA_COVER;
+
+static void agent_apply_pulse_opa(lv_opa_t opa)
+{
+    if (opa == s_agent_pulse_applied || s_agent_ui.ring == NULL) {
+        return;
+    }
+    s_agent_pulse_applied = opa;
+    lv_obj_set_style_arc_opa(s_agent_ui.ring, opa, LV_PART_INDICATOR);
+    lv_obj_set_style_text_opa(s_agent_ui.state_label, opa, 0);
+}
+
+static void agent_pulse_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (s_agent_ui.ring == NULL) {
+        return;
+    }
+
+    /* Only the visible page is worth animating. */
+    if (s_current_page != APP_PAGE_AGENT) {
+        agent_apply_pulse_opa(LV_OPA_COVER);
+        return;
+    }
+
+    agent_state_t state = s_agent_status.valid ? s_agent_status.state : AGENT_STATE_UNKNOWN;
+    s_agent_pulse_phase++;
+
+    lv_opa_t opa = LV_OPA_COVER;
+    if (state == AGENT_STATE_WAITING || state == AGENT_STATE_ERROR) {
+        /* Blink: ~400 ms lit, ~400 ms dimmed. */
+        opa = (s_agent_pulse_phase & 0x02) ? LV_OPA_30 : LV_OPA_COVER;
+    } else if (state == AGENT_STATE_DONE) {
+        /* Breathe over ~3.2 s, stepping every other tick. */
+        static const lv_opa_t breathe[8] = {255, 225, 195, 165, 135, 165, 195, 225};
+        opa = breathe[(s_agent_pulse_phase >> 1) & 0x07];
+    }
+    agent_apply_pulse_opa(opa);
+}
+
+/*
  * The ring is a solid colour band rather than a progress arc: it is the
  * status lamp. Everything else follows the layout of the other data pages.
  */
@@ -2115,6 +2166,7 @@ static void create_agent_page(lv_obj_t *parent)
         create_metric_column(s_agent_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT,
                              "FOR", "--");
 
+    lv_timer_create(agent_pulse_timer_cb, AGENT_PULSE_TICK_MS, NULL);
 }
 
 static void create_page_dots(lv_obj_t *parent)
