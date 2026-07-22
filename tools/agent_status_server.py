@@ -13,9 +13,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 HOST = "0.0.0.0"
@@ -126,6 +129,15 @@ def build_status() -> dict[str, Any]:
         if lead
         else "",
     }
+
+
+class BridgeServer(ThreadingHTTPServer):
+    """HTTPServer enables SO_REUSEADDR, which on Windows lets a second copy
+    bind a port that is already being listened on. Both instances then
+    receive events at random, which looks exactly like flaky hooks. Refuse
+    the second bind so a duplicate fails loudly instead."""
+
+    allow_reuse_address = False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -246,22 +258,151 @@ States: idle | working | waiting | error | done
 """
 
 
-def main() -> None:
+TASK_NAME = "AgentStatusBridge"
+LOG_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _redirect_output(path: Path) -> None:
+    """Send prints to a file so the hidden autostart instance stays debuggable."""
+    try:
+        if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
+            path.replace(path.with_suffix(".log.old"))
+        stream = path.open("a", encoding="utf-8", buffering=1)
+    except OSError:
+        return
+    sys.stdout = stream
+    sys.stderr = stream
+    print(f"\n=== bridge started {time.strftime('%Y-%m-%d %H:%M:%S')} ===", flush=True)
+
+
+def _task_command() -> tuple[str, Path]:
+    """Build the autostart command: pythonw keeps it windowless."""
+    interpreter = Path(sys.executable)
+    windowless = interpreter.with_name("pythonw.exe")
+    if windowless.exists():
+        interpreter = windowless
+    script = Path(__file__).resolve()
+    log = script.with_name("agent_status.log")
+    return f'"{interpreter}" "{script}" --log "{log}"', log
+
+
+def _startup_script() -> Path:
+    startup = (
+        Path(os.environ["APPDATA"])
+        / "Microsoft"
+        / "Windows"
+        / "Start Menu"
+        / "Programs"
+        / "Startup"
+    )
+    return startup / f"{TASK_NAME}.vbs"
+
+
+def _install_via_startup_folder(command: str, log: Path) -> int:
+    """Fallback when the task scheduler needs rights we do not have.
+
+    A .vbs launcher rather than a .cmd: WScript.Run with a hidden window
+    starts pythonw with no console flashing on screen at logon.
+    """
+    target = _startup_script()
+    escaped = command.replace('"', '""')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        'Set sh = CreateObject("WScript.Shell")\r\n'
+        f'sh.Run "{escaped}", 0, False\r\n',
+        encoding="utf-8",
+    )
+    print(f"Installed a startup entry at:\n  {target}")
+    print(f"  runs: {command}")
+    print(f"  log:  {log}")
+    subprocess.Popen(["wscript.exe", str(target)], close_fds=True)
+    print("Started now; it will start again at every logon.")
+    print(f"Remove it with: python {Path(__file__).name} --uninstall")
+    return 0
+
+
+def install_autostart() -> int:
+    command, log = _task_command()
+
+    # A scheduled task is the better home (it can restart on failure), but
+    # creating one needs rights a normal account may not have.
+    create = subprocess.run(
+        ["schtasks", "/Create", "/TN", TASK_NAME, "/TR", command, "/SC", "ONLOGON", "/F"],
+        capture_output=True,
+        text=True,
+    )
+    if create.returncode != 0:
+        print("Task scheduler refused (needs admin); using the startup folder instead.")
+        return _install_via_startup_folder(command, log)
+
+    print(f"Installed '{TASK_NAME}' - it now starts at every logon.")
+    print(f"  runs: {command}")
+    print(f"  log:  {log}")
+    run = subprocess.run(
+        ["schtasks", "/Run", "/TN", TASK_NAME], capture_output=True, text=True
+    )
+    print("Started now." if run.returncode == 0 else "Will start at your next logon.")
+    print(f"Remove it with: python {Path(__file__).name} --uninstall")
+    return 0
+
+
+def uninstall_autostart() -> int:
+    removed = []
+
+    result = subprocess.run(
+        ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"], capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        removed.append("scheduled task")
+
+    target = _startup_script()
+    if target.exists():
+        target.unlink()
+        removed.append(f"startup entry ({target.name})")
+
+    if not removed:
+        print("Nothing to remove.")
+        return 1
+    print("Removed: " + ", ".join(removed))
+    print("A bridge that is already running keeps going until you end it.")
+    return 0
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=PORT)
     parser.add_argument("--print-hooks", action="store_true", help="show hook setup and exit")
+    parser.add_argument("--log", metavar="FILE", help="append output to FILE instead of stdout")
+    parser.add_argument("--install", action="store_true", help="start automatically at logon")
+    parser.add_argument("--uninstall", action="store_true", help="remove the logon task")
     args = parser.parse_args()
 
     if args.print_hooks:
         print(HOOK_HELP)
-        return
+        return 0
+    if args.install:
+        return install_autostart()
+    if args.uninstall:
+        return uninstall_autostart()
 
-    server = ThreadingHTTPServer((HOST, args.port), Handler)
+    if args.log:
+        _redirect_output(Path(args.log))
+
+    try:
+        server = BridgeServer((HOST, args.port), Handler)
+    except OSError as exc:
+        # Nearly always a second copy already listening; say so plainly
+        # instead of dumping a traceback into the log every logon.
+        print(f"Cannot listen on port {args.port}: {exc}")
+        print("Another bridge instance is probably already running.")
+        return 1
+
     print(f"Agent status bridge on http://{HOST}:{args.port}/status")
     print(f"Point AGENT_STATUS_URL in main/app_config.h at this host:{args.port}.")
-    print("Run with --print-hooks for the Claude Code / Codex hook setup.")
+    print("Run with --print-hooks for hook setup, --install to start at logon.")
     server.serve_forever()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
