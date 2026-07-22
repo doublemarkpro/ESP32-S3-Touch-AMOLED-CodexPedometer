@@ -48,6 +48,9 @@ def _blank(name: str) -> dict[str, Any]:
         "detail": "",
         "since": _now(),
         "updated": _now(),
+        # Wall clock of the last state *change*, so the watch shows when the
+        # state last moved rather than a clock that ticks on every poll.
+        "changed_wall": time.time(),
     }
 
 
@@ -72,6 +75,7 @@ def record_event(name: str, state: str, project: str = "", detail: str = "") -> 
         agent = _agents.get(name) or _blank(name)
         if agent["state"] != state:
             agent["since"] = _now()
+            agent["changed_wall"] = time.time()
         agent["state"] = state
         agent["updated"] = _now()
         if project:
@@ -107,7 +111,9 @@ def build_status() -> dict[str, Any]:
         "elapsed": max(0, elapsed),
         "codex": per_agent.get("codex", "idle" if "codex" in per_agent else ""),
         "claude": per_agent.get("claude", "idle" if "claude" in per_agent else ""),
-        "updated": time.strftime("%H:%M:%S"),
+        "updated": time.strftime("%H:%M:%S", time.localtime(lead["changed_wall"]))
+        if lead
+        else "",
     }
 
 
@@ -179,12 +185,19 @@ def _unquote(value: str) -> str:
 
 def _state_from_hook(event: str) -> str:
     return {
+        "SessionStart": "idle",
         "UserPromptSubmit": "working",
         "PreToolUse": "working",
         "PostToolUse": "working",
-        "Notification": "waiting",
-        "Stop": "done",
         "SubagentStop": "working",
+        # Anything that blocks on a human turns the ring amber.
+        "Notification": "waiting",
+        "PermissionRequest": "waiting",
+        "PermissionDenied": "waiting",
+        "Elicitation": "waiting",
+        "Stop": "done",
+        "StopFailure": "error",
+        "PostToolUseFailure": "error",
         "SessionEnd": "idle",
     }.get(event, "working")
 

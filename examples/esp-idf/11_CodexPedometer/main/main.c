@@ -188,6 +188,8 @@
 #define UI_METRIC_VALUE_CENTER_Y 133
 #define UI_METRIC_LABEL_CENTER_Y 155
 #define UI_UPDATED_CENTER_Y 172
+/* Agent page keeps its timestamp directly under the state word. */
+#define UI_AGENT_UPDATED_CENTER_Y 26
 #define PAGE_DOTS_VISIBLE 0
 #define PAGE_NAV_DEBOUNCE_MS 320
 #define PAGE_ANIM_MS 240
@@ -2082,6 +2084,14 @@ static void create_agent_page(lv_obj_t *parent)
     lv_label_set_long_mode(s_agent_ui.state_label, LV_LABEL_LONG_CLIP);
     lv_obj_align(s_agent_ui.state_label, LV_ALIGN_CENTER, 0, UI_VALUE_CENTER_Y);
 
+    /* Time of the last state change, right under the state word. */
+    s_agent_ui.updated_label = create_label(s_agent_ui.page, "", FONT_MEDIUM,
+                                            lv_color_hex(0xC9D3DC));
+    lv_obj_set_width(s_agent_ui.updated_label, 320);
+    lv_obj_set_style_text_align(s_agent_ui.updated_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_agent_ui.updated_label, LV_LABEL_LONG_CLIP);
+    lv_obj_align(s_agent_ui.updated_label, LV_ALIGN_CENTER, 0, UI_AGENT_UPDATED_CENTER_Y);
+
     s_agent_ui.target_label = create_label(s_agent_ui.page, "", FONT_SMALL,
                                            lv_color_hex(0x9AA7B5));
     lv_obj_set_width(s_agent_ui.target_label, 320);
@@ -2105,12 +2115,6 @@ static void create_agent_page(lv_obj_t *parent)
         create_metric_column(s_agent_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT,
                              "FOR", "--");
 
-    s_agent_ui.updated_label = create_label(s_agent_ui.page, "", FONT_SMALL,
-                                            lv_color_hex(0x63717F));
-    lv_obj_set_width(s_agent_ui.updated_label, 280);
-    lv_obj_set_style_text_align(s_agent_ui.updated_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(s_agent_ui.updated_label, LV_LABEL_LONG_DOT);
-    lv_obj_align(s_agent_ui.updated_label, LV_ALIGN_CENTER, 0, UI_UPDATED_CENTER_Y);
 }
 
 static void create_page_dots(lv_obj_t *parent)
