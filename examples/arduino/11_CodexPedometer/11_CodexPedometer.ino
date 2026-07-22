@@ -16,7 +16,7 @@ static const char *WIFI_SSID = "YOUR_WIFI_SSID";
 static const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
 // Run tools/codex_usage_server.py on your PC, then replace the host with your PC LAN IP.
-static const char *CODEX_USAGE_URL = "http://192.168.50.37:8765/usage";
+static const char *CODEX_USAGE_URL = "http://YOUR_PC_LAN_IP:8765/usage";
 
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t buf[LCD_WIDTH * LCD_HEIGHT / 10];

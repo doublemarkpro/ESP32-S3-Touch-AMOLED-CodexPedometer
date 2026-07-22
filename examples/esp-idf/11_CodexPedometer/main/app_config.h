@@ -7,8 +7,8 @@
 #define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 #define NTP_SERVER "ntp.aliyun.com"
-#define CODEX_USAGE_URL "http://192.168.50.37:8765/usage"
+#define CODEX_USAGE_URL "http://YOUR_PC_LAN_IP:8765/usage"
 /* Served by tools/agent_status_server.py; fed by Claude Code / Codex hooks. */
-#define AGENT_STATUS_URL "http://192.168.50.37:8766/status"
+#define AGENT_STATUS_URL "http://YOUR_PC_LAN_IP:8766/status"
 #define WEATHER_CITY "青岛市"
 #define AMAP_WEATHER_KEY "YOUR_AMAP_WEB_SERVICE_KEY"
