@@ -69,10 +69,11 @@ def main() -> int:
         fields["project"] = project
     if detail:
         fields["detail"] = detail
-    elif not project:
-        # Make a silent shim distinguishable from one that never ran: seeing
-        # this in the bridge log means the hook fired but stdin carried no cwd.
-        fields["detail"] = "shim-nocwd"
+    if not project:
+        # Diagnostic only - "note" is logged by the bridge but never shown on
+        # the watch, so a silent shim stays distinguishable from one that
+        # never ran without leaking debug text onto the face.
+        fields["note"] = "shim-nocwd"
 
     try:
         urllib.request.urlopen(

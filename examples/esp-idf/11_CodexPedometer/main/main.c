@@ -2099,11 +2099,14 @@ static void agent_set_lamp_mode(agent_lamp_mode_t mode)
     lv_anim_set_repeat_count(&anim, LV_ANIM_REPEAT_INFINITE);
 
     if (mode == AGENT_LAMP_BLINK) {
-        /* A blink is meant to be hard on/off, so step rather than fade. */
-        lv_anim_set_values(&anim, LV_OPA_COVER, LV_OPA_20);
-        lv_anim_set_duration(&anim, 380);
-        lv_anim_set_reverse_duration(&anim, 380);
-        lv_anim_set_path_cb(&anim, lv_anim_path_step);
+        /* Also a fade, not a hard on/off: stepping the whole ring in one
+         * frame exposes the 14-row strip refresh as visible banding on this
+         * TE-less panel. Faster and deeper than the breathe so it still
+         * reads as "needs you" rather than "resting". */
+        lv_anim_set_values(&anim, LV_OPA_COVER, 60);
+        lv_anim_set_duration(&anim, 520);
+        lv_anim_set_reverse_duration(&anim, 520);
+        lv_anim_set_path_cb(&anim, lv_anim_path_ease_in_out);
     } else {
         lv_anim_set_values(&anim, LV_OPA_COVER, 70);
         lv_anim_set_duration(&anim, 1300);
@@ -3217,7 +3220,9 @@ static void render_agent_status(const agent_status_t *status, const char *fallba
     char elapsed_text[12];
     if (data->valid && (data->agent[0] != '\0' || data->project[0] != '\0')) {
         if (data->agent[0] != '\0' && data->project[0] != '\0') {
-            snprintf(target_text, sizeof(target_text), "%s · %s", data->agent, data->project);
+            /* ASCII only: the Montserrat build carries no U+00B7, so a middle
+             * dot separator renders as a missing-glyph box. */
+            snprintf(target_text, sizeof(target_text), "%s - %s", data->agent, data->project);
         } else {
             snprintf(target_text, sizeof(target_text), "%s",
                      data->agent[0] != '\0' ? data->agent : data->project);

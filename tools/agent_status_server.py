@@ -65,7 +65,9 @@ def _effective(agent: dict[str, Any]) -> str:
     return state
 
 
-def record_event(name: str, state: str, project: str = "", detail: str = "") -> None:
+def record_event(
+    name: str, state: str, project: str = "", detail: str = "", note: str = ""
+) -> None:
     name = (name or "agent").strip().lower()
     state = (state or "").strip().lower()
     if state not in STATES:
@@ -75,7 +77,8 @@ def record_event(name: str, state: str, project: str = "", detail: str = "") -> 
     # that never fired from one that fired with the wrong state.
     print(
         f"{time.strftime('%H:%M:%S')}  {name:<7} -> {state:<8}"
-        f" project={project or '-':<24} {('[' + detail + ']') if detail else ''}",
+        f" project={project or '-':<24} {('[' + detail + ']') if detail else ''}"
+        f"{(' <' + note + '>') if note else ''}",
         flush=True,
     )
 
@@ -149,6 +152,7 @@ class Handler(BaseHTTPRequestHandler):
                 fields.get("state", "working"),
                 fields.get("project", ""),
                 fields.get("detail", ""),
+                fields.get("note", ""),
             )
             self._send({"ok": True})
             return
@@ -184,7 +188,8 @@ class Handler(BaseHTTPRequestHandler):
         )
         detail = query.get("detail") or body.get("detail") or body.get("tool_name") or ""
 
-        record_event(agent, state, project, detail)
+        note = query.get("note") or body.get("note") or ""
+        record_event(agent, state, project, detail, note)
         self._send({"ok": True, "status": build_status()})
 
     def log_message(self, fmt: str, *args: object) -> None:
