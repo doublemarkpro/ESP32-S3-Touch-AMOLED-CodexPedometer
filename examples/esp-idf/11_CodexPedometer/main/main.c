@@ -54,7 +54,7 @@
  * starts failing once Wi-Fi has claimed internal heap. 466 x 20 x 2 bytes
  * x 2 buffers = ~26 KB reserved once at boot. Height is kept modest so task
  * stacks (which must be internal) always fit alongside the LVGL widgets. */
-#define APP_DRAW_BUFFER_HEIGHT 14
+#define APP_DRAW_BUFFER_HEIGHT 20
 #define CO5300_GRAM_RES 480
 #define PANEL_CLEAR_ROWS 13
 
