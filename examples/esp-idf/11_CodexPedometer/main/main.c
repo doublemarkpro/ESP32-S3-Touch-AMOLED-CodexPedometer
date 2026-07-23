@@ -380,9 +380,9 @@ typedef struct {
     lv_obj_t *date_label;
     lv_obj_t *range_label;
     lv_obj_t *cond_label;
-    lv_obj_t *day_value_label;
     lv_obj_t *night_value_label;
     lv_obj_t *wind_value_label;
+    lv_obj_t *force_value_label;
     lv_obj_t *dots[WEATHER_FORECAST_DAYS];
 } forecast_ui_t;
 
@@ -424,11 +424,12 @@ typedef struct {
 typedef struct {
     char date[12];      /* MM-DD */
     char day_cond[24];
-    char night_cond[24];
-    char wind[32];      /* direction + power, e.g. "S 1-3" */
+    char wind_dir[8];   /* compass letters, e.g. "S" */
+    char wind_power[12];/* Beaufort range, e.g. "1-3" */
     int day_temp_c;
     int night_temp_c;
     int day_code;
+    int night_code;
     bool valid;
 } weather_day_t;
 
@@ -2717,12 +2718,14 @@ static void create_forecast_page(lv_obj_t *parent)
     lv_label_set_long_mode(s_forecast_ui.cond_label, LV_LABEL_LONG_DOT);
     lv_obj_align(s_forecast_ui.cond_label, LV_ALIGN_CENTER, 0, 58);
 
-    s_forecast_ui.day_value_label =
-        create_metric_column(page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED, "DAY", "--");
+    /* One unambiguous fact per column; the daytime condition already sits
+     * under the temperature range so it is not repeated here. */
     s_forecast_ui.night_value_label =
-        create_metric_column(page, 0, false, METRIC_ICON_LEFT, "NIGHT", "--");
+        create_metric_column(page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED, "NIGHT", "--");
     s_forecast_ui.wind_value_label =
-        create_metric_column(page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT, "WIND", "--");
+        create_metric_column(page, 0, false, METRIC_ICON_LEFT, "WIND", "--");
+    s_forecast_ui.force_value_label =
+        create_metric_column(page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT, "FORCE", "--");
 
     for (int i = 0; i < WEATHER_FORECAST_DAYS; i++) {
         lv_obj_t *dot = lv_obj_create(page);
@@ -3723,18 +3726,20 @@ static void render_forecast_locked(void)
     snprintf(text, sizeof(text), "%d°~%d°", day->night_temp_c, day->day_temp_c);
     set_label_text_if_changed(s_forecast_ui.range_label, text);
 
-    const char *cond = text_glyphs_available(FONT_CJK, day->day_cond)
-                           ? day->day_cond
-                           : weather_condition_en(day->day_code);
-    set_label_text_if_changed(s_forecast_ui.cond_label, cond);
-    set_label_text_if_changed(s_forecast_ui.day_value_label, cond);
+    /* The centre line uses the CJK font, so Chinese is fine there. */
+    set_label_text_if_changed(s_forecast_ui.cond_label,
+                              text_glyphs_available(FONT_CJK, day->day_cond)
+                                  ? day->day_cond
+                                  : weather_condition_en(day->day_code));
 
-    const char *night = text_glyphs_available(FONT_CJK, day->night_cond)
-                            ? day->night_cond
-                            : "--";
-    set_label_text_if_changed(s_forecast_ui.night_value_label, night);
+    /* Metric columns render in Montserrat, which carries no CJK at all, so
+     * their values must stay ASCII regardless of what the API returned. */
+    set_label_text_if_changed(s_forecast_ui.night_value_label,
+                              weather_condition_en(day->night_code));
     set_label_text_if_changed(s_forecast_ui.wind_value_label,
-                              day->wind[0] != '\0' ? day->wind : "--");
+                              day->wind_dir[0] != '\0' ? day->wind_dir : "--");
+    set_label_text_if_changed(s_forecast_ui.force_value_label,
+                              day->wind_power[0] != '\0' ? day->wind_power : "--");
 
     draw_weather_icon(s_forecast_ui.icon, day->day_code);
 
@@ -4376,17 +4381,14 @@ static bool parse_amap_weather_json(const char *json, weather_data_t *weather,
             day->day_code = weather_code_from_china_type(field);
         }
         if (json_get_string(entry, "nightweather", field, sizeof(field))) {
-            copy_string(day->night_cond, sizeof(day->night_cond), field);
+            day->night_code = weather_code_from_china_type(field);
         }
 
-        char power[16];
         if (json_get_string(entry, "daywind", field, sizeof(field))) {
-            if (json_get_string(entry, "daypower", power, sizeof(power))) {
-                snprintf(day->wind, sizeof(day->wind), "%s %s",
-                         wind_direction_en(field), power);
-            } else {
-                copy_string(day->wind, sizeof(day->wind), wind_direction_en(field));
-            }
+            copy_string(day->wind_dir, sizeof(day->wind_dir), wind_direction_en(field));
+        }
+        if (json_get_string(entry, "daypower", field, sizeof(field))) {
+            copy_string(day->wind_power, sizeof(day->wind_power), field);
         }
 
         day->valid = true;
@@ -4698,9 +4700,11 @@ static esp_err_t fetch_weather(weather_data_t *weather)
         ESP_LOGI(TAG, "Weather live %dC in range %d..%dC", parsed.current_temp_c,
                  parsed.min_temp_c, parsed.max_temp_c);
         for (int i = 0; i < parsed.day_count; i++) {
-            ESP_LOGI(TAG, "  forecast[%d] %s %d..%dC wind=%s", i, parsed.days[i].date,
-                     parsed.days[i].night_temp_c, parsed.days[i].day_temp_c,
-                     parsed.days[i].wind);
+            ESP_LOGI(TAG, "  forecast[%d] %s %d..%dC day=%s night=%s wind=%s %s", i,
+                     parsed.days[i].date, parsed.days[i].night_temp_c,
+                     parsed.days[i].day_temp_c, weather_condition_en(parsed.days[i].day_code),
+                     weather_condition_en(parsed.days[i].night_code),
+                     parsed.days[i].wind_dir, parsed.days[i].wind_power);
         }
     }
 
