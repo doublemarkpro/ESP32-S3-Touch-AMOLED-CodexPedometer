@@ -484,6 +484,26 @@ static volatile float s_board_temp_c = BOARD_TEMP_INVALID;
 static volatile bool s_ntp_resync_requested;
 static uint8_t s_corner_widget[4] = {CW_BATTERY, CW_TEMP, CW_WEEKDAY, CW_DATE};
 
+/* Ring accent colors, adjustable from the provisioning web page. The AI ring
+ * is deliberately absent: its color IS the state. */
+typedef enum {
+    THEME_BATTERY,
+    THEME_TEMP,
+    THEME_WEEKDAY,
+    THEME_DATE,
+    THEME_CODEX,
+    THEME_STEPS,
+    THEME_MUSIC,
+    THEME_COUNT,
+} theme_color_id_t;
+
+static const char *const THEME_NAMES[THEME_COUNT] = {
+    "电量", "温度", "星期", "日期", "Codex", "步数", "音乐",
+};
+static uint32_t s_theme_color[THEME_COUNT] = {
+    0x30D158, 0xFF9F0A, 0xBF5AF2, 0xFF453A, 0xFFD166, 0x9DFF35, 0x18D7F5,
+};
+
 typedef struct {
     lv_obj_t *panel;
     lv_obj_t *brightness_label;
@@ -534,7 +554,6 @@ static bool text_glyphs_available(const lv_font_t *font, const char *text);
 static const char *weather_condition_en(int code);
 static uint32_t agent_state_color(agent_state_t state);
 static const char *agent_state_short(agent_state_t state);
-static const char *weekday_cn(int wday);
 static void save_ui_settings(void);
 static bool corner_handle_tap(lv_point_t point);
 static bool json_get_string(const char *json, const char *key, char *out_value, size_t out_size);
@@ -761,6 +780,14 @@ static void load_ui_settings(void)
             s_corner_widget[corner] = value;
         }
     }
+    for (int i = 0; i < THEME_COUNT; i++) {
+        char key[12];
+        uint32_t color = 0;
+        snprintf(key, sizeof(key), "theme%d", i);
+        if (nvs_get_u32(nvs, key, &color) == ESP_OK && color <= 0xFFFFFF) {
+            s_theme_color[i] = color;
+        }
+    }
     nvs_close(nvs);
 }
 
@@ -778,6 +805,11 @@ static void save_ui_settings(void)
         char key[12];
         snprintf(key, sizeof(key), "corner%d", corner);
         (void)nvs_set_u8(nvs, key, s_corner_widget[corner]);
+    }
+    for (int i = 0; i < THEME_COUNT; i++) {
+        char key[12];
+        snprintf(key, sizeof(key), "theme%d", i);
+        (void)nvs_set_u32(nvs, key, s_theme_color[i]);
     }
     (void)nvs_commit(nvs);
     nvs_close(nvs);
@@ -1595,6 +1627,27 @@ static lv_obj_t *create_corner_gauge(lv_obj_t *parent, int32_t x_ofs, int32_t y_
     return arc;
 }
 
+static const char *weekday_short_cn(int wday)
+{
+    static const char *const days[] = {"日", "一", "二", "三", "四", "五", "六"};
+    if (wday < 0 || wday > 6) {
+        return "-";
+    }
+    return days[wday];
+}
+
+static int days_in_month(int year, int month)
+{
+    static const int days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (month < 1 || month > 12) {
+        return 31;
+    }
+    if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) {
+        return 29;
+    }
+    return days[month - 1];
+}
+
 static int32_t corner_x_ofs(int corner)
 {
     return (corner == 0 || corner == 2) ? -WATCH_CORNER_OFS : WATCH_CORNER_OFS;
@@ -1623,11 +1676,10 @@ static void corner_apply_widget_locked(int corner)
     /* Top corners put the caption under the content, bottom corners above. */
     int32_t caption_y = corner < 2 ? cy + 45 : cy - 45;
 
-    bool uses_arc = type == CW_BATTERY || type == CW_TEMP || type == CW_CODEX ||
-                    type == CW_AGENT;
+    bool uses_arc = type != CW_WEATHER;
     set_obj_hidden(arc, !uses_arc);
 
-    uint32_t arc_color = WATCH_COLOR_BATTERY;
+    uint32_t arc_color = s_theme_color[THEME_BATTERY];
     int32_t range_min = 0;
     int32_t range_max = 100;
     const lv_font_t *value_font = FONT_SMALL;
@@ -1641,22 +1693,25 @@ static void corner_apply_widget_locked(int corner)
         caption_text = "电量";
         break;
     case CW_TEMP:
-        arc_color = WATCH_COLOR_TEMP;
+        arc_color = s_theme_color[THEME_TEMP];
         range_min = -10;
         range_max = 50;
         caption_text = "温度";
         break;
     case CW_WEEKDAY:
+        /* Ring fills wday/7; the single weekday character sits inside. */
+        arc_color = s_theme_color[THEME_WEEKDAY];
+        range_max = 7;
         value_font = FONT_CJK;
-        value_color = WATCH_COLOR_WEEKDAY;
+        value_color = s_theme_color[THEME_WEEKDAY];
         caption_text = "星期";
         break;
     case CW_DATE:
-        /* Caption doubles as the red month, value is the big day number. */
-        value_font = FONT_VALUE;
-        value_y = cy + (corner < 2 ? -8 : 10);
-        caption_y = corner < 2 ? cy + 30 : cy - 22;
-        caption_color = WATCH_COLOR_MONTH;
+        /* Ring fills day/days-in-month; caption doubles as the month. */
+        arc_color = s_theme_color[THEME_DATE];
+        range_max = 31;
+        value_font = FONT_MEDIUM;
+        caption_color = s_theme_color[THEME_DATE];
         break;
     case CW_WEATHER:
         value_font = FONT_MEDIUM;
@@ -1664,7 +1719,7 @@ static void corner_apply_widget_locked(int corner)
         caption_color = WATCH_COLOR_WEEKDAY;
         break;
     case CW_CODEX:
-        arc_color = 0xFFD166;
+        arc_color = s_theme_color[THEME_CODEX];
         caption_text = "Codex";
         break;
     case CW_AGENT:
@@ -1728,15 +1783,29 @@ static void corner_render_widget_locked(int corner, const struct tm *local_time)
         set_label_text_if_changed(value, text);
         break;
     }
-    case CW_WEEKDAY:
-        set_label_text_if_changed(value, weekday_cn(local_time->tm_wday));
+    case CW_WEEKDAY: {
+        /* Monday=1 .. Sunday=7, so the ring reads as week progress. */
+        int wday7 = local_time->tm_wday == 0 ? 7 : local_time->tm_wday;
+        if (lv_arc_get_value(arc) != wday7) {
+            lv_arc_set_value(arc, wday7);
+        }
+        set_label_text_if_changed(value, weekday_short_cn(local_time->tm_wday));
         break;
-    case CW_DATE:
+    }
+    case CW_DATE: {
+        int days = days_in_month(local_time->tm_year + 1900, local_time->tm_mon + 1);
+        if (lv_arc_get_max_value(arc) != days) {
+            lv_arc_set_range(arc, 0, days);
+        }
+        if (lv_arc_get_value(arc) != local_time->tm_mday) {
+            lv_arc_set_value(arc, local_time->tm_mday);
+        }
         snprintf(text, sizeof(text), "%d月", local_time->tm_mon + 1);
         set_label_text_if_changed(caption, text);
         snprintf(text, sizeof(text), "%d", local_time->tm_mday);
         set_label_text_if_changed(value, text);
         break;
+    }
     case CW_WEATHER:
         if (s_last_weather.valid) {
             snprintf(text, sizeof(text), "%d°", s_last_weather.current_temp_c);
@@ -1779,6 +1848,37 @@ static void corner_render_widget_locked(int corner, const struct tm *local_time)
     default:
         break;
     }
+}
+
+/* Push the (possibly just web-edited) theme colors onto every ring that is
+ * already built. Corner arcs are handled by re-applying their widget type. */
+static void apply_theme_colors(void)
+{
+    if (bsp_display_lock(DISPLAY_LOCK_TIMEOUT_MS) != ESP_OK) {
+        return;
+    }
+    for (int corner = 0; corner < 4; corner++) {
+        corner_apply_widget_locked(corner);
+        struct tm local_time;
+        get_local_clock(&local_time);
+        corner_render_widget_locked(corner, &local_time);
+    }
+    if (s_pedometer_ui.progress_arc != NULL) {
+        lv_obj_set_style_arc_color(s_pedometer_ui.progress_arc,
+                                   lv_color_hex(s_theme_color[THEME_STEPS]),
+                                   LV_PART_INDICATOR);
+    }
+    if (s_codex_ui.usage_arc != NULL) {
+        lv_obj_set_style_arc_color(s_codex_ui.usage_arc,
+                                   lv_color_hex(s_theme_color[THEME_CODEX]),
+                                   LV_PART_INDICATOR);
+    }
+    if (s_music_ui.vu_arc != NULL) {
+        lv_obj_set_style_arc_color(s_music_ui.vu_arc,
+                                   lv_color_hex(s_theme_color[THEME_MUSIC]),
+                                   LV_PART_INDICATOR);
+    }
+    bsp_display_unlock();
 }
 
 /* A short tap on the clock face cycles the corner under the finger to the
@@ -2135,7 +2235,8 @@ static void create_pedometer_page(lv_obj_t *parent)
     lv_obj_set_style_arc_width(s_pedometer_ui.progress_arc, UI_ARC_WIDTH, LV_PART_INDICATOR);
     lv_obj_set_style_arc_rounded(s_pedometer_ui.progress_arc, true, LV_PART_INDICATOR);
     lv_obj_set_style_arc_color(s_pedometer_ui.progress_arc, lv_color_hex(0x17212B), LV_PART_MAIN);
-    lv_obj_set_style_arc_color(s_pedometer_ui.progress_arc, lv_color_hex(0x9DFF35),
+    lv_obj_set_style_arc_color(s_pedometer_ui.progress_arc,
+                               lv_color_hex(s_theme_color[THEME_STEPS]),
                                LV_PART_INDICATOR);
 
     s_pedometer_ui.main_icon = create_main_icon(s_pedometer_ui.page, &ui_icon_steps);
@@ -2189,7 +2290,8 @@ static void create_codex_page(lv_obj_t *parent)
     lv_obj_set_style_arc_width(s_codex_ui.usage_arc, UI_ARC_WIDTH, LV_PART_INDICATOR);
     lv_obj_set_style_arc_rounded(s_codex_ui.usage_arc, true, LV_PART_INDICATOR);
     lv_obj_set_style_arc_color(s_codex_ui.usage_arc, lv_color_hex(0x17212B), LV_PART_MAIN);
-    lv_obj_set_style_arc_color(s_codex_ui.usage_arc, lv_color_hex(0xFFD166), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_codex_ui.usage_arc,
+                               lv_color_hex(s_theme_color[THEME_CODEX]), LV_PART_INDICATOR);
 
     s_codex_ui.main_icon = create_label(s_codex_ui.page, "Codex", FONT_TITLE,
                                         lv_color_hex(0xFFD166));
@@ -2489,7 +2591,8 @@ static void create_music_page(lv_obj_t *parent)
     lv_obj_set_style_arc_width(s_music_ui.vu_arc, UI_ARC_WIDTH, LV_PART_INDICATOR);
     lv_obj_set_style_arc_rounded(s_music_ui.vu_arc, true, LV_PART_INDICATOR);
     lv_obj_set_style_arc_color(s_music_ui.vu_arc, lv_color_hex(0x17212B), LV_PART_MAIN);
-    lv_obj_set_style_arc_color(s_music_ui.vu_arc, lv_color_hex(0x18D7F5), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_music_ui.vu_arc,
+                               lv_color_hex(s_theme_color[THEME_MUSIC]), LV_PART_INDICATOR);
 
     /* Caption sits high so the tallest bars never crowd it. */
     lv_obj_t *caption = create_label(s_music_ui.page, "MUSIC", FONT_TITLE,
@@ -3019,23 +3122,6 @@ static void screenshot_console_task(void *arg)
             line[index++] = (char)ch;
         }
     }
-}
-
-static const char *weekday_cn(int wday)
-{
-    static const char *const weekdays[] = {
-        "星期日",
-        "星期一",
-        "星期二",
-        "星期三",
-        "星期四",
-        "星期五",
-        "星期六",
-    };
-    if (wday < 0 || wday >= (int)(sizeof(weekdays) / sizeof(weekdays[0]))) {
-        return "星期一";
-    }
-    return weekdays[wday];
 }
 
 static void update_time_page_locked(void)
@@ -4563,6 +4649,20 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
              (unsigned long)s_pedometer_goal_steps);
     httpd_resp_sendstr_chunk(req, goal_input);
 
+    httpd_resp_sendstr_chunk(req, "<label>小组件颜色</label>"
+                                  "<div style='display:grid;grid-template-columns:repeat(4,1fr);"
+                                  "gap:8px;margin:8px 0 16px'>");
+    for (int i = 0; i < THEME_COUNT; i++) {
+        char color_input[192];
+        snprintf(color_input, sizeof(color_input),
+                 "<span style='font-size:13px;color:#9fb0c0'>%s"
+                 "<input name='theme%d' type='color' value='#%06lx'"
+                 " style='margin:4px 0 0;padding:2px;height:34px'></span>",
+                 THEME_NAMES[i], i, (unsigned long)s_theme_color[i]);
+        httpd_resp_sendstr_chunk(req, color_input);
+    }
+    httpd_resp_sendstr_chunk(req, "</div>");
+
     httpd_resp_sendstr_chunk(req,
                              "<button type='submit'>保存并连接</button></form>"
                              "<p class='hint'>当前保存 SSID: ");
@@ -4643,6 +4743,30 @@ static esp_err_t config_page_post_handler(httpd_req_t *req)
         } else {
             ret = ESP_ERR_INVALID_ARG;
         }
+    }
+
+    /* Ring colors: <input type=color> posts "#rrggbb" (# arrives as %23 and
+     * url_decode already unescaped it). */
+    bool theme_changed = false;
+    for (int i = 0; i < THEME_COUNT; i++) {
+        char field[12];
+        char color_text[12];
+        snprintf(field, sizeof(field), "theme%d", i);
+        if (!get_form_value(body, field, color_text, sizeof(color_text))) {
+            continue;
+        }
+        const char *hex = color_text[0] == '#' ? color_text + 1 : color_text;
+        char *end = NULL;
+        unsigned long color = strtoul(hex, &end, 16);
+        if (end != hex && *end == '\0' && color <= 0xFFFFFF &&
+            (uint32_t)color != s_theme_color[i]) {
+            s_theme_color[i] = (uint32_t)color;
+            theme_changed = true;
+        }
+    }
+    if (theme_changed) {
+        save_ui_settings();
+        apply_theme_colors();
     }
     if (ret == ESP_OK && weather_changed) {
         s_last_weather.valid = false;
