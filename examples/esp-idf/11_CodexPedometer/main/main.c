@@ -304,7 +304,41 @@ typedef struct {
     lv_obj_t *corner_arc[4];
     lv_obj_t *corner_value[4];
     lv_obj_t *corner_caption[4];
+    /* Pixel analog face */
+    lv_obj_t *px_time_pill;
+    lv_obj_t *px_side_pill;
+    lv_obj_t *px_top_ring;
+    lv_obj_t *px_sub_dial;
+    lv_obj_t *px_sub_value;
+    lv_obj_t *px_center_ring;
+    /* Pixel tiles face */
+    lv_obj_t *tile_hour;
+    lv_obj_t *tile_minute;
+    lv_obj_t *tile_weather;
+    lv_obj_t *tile_steps;
+    lv_obj_t *tile_batt;
 } time_ui_t;
+
+/* Selectable watch faces. Only the active one is built; switching tears the
+ * old widget tree down and builds the new one, so adding faces costs no
+ * steady-state memory. */
+typedef enum {
+    FACE_INFOGRAPH,
+    FACE_PIXEL_ANALOG,
+    FACE_PIXEL_TILES,
+    FACE_COUNT,
+} watchface_t;
+
+/* Material-style palette used by the Pixel faces. */
+#define PX_BLUE_BRIGHT 0xA8C7FA
+#define PX_BLUE_TEXT 0x8AB4F8
+#define PX_BLUE_DIM 0x5E88BF
+#define PX_TILE_STRONG 0x1A6BC4
+#define PX_TILE_MID 0x12457D
+#define PX_TILE_DARK 0x0E3A6B
+#define PX_TILE_TEXT 0xD6E6FF
+#define PX_TICK_DIM 0x6E7A86
+#define PX_WHITE 0xF2F2F7
 
 /* Tap-cyclable corner complications on the watch face. Order here is the
  * cycle order. */
@@ -518,6 +552,7 @@ static volatile int s_battery_percent = -1;
 static volatile float s_board_temp_c = BOARD_TEMP_INVALID;
 static volatile bool s_ntp_resync_requested;
 static uint8_t s_corner_widget[4] = {CW_BATTERY, CW_TEMP, CW_WEEKDAY, CW_DATE};
+static uint8_t s_watchface = FACE_INFOGRAPH;
 
 /* Ring accent colors, adjustable from the provisioning web page. The AI ring
  * is deliberately absent: its color IS the state. */
@@ -548,6 +583,7 @@ typedef struct {
     lv_obj_t *volume_slider;
     lv_obj_t *standby_checkbox;
     lv_obj_t *standby_slider;
+    lv_obj_t *face_buttons[FACE_COUNT];
 } settings_ui_t;
 
 static settings_ui_t s_settings_ui;
@@ -592,6 +628,8 @@ static uint32_t agent_state_color(agent_state_t state);
 static const char *agent_state_short(agent_state_t state);
 static void save_ui_settings(void);
 static bool corner_handle_tap(lv_point_t point);
+static void rebuild_watchface_locked(void);
+static void settings_face_event_cb(lv_event_t *event);
 static bool weather_icon_hit(lv_point_t point);
 static void show_forecast_page(bool show);
 static void render_forecast_locked(void);
@@ -830,6 +868,9 @@ static void load_ui_settings(void)
             s_theme_color[i] = color;
         }
     }
+    if (nvs_get_u8(nvs, "face", &value) == ESP_OK && value < FACE_COUNT) {
+        s_watchface = value;
+    }
     nvs_close(nvs);
 }
 
@@ -853,6 +894,7 @@ static void save_ui_settings(void)
         snprintf(key, sizeof(key), "theme%d", i);
         (void)nvs_set_u32(nvs, key, s_theme_color[i]);
     }
+    (void)nvs_set_u8(nvs, "face", s_watchface);
     (void)nvs_commit(nvs);
     nvs_close(nvs);
 }
@@ -1618,6 +1660,24 @@ static void draw_canvas_text(lv_layer_t *layer, const char *text, const lv_font_
 
 /* Static dial artwork (ticks, numerals, corner captions) is rendered once
  * into a PSRAM canvas so per-frame redraws are a plain image blit. */
+/*
+ * lv_canvas_set_buffer does not take ownership, and lv_obj_clean only
+ * destroys the widget - so a rebuilt face would leak its whole 434 KB
+ * canvas buffer every time. Tie the buffer's lifetime to the object.
+ */
+static void canvas_delete_cb(lv_event_t *event)
+{
+    void *buf = lv_event_get_user_data(event);
+    if (buf != NULL) {
+        heap_caps_free(buf);
+    }
+}
+
+static void canvas_own_buffer(lv_obj_t *canvas, void *buf)
+{
+    lv_obj_add_event_cb(canvas, canvas_delete_cb, LV_EVENT_DELETE, buf);
+}
+
 static lv_obj_t *create_dial_canvas(lv_obj_t *parent)
 {
     size_t buf_size = (size_t)BSP_LCD_H_RES * BSP_LCD_V_RES * 2;
@@ -1629,6 +1689,7 @@ static lv_obj_t *create_dial_canvas(lv_obj_t *parent)
 
     lv_obj_t *canvas = lv_canvas_create(parent);
     lv_canvas_set_buffer(canvas, buf, BSP_LCD_H_RES, BSP_LCD_V_RES, LV_COLOR_FORMAT_RGB565);
+    canvas_own_buffer(canvas, buf);
     lv_obj_set_pos(canvas, 0, 0);
     lv_obj_clear_flag(canvas, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
     lv_canvas_fill_bg(canvas, lv_color_hex(0x000000), LV_OPA_COVER);
@@ -1962,6 +2023,10 @@ static void apply_theme_colors(void)
  * next widget type; returns false when the tap missed every corner. */
 static bool corner_handle_tap(lv_point_t point)
 {
+    /* Corner complications exist only on the infograph face. */
+    if (s_watchface != FACE_INFOGRAPH) {
+        return false;
+    }
     for (int corner = 0; corner < 4; corner++) {
         int32_t dx = point.x - (WATCH_CENTER_X + corner_x_ofs(corner));
         int32_t dy = point.y - (WATCH_CENTER_Y + corner_y_ofs(corner));
@@ -2020,49 +2085,256 @@ static void set_hand_angle(lv_obj_t *hand, lv_point_precise_t *points, float ang
     lv_line_set_points(hand, points, 2);
 }
 
-static void create_time_page(lv_obj_t *parent)
+/*
+ * Pixel-style dial: a fine 60-tick ring hugging the bezel, the five-minute
+ * numerals in bright blue just inside it, and a dimmer even-minute ring
+ * further in. Drawn once into a PSRAM canvas like the infograph dial.
+ */
+static lv_obj_t *create_pixel_dial_canvas(lv_obj_t *parent)
 {
-    s_time_ui.page = create_page(parent);
-    lv_obj_set_style_bg_color(s_time_ui.page, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(s_time_ui.page, LV_OPA_COVER, 0);
+    size_t buf_size = (size_t)BSP_LCD_H_RES * BSP_LCD_V_RES * 2;
+    void *buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == NULL) {
+        ESP_LOGW(TAG, "Pixel dial canvas alloc failed");
+        return NULL;
+    }
 
-    create_dial_canvas(s_time_ui.page);
+    lv_obj_t *canvas = lv_canvas_create(parent);
+    lv_canvas_set_buffer(canvas, buf, BSP_LCD_H_RES, BSP_LCD_V_RES, LV_COLOR_FORMAT_RGB565);
+    canvas_own_buffer(canvas, buf);
+    lv_obj_set_pos(canvas, 0, 0);
+    lv_obj_clear_flag(canvas, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_canvas_fill_bg(canvas, lv_color_hex(0x000000), LV_OPA_COVER);
+
+    lv_layer_t layer;
+    lv_canvas_init_layer(canvas, &layer);
+
+    for (int i = 0; i < 60; i++) {
+        bool five = (i % 5) == 0;
+        float a = WATCH_DEG_TO_RAD(i * 6 - 90);
+        float ca = cosf(a);
+        float sa = sinf(a);
+
+        lv_draw_line_dsc_t dsc;
+        lv_draw_line_dsc_init(&dsc);
+        dsc.color = lv_color_hex(five ? PX_BLUE_BRIGHT : PX_TICK_DIM);
+        dsc.width = five ? 3 : 2;
+        dsc.round_start = 1;
+        dsc.round_end = 1;
+        dsc.p1.x = WATCH_CENTER_X + ca * 228;
+        dsc.p1.y = WATCH_CENTER_Y + sa * 228;
+        dsc.p2.x = WATCH_CENTER_X + ca * (five ? 212 : 218);
+        dsc.p2.y = WATCH_CENTER_Y + sa * (five ? 212 : 218);
+        lv_draw_line(&layer, &dsc);
+    }
+
+    /* Five-minute numerals, bright, just inside the tick ring. */
+    for (int m = 0; m < 60; m += 5) {
+        char text[4];
+        snprintf(text, sizeof(text), "%02d", m);
+        float a = WATCH_DEG_TO_RAD(m * 6 - 90);
+        draw_canvas_text(&layer, text, FONT_MEDIUM, lv_color_hex(PX_BLUE_BRIGHT),
+                         WATCH_CENTER_X + (int32_t)(cosf(a) * 188),
+                         WATCH_CENTER_Y + (int32_t)(sinf(a) * 188));
+    }
+
+    /* Dimmer even-minute ring further in - the detail that gives the Pixel
+     * dial its layered density. */
+    for (int m = 0; m < 60; m += 2) {
+        if (m % 10 == 0) {
+            continue;
+        }
+        char text[4];
+        snprintf(text, sizeof(text), "%02d", m);
+        float a = WATCH_DEG_TO_RAD(m * 6 - 90);
+        draw_canvas_text(&layer, text, FONT_SMALL, lv_color_hex(0x4A5560),
+                         WATCH_CENTER_X + (int32_t)(cosf(a) * 152),
+                         WATCH_CENTER_Y + (int32_t)(sinf(a) * 152));
+    }
+
+    lv_canvas_finish_layer(canvas, &layer);
+    return canvas;
+}
+
+static lv_obj_t *create_pixel_pill(lv_obj_t *parent, int32_t w, int32_t h, int32_t x,
+                                   int32_t y, uint32_t border)
+{
+    lv_obj_t *pill = lv_obj_create(parent);
+    lv_obj_remove_style_all(pill);
+    lv_obj_set_size(pill, w, h);
+    lv_obj_align(pill, LV_ALIGN_CENTER, x, y);
+    lv_obj_set_style_radius(pill, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(pill, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(pill, lv_color_hex(border), 0);
+    lv_obj_set_style_border_width(pill, 2, 0);
+    lv_obj_clear_flag(pill, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    return pill;
+}
+
+static void build_face_pixel_analog(lv_obj_t *page)
+{
+    create_pixel_dial_canvas(page);
+
+    /* Digital time in a pill on the left, as on the reference face. */
+    s_time_ui.px_time_pill = create_pixel_pill(page, 116, 46, -96, 0, PX_BLUE_TEXT);
+    s_time_ui.digital_label = create_label(page, "10:10", FONT_VALUE,
+                                           lv_color_hex(PX_BLUE_TEXT));
+    lv_obj_center(s_time_ui.digital_label);
+    lv_obj_set_parent(s_time_ui.digital_label, s_time_ui.px_time_pill);
+    lv_obj_center(s_time_ui.digital_label);
+
+    /* Date pill on the right. */
+    s_time_ui.px_side_pill = create_pixel_pill(page, 72, 42, 100, 0, 0xC7D6E5);
+    s_time_ui.corner_value[3] = create_label(page, "23", FONT_MEDIUM,
+                                             lv_color_hex(PX_WHITE));
+    lv_obj_set_parent(s_time_ui.corner_value[3], s_time_ui.px_side_pill);
+    lv_obj_center(s_time_ui.corner_value[3]);
+
+    /* Top ring complication: battery. */
+    s_time_ui.px_top_ring = create_pixel_pill(page, 62, 62, 0, -104, PX_BLUE_BRIGHT);
+    s_time_ui.corner_value[0] = create_label(page, "--", FONT_SMALL,
+                                             lv_color_hex(PX_BLUE_BRIGHT));
+    lv_obj_set_parent(s_time_ui.corner_value[0], s_time_ui.px_top_ring);
+    lv_obj_center(s_time_ui.corner_value[0]);
+
+    /* Sub-dial bottom-left with its own mini tick ring. */
+    s_time_ui.px_sub_dial = create_pixel_pill(page, 88, 88, -86, 98, 0x3C4A57);
+    s_time_ui.px_sub_value = create_label(page, "--", FONT_MEDIUM, lv_color_hex(PX_WHITE));
+    lv_obj_set_parent(s_time_ui.px_sub_value, s_time_ui.px_sub_dial);
+    lv_obj_center(s_time_ui.px_sub_value);
+
+    /* Bottom-right ring complication: temperature. */
+    lv_obj_t *br = create_pixel_pill(page, 62, 62, 88, 92, PX_BLUE_BRIGHT);
+    s_time_ui.corner_value[1] = create_label(page, "--", FONT_SMALL,
+                                             lv_color_hex(PX_BLUE_BRIGHT));
+    lv_obj_set_parent(s_time_ui.corner_value[1], br);
+    lv_obj_center(s_time_ui.corner_value[1]);
+
+    s_time_ui.status_label = create_label(page, "", FONT_SMALL,
+                                          lv_color_hex(WATCH_COLOR_CAPTION));
+    lv_obj_align(s_time_ui.status_label, LV_ALIGN_CENTER, 0, 168);
+
+    /* Flat white rounded hands, no second hand: the reference face has none. */
+    s_time_ui.hour_hand = create_watch_hand(page, 16, PX_WHITE, s_hour_hand_points);
+    s_time_ui.minute_hand = create_watch_hand(page, 14, PX_WHITE, s_minute_hand_points);
+
+    /* Hollow centre ring rather than a solid cap. */
+    s_time_ui.px_center_ring = lv_obj_create(page);
+    lv_obj_remove_style_all(s_time_ui.px_center_ring);
+    lv_obj_set_size(s_time_ui.px_center_ring, 24, 24);
+    lv_obj_align(s_time_ui.px_center_ring, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(s_time_ui.px_center_ring, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(s_time_ui.px_center_ring, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(s_time_ui.px_center_ring, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(s_time_ui.px_center_ring, lv_color_hex(PX_WHITE), 0);
+    lv_obj_set_style_border_width(s_time_ui.px_center_ring, 4, 0);
+    lv_obj_clear_flag(s_time_ui.px_center_ring,
+                      LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+}
+
+static lv_obj_t *create_tile(lv_obj_t *parent, int32_t w, int32_t h, int32_t x, int32_t y,
+                             int32_t radius, uint32_t bg)
+{
+    lv_obj_t *tile = lv_obj_create(parent);
+    lv_obj_remove_style_all(tile);
+    lv_obj_set_size(tile, w, h);
+    lv_obj_align(tile, LV_ALIGN_CENTER, x, y);
+    lv_obj_set_style_radius(tile, radius, 0);
+    lv_obj_set_style_bg_color(tile, lv_color_hex(bg), 0);
+    lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    return tile;
+}
+
+static void build_face_pixel_tiles(lv_obj_t *page)
+{
+    /* Hour and minute as two big rounded tiles. */
+    s_time_ui.tile_hour = create_tile(page, 140, 120, -79, -6, 34, PX_TILE_STRONG);
+    s_time_ui.digital_label = create_label(page, "10", FONT_STEPS,
+                                           lv_color_hex(PX_TILE_TEXT));
+    lv_obj_set_parent(s_time_ui.digital_label, s_time_ui.tile_hour);
+    lv_obj_center(s_time_ui.digital_label);
+
+    s_time_ui.tile_minute = create_tile(page, 140, 120, 79, -6, 34, PX_TILE_STRONG);
+    s_time_ui.px_sub_value = create_label(page, "30", FONT_STEPS,
+                                          lv_color_hex(PX_TILE_TEXT));
+    lv_obj_set_parent(s_time_ui.px_sub_value, s_time_ui.tile_minute);
+    lv_obj_center(s_time_ui.px_sub_value);
+
+    /* Weather tile, top centre-right. */
+    s_time_ui.tile_weather = create_tile(page, 80, 80, 3, -115, 26, PX_TILE_MID);
+    s_time_ui.corner_value[1] = create_label(page, "--", FONT_TITLE,
+                                             lv_color_hex(PX_BLUE_BRIGHT));
+    lv_obj_set_parent(s_time_ui.corner_value[1], s_time_ui.tile_weather);
+    lv_obj_center(s_time_ui.corner_value[1]);
+
+    /* Round accent tile, top left. */
+    lv_obj_t *accent = create_tile(page, 80, 80, -93, -115, 40, PX_TILE_DARK);
+    lv_obj_t *spark = create_label(page, LV_SYMBOL_CHARGE, FONT_TITLE,
+                                   lv_color_hex(PX_BLUE_TEXT));
+    lv_obj_set_parent(spark, accent);
+    lv_obj_center(spark);
+
+    /* Steps and battery tiles along the bottom. */
+    s_time_ui.tile_steps = create_tile(page, 112, 70, -65, 120, 26, PX_TILE_MID);
+    s_time_ui.corner_value[2] = create_label(page, "0", FONT_MEDIUM,
+                                             lv_color_hex(PX_BLUE_BRIGHT));
+    lv_obj_set_parent(s_time_ui.corner_value[2], s_time_ui.tile_steps);
+    lv_obj_align(s_time_ui.corner_value[2], LV_ALIGN_CENTER, 0, -9);
+    lv_obj_t *steps_cap = create_label(page, "STEPS", FONT_SMALL, lv_color_hex(PX_BLUE_DIM));
+    lv_obj_set_parent(steps_cap, s_time_ui.tile_steps);
+    lv_obj_align(steps_cap, LV_ALIGN_CENTER, 0, 14);
+
+    s_time_ui.tile_batt = create_tile(page, 112, 70, 65, 120, 26, PX_TILE_DARK);
+    s_time_ui.corner_value[0] = create_label(page, "--", FONT_MEDIUM,
+                                             lv_color_hex(PX_BLUE_TEXT));
+    lv_obj_set_parent(s_time_ui.corner_value[0], s_time_ui.tile_batt);
+    lv_obj_align(s_time_ui.corner_value[0], LV_ALIGN_CENTER, 0, -9);
+    lv_obj_t *batt_cap = create_label(page, "BATT", FONT_SMALL, lv_color_hex(PX_BLUE_DIM));
+    lv_obj_set_parent(batt_cap, s_time_ui.tile_batt);
+    lv_obj_align(batt_cap, LV_ALIGN_CENTER, 0, 14);
+
+    s_time_ui.status_label = create_label(page, "", FONT_SMALL,
+                                          lv_color_hex(WATCH_COLOR_CAPTION));
+    lv_obj_align(s_time_ui.status_label, LV_ALIGN_CENTER, 0, 180);
+}
+
+static void build_face_infograph(lv_obj_t *page)
+{
+    create_dial_canvas(page);
 
     for (int corner = 0; corner < 4; corner++) {
         s_time_ui.corner_arc[corner] =
-            create_corner_gauge(s_time_ui.page, corner_x_ofs(corner), corner_y_ofs(corner),
+            create_corner_gauge(page, corner_x_ofs(corner), corner_y_ofs(corner),
                                 WATCH_COLOR_BATTERY, 0, 100);
-        s_time_ui.corner_value[corner] = create_label(s_time_ui.page, "--", FONT_SMALL,
+        s_time_ui.corner_value[corner] = create_label(page, "--", FONT_SMALL,
                                                       lv_color_hex(0xFFFFFF));
-        s_time_ui.corner_caption[corner] = create_label(s_time_ui.page, "", FONT_CJK,
+        s_time_ui.corner_caption[corner] = create_label(page, "", FONT_CJK,
                                                         lv_color_hex(WATCH_COLOR_CAPTION));
         corner_apply_widget_locked(corner);
     }
 
-    s_time_ui.digital_label = create_label(s_time_ui.page, "00:00:00", FONT_TITLE,
+    s_time_ui.digital_label = create_label(page, "00:00:00", FONT_TITLE,
                                            lv_color_hex(WATCH_COLOR_DIGITAL));
     lv_obj_align(s_time_ui.digital_label, LV_ALIGN_CENTER, 0, 69);
 
-    s_time_ui.status_label = create_label(s_time_ui.page, "AP 192.168.4.1", FONT_SMALL,
+    s_time_ui.status_label = create_label(page, "AP 192.168.4.1", FONT_SMALL,
                                           lv_color_hex(WATCH_COLOR_BATTERY));
     lv_obj_align(s_time_ui.status_label, LV_ALIGN_CENTER, 0, 96);
 
-    s_time_ui.wifi_icon = create_label(s_time_ui.page, LV_SYMBOL_WIFI, FONT_MEDIUM,
+    s_time_ui.wifi_icon = create_label(page, LV_SYMBOL_WIFI, FONT_MEDIUM,
                                        lv_color_hex(WATCH_COLOR_CAPTION));
     lv_obj_align(s_time_ui.wifi_icon, LV_ALIGN_CENTER, -18, 97);
 
-    s_time_ui.ntp_icon = create_label(s_time_ui.page, LV_SYMBOL_REFRESH, FONT_MEDIUM,
+    s_time_ui.ntp_icon = create_label(page, LV_SYMBOL_REFRESH, FONT_MEDIUM,
                                       lv_color_hex(WATCH_COLOR_CAPTION));
     lv_obj_align(s_time_ui.ntp_icon, LV_ALIGN_CENTER, 18, 97);
 
-    s_time_ui.hour_hand = create_watch_hand(s_time_ui.page, 9, WATCH_COLOR_HAND,
-                                            s_hour_hand_points);
-    s_time_ui.minute_hand = create_watch_hand(s_time_ui.page, 6, WATCH_COLOR_HAND,
-                                              s_minute_hand_points);
-    s_time_ui.second_hand = create_watch_hand(s_time_ui.page, 3, WATCH_COLOR_SECOND,
-                                              s_second_hand_points);
+    s_time_ui.hour_hand = create_watch_hand(page, 9, WATCH_COLOR_HAND, s_hour_hand_points);
+    s_time_ui.minute_hand = create_watch_hand(page, 6, WATCH_COLOR_HAND, s_minute_hand_points);
+    s_time_ui.second_hand = create_watch_hand(page, 3, WATCH_COLOR_SECOND, s_second_hand_points);
 
-    lv_obj_t *cap = lv_obj_create(s_time_ui.page);
+    lv_obj_t *cap = lv_obj_create(page);
     lv_obj_remove_style_all(cap);
     lv_obj_set_size(cap, 18, 18);
     lv_obj_align(cap, LV_ALIGN_CENTER, 0, 0);
@@ -2071,7 +2343,7 @@ static void create_time_page(lv_obj_t *parent)
     lv_obj_set_style_bg_opa(cap, LV_OPA_COVER, 0);
     lv_obj_clear_flag(cap, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
-    lv_obj_t *cap_inner = lv_obj_create(s_time_ui.page);
+    lv_obj_t *cap_inner = lv_obj_create(page);
     lv_obj_remove_style_all(cap_inner);
     lv_obj_set_size(cap_inner, 8, 8);
     lv_obj_align(cap_inner, LV_ALIGN_CENTER, 0, 0);
@@ -2079,6 +2351,46 @@ static void create_time_page(lv_obj_t *parent)
     lv_obj_set_style_bg_color(cap_inner, lv_color_hex(WATCH_COLOR_SECOND), 0);
     lv_obj_set_style_bg_opa(cap_inner, LV_OPA_COVER, 0);
     lv_obj_clear_flag(cap_inner, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+}
+
+/* Tear the old face down and build the selected one. Every per-face pointer
+ * is cleared first so stale handles from the previous face can never be
+ * written to. */
+static void rebuild_watchface_locked(void)
+{
+    lv_obj_t *page = s_time_ui.page;
+    if (page == NULL) {
+        return;
+    }
+
+    lv_obj_clean(page);
+    lv_obj_t *saved_page = s_time_ui.page;
+    memset(&s_time_ui, 0, sizeof(s_time_ui));
+    s_time_ui.page = saved_page;
+
+    switch ((watchface_t)s_watchface) {
+    case FACE_PIXEL_ANALOG:
+        build_face_pixel_analog(page);
+        break;
+    case FACE_PIXEL_TILES:
+        build_face_pixel_tiles(page);
+        break;
+    default:
+        build_face_infograph(page);
+        break;
+    }
+    lv_obj_invalidate(page);
+    ESP_LOGI(TAG, "Face %d built, psram_free=%u internal_free=%u", s_watchface,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+}
+
+static void create_time_page(lv_obj_t *parent)
+{
+    s_time_ui.page = create_page(parent);
+    lv_obj_set_style_bg_color(s_time_ui.page, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(s_time_ui.page, LV_OPA_COVER, 0);
+    rebuild_watchface_locked();
 }
 
 #define WEATHER_ICON_SIZE 96
@@ -2218,6 +2530,7 @@ static lv_obj_t *create_weather_icon_visual(lv_obj_t *parent)
     lv_obj_t *canvas = lv_canvas_create(parent);
     lv_canvas_set_buffer(canvas, buf, WEATHER_ICON_SIZE, WEATHER_ICON_SIZE,
                          LV_COLOR_FORMAT_RGB565);
+    canvas_own_buffer(canvas, buf);
     lv_obj_align(canvas, LV_ALIGN_CENTER, 0, -124);
     lv_obj_clear_flag(canvas, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
     draw_weather_icon(canvas, -1);
@@ -2887,6 +3200,34 @@ static void settings_volume_event_cb(lv_event_t *event)
     }
 }
 
+/* Switch faces from the settings panel. The rebuild happens here, on the
+ * LVGL thread with the lock already held by the event dispatcher. */
+static void settings_face_event_cb(lv_event_t *event)
+{
+    int face = (int)(intptr_t)lv_event_get_user_data(event);
+    s_last_activity_ms = now_ms();
+    if (face < 0 || face >= FACE_COUNT || face == s_watchface) {
+        return;
+    }
+    s_watchface = (uint8_t)face;
+    save_ui_settings();
+    rebuild_watchface_locked();
+
+    for (int i = 0; i < FACE_COUNT; i++) {
+        if (s_settings_ui.face_buttons[i] == NULL) {
+            continue;
+        }
+        bool active = i == face;
+        lv_obj_set_style_bg_color(s_settings_ui.face_buttons[i],
+                                  lv_color_hex(active ? 0x18D7F5 : 0x1B222B), 0);
+        lv_obj_t *label = lv_obj_get_child(s_settings_ui.face_buttons[i], 0);
+        if (label != NULL) {
+            lv_obj_set_style_text_color(label,
+                                        lv_color_hex(active ? 0x03181F : 0xC9D3DC), 0);
+        }
+    }
+}
+
 static void settings_standby_switch_event_cb(lv_event_t *event)
 {
     (void)event;
@@ -3011,9 +3352,30 @@ static void create_settings_panel(lv_obj_t *parent)
                                SETTINGS_STANDBY_MAX_MINUTES, s_cfg_standby_minutes,
                                settings_standby_slider_event_cb);
 
+    /* Watch face picker: one button per face, highlighted when active. */
+    lv_obj_t *face_caption = create_label(panel, "WATCH FACE", FONT_SMALL,
+                                          lv_color_hex(0x9AA7B5));
+    lv_obj_align(face_caption, LV_ALIGN_TOP_MID, 0, 336);
+    for (int i = 0; i < FACE_COUNT; i++) {
+        static const char *const names[FACE_COUNT] = {"INFO", "PIXEL", "TILES"};
+        lv_obj_t *btn = lv_button_create(panel);
+        lv_obj_set_size(btn, 78, 34);
+        lv_obj_align(btn, LV_ALIGN_TOP_MID, (i - 1) * 84, 360);
+        lv_obj_set_style_radius(btn, 17, 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(i == s_watchface ? 0x18D7F5 : 0x1B222B),
+                                  0);
+        lv_obj_set_style_border_width(btn, 0, 0);
+        lv_obj_add_event_cb(btn, settings_face_event_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+        lv_obj_t *label = create_label(btn, names[i], FONT_SMALL,
+                                       lv_color_hex(i == s_watchface ? 0x03181F : 0xC9D3DC));
+        lv_obj_center(label);
+        s_settings_ui.face_buttons[i] = btn;
+    }
+
     lv_obj_t *hint = create_label(panel, "Swipe up to close", FONT_SMALL,
                                   lv_color_hex(0x63717F));
-    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 362);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 404);
 
     settings_update_labels();
     set_obj_hidden(panel, true);
@@ -3303,10 +3665,13 @@ static void update_time_page_locked(void)
     localtime_r(&tv.tv_sec, &local_time);
 
     /* The second hand sweeps: update it on every 100 ms tick with sub-second
-     * precision. Everything else only changes once per second. */
-    float second_f = (float)local_time.tm_sec + (float)tv.tv_usec / 1000000.0f;
-    set_hand_angle(s_time_ui.second_hand, s_second_hand_points, second_f * 6.0f,
-                   WATCH_SECOND_HAND_LEN, WATCH_SECOND_TAIL_LEN, 3);
+     * precision. Everything else only changes once per second. The Pixel
+     * faces have no second hand at all. */
+    if (s_time_ui.second_hand != NULL) {
+        float second_f = (float)local_time.tm_sec + (float)tv.tv_usec / 1000000.0f;
+        set_hand_angle(s_time_ui.second_hand, s_second_hand_points, second_f * 6.0f,
+                       WATCH_SECOND_HAND_LEN, WATCH_SECOND_TAIL_LEN, 3);
+    }
 
     static time_t last_rendered_second;
     if (tv.tv_sec == last_rendered_second) {
@@ -3314,26 +3679,77 @@ static void update_time_page_locked(void)
     }
     last_rendered_second = tv.tv_sec;
 
-    float minute_angle = ((float)local_time.tm_min + (float)local_time.tm_sec / 60.0f) * 6.0f;
-    float hour_angle = ((float)(local_time.tm_hour % 12) +
-                        (float)local_time.tm_min / 60.0f) * 30.0f;
-    set_hand_angle(s_time_ui.hour_hand, s_hour_hand_points, hour_angle,
-                   WATCH_HOUR_HAND_LEN, WATCH_HAND_TAIL_LEN, 9);
-    set_hand_angle(s_time_ui.minute_hand, s_minute_hand_points, minute_angle,
-                   WATCH_MINUTE_HAND_LEN, WATCH_HAND_TAIL_LEN, 6);
+    if (s_time_ui.hour_hand != NULL && s_time_ui.minute_hand != NULL) {
+        float minute_angle =
+            ((float)local_time.tm_min + (float)local_time.tm_sec / 60.0f) * 6.0f;
+        float hour_angle = ((float)(local_time.tm_hour % 12) +
+                            (float)local_time.tm_min / 60.0f) * 30.0f;
+        /* Pixel hands are longer and blunter than the infograph ones. */
+        bool pixel = s_watchface == FACE_PIXEL_ANALOG;
+        set_hand_angle(s_time_ui.hour_hand, s_hour_hand_points, hour_angle,
+                       pixel ? 106.0f : WATCH_HOUR_HAND_LEN,
+                       pixel ? 0.0f : WATCH_HAND_TAIL_LEN, pixel ? 16 : 9);
+        set_hand_angle(s_time_ui.minute_hand, s_minute_hand_points, minute_angle,
+                       pixel ? 158.0f : WATCH_MINUTE_HAND_LEN,
+                       pixel ? 0.0f : WATCH_HAND_TAIL_LEN, pixel ? 14 : 6);
+    }
 
     char text[32];
-    snprintf(text, sizeof(text), "%02d:%02d:%02d", local_time.tm_hour, local_time.tm_min,
-             local_time.tm_sec);
-    set_label_text_if_changed(s_time_ui.digital_label, text);
+    if (s_watchface == FACE_PIXEL_ANALOG) {
+        snprintf(text, sizeof(text), "%02d:%02d", local_time.tm_hour, local_time.tm_min);
+        set_label_text_if_changed(s_time_ui.digital_label, text);
+        snprintf(text, sizeof(text), "%d", local_time.tm_mday);
+        set_label_text_if_changed(s_time_ui.corner_value[3], text);
+        if (s_battery_percent >= 0) {
+            snprintf(text, sizeof(text), "%d%%", s_battery_percent);
+        } else {
+            snprintf(text, sizeof(text), "--");
+        }
+        set_label_text_if_changed(s_time_ui.corner_value[0], text);
+        if (s_board_temp_c > -100.0f) {
+            snprintf(text, sizeof(text), "%d°", (int)lroundf(s_board_temp_c));
+        } else {
+            snprintf(text, sizeof(text), "--");
+        }
+        set_label_text_if_changed(s_time_ui.corner_value[1], text);
+        snprintf(text, sizeof(text), "%02d", local_time.tm_sec);
+        set_label_text_if_changed(s_time_ui.px_sub_value, text);
+    } else if (s_watchface == FACE_PIXEL_TILES) {
+        snprintf(text, sizeof(text), "%02d", local_time.tm_hour);
+        set_label_text_if_changed(s_time_ui.digital_label, text);
+        snprintf(text, sizeof(text), "%02d", local_time.tm_min);
+        set_label_text_if_changed(s_time_ui.px_sub_value, text);
+        if (s_last_weather.valid) {
+            snprintf(text, sizeof(text), "%d°", s_last_weather.current_temp_c);
+        } else {
+            snprintf(text, sizeof(text), "--");
+        }
+        set_label_text_if_changed(s_time_ui.corner_value[1], text);
+        format_step_count(s_step_count, text, sizeof(text));
+        set_label_text_if_changed(s_time_ui.corner_value[2], text);
+        if (s_battery_percent >= 0) {
+            snprintf(text, sizeof(text), "%d%%", s_battery_percent);
+        } else {
+            snprintf(text, sizeof(text), "--");
+        }
+        set_label_text_if_changed(s_time_ui.corner_value[0], text);
+    } else {
+        snprintf(text, sizeof(text), "%02d:%02d:%02d", local_time.tm_hour, local_time.tm_min,
+                 local_time.tm_sec);
+        set_label_text_if_changed(s_time_ui.digital_label, text);
 
-    for (int corner = 0; corner < 4; corner++) {
-        corner_render_widget_locked(corner, &local_time);
+        for (int corner = 0; corner < 4; corner++) {
+            corner_render_widget_locked(corner, &local_time);
+        }
     }
 
     EventBits_t bits = s_wifi_event_group != NULL ? xEventGroupGetBits(s_wifi_event_group) : 0;
     bool configured = wifi_configured();
     set_obj_hidden(s_time_ui.status_label, configured);
+    /* Only the infograph face carries the Wi-Fi/NTP glyph pair. */
+    if (s_time_ui.wifi_icon == NULL || s_time_ui.ntp_icon == NULL) {
+        return;
+    }
     set_obj_hidden(s_time_ui.wifi_icon, !configured);
     set_obj_hidden(s_time_ui.ntp_icon, !configured);
 
@@ -5035,6 +5451,19 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
              (unsigned long)s_pedometer_goal_steps);
     httpd_resp_sendstr_chunk(req, goal_input);
 
+    {
+        static const char *const face_names[FACE_COUNT] = {"信息图文", "Pixel 指针",
+                                                           "Pixel 磁贴"};
+        httpd_resp_sendstr_chunk(req, "<label>表盘</label><select name='face'>");
+        for (int i = 0; i < FACE_COUNT; i++) {
+            char option[96];
+            snprintf(option, sizeof(option), "<option value='%d'%s>%s</option>", i,
+                     i == s_watchface ? " selected" : "", face_names[i]);
+            httpd_resp_sendstr_chunk(req, option);
+        }
+        httpd_resp_sendstr_chunk(req, "</select>");
+    }
+
     httpd_resp_sendstr_chunk(req, "<label>小组件颜色</label>"
                                   "<div style='display:grid;grid-template-columns:repeat(4,1fr);"
                                   "gap:8px;margin:8px 0 16px'>");
@@ -5128,6 +5557,19 @@ static esp_err_t config_page_post_handler(httpd_req_t *req)
             ret = save_pedometer_goal((uint32_t)parsed_goal);
         } else {
             ret = ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    char face_text[8];
+    if (get_form_value(body, "face", face_text, sizeof(face_text)) && face_text[0] != '\0') {
+        int face = atoi(face_text);
+        if (face >= 0 && face < FACE_COUNT && face != s_watchface) {
+            s_watchface = (uint8_t)face;
+            save_ui_settings();
+            if (bsp_display_lock(DISPLAY_LOCK_TIMEOUT_MS) == ESP_OK) {
+                rebuild_watchface_locked();
+                bsp_display_unlock();
+            }
         }
     }
 
