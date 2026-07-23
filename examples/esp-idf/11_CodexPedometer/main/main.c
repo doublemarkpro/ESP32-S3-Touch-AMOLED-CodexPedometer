@@ -494,14 +494,15 @@ typedef enum {
     THEME_CODEX,
     THEME_STEPS,
     THEME_MUSIC,
+    THEME_WEATHER,
     THEME_COUNT,
 } theme_color_id_t;
 
 static const char *const THEME_NAMES[THEME_COUNT] = {
-    "电量", "温度", "星期", "日期", "Codex", "步数", "音乐",
+    "电量", "温度", "星期", "日期", "Codex", "步数", "音乐", "天气",
 };
 static uint32_t s_theme_color[THEME_COUNT] = {
-    0x30D158, 0xFF9F0A, 0xBF5AF2, 0xFF453A, 0xFFD166, 0x9DFF35, 0x18D7F5,
+    0x30D158, 0xFF9F0A, 0xBF5AF2, 0xFF453A, 0xFFD166, 0x9DFF35, 0x18D7F5, 0x64D2FF,
 };
 
 typedef struct {
@@ -1676,8 +1677,7 @@ static void corner_apply_widget_locked(int corner)
     /* Top corners put the caption under the content, bottom corners above. */
     int32_t caption_y = corner < 2 ? cy + 45 : cy - 45;
 
-    bool uses_arc = type != CW_WEATHER;
-    set_obj_hidden(arc, !uses_arc);
+    set_obj_hidden(arc, false);
 
     uint32_t arc_color = s_theme_color[THEME_BATTERY];
     int32_t range_min = 0;
@@ -1714,6 +1714,9 @@ static void corner_apply_widget_locked(int corner)
         caption_color = s_theme_color[THEME_DATE];
         break;
     case CW_WEATHER:
+        /* Ring shows where the live temperature sits inside today's
+         * forecast low..high; range is set per render. */
+        arc_color = s_theme_color[THEME_WEATHER];
         value_font = FONT_MEDIUM;
         caption_text = "天气";
         caption_color = WATCH_COLOR_WEEKDAY;
@@ -1729,11 +1732,9 @@ static void corner_apply_widget_locked(int corner)
         break;
     }
 
-    if (uses_arc) {
-        lv_arc_set_range(arc, range_min, range_max);
-        lv_arc_set_value(arc, range_min);
-        lv_obj_set_style_arc_color(arc, lv_color_hex(arc_color), LV_PART_INDICATOR);
-    }
+    lv_arc_set_range(arc, range_min, range_max);
+    lv_arc_set_value(arc, range_min);
+    lv_obj_set_style_arc_color(arc, lv_color_hex(arc_color), LV_PART_INDICATOR);
 
     lv_obj_set_style_text_font(value, value_font, 0);
     lv_obj_set_style_text_color(value, lv_color_hex(value_color), 0);
@@ -1808,6 +1809,18 @@ static void corner_render_widget_locked(int corner, const struct tm *local_time)
     }
     case CW_WEATHER:
         if (s_last_weather.valid) {
+            int low = s_last_weather.min_temp_c;
+            int high = s_last_weather.max_temp_c;
+            if (high <= low) {
+                high = low + 1;
+            }
+            if (lv_arc_get_min_value(arc) != low || lv_arc_get_max_value(arc) != high) {
+                lv_arc_set_range(arc, low, high);
+            }
+            int current = clamp_int(s_last_weather.current_temp_c, low, high);
+            if (lv_arc_get_value(arc) != current) {
+                lv_arc_set_value(arc, current);
+            }
             snprintf(text, sizeof(text), "%d°", s_last_weather.current_temp_c);
             set_label_text_if_changed(value, text);
             const char *cond = text_glyphs_available(FONT_CJK, s_last_weather.condition)
@@ -4320,6 +4333,31 @@ static esp_err_t fetch_weather(weather_data_t *weather)
         ESP_LOGW(TAG, "AMap weather parse failed: %s", response->body);
         free(response);
         return ESP_FAIL;
+    }
+
+    /* The forecast payload has no live reading, so "current" above is just
+     * the daytime high. Fetch the live observation too - it drives the
+     * corner ring (position of now within today's low..high) and gives the
+     * actual present condition. Forecast values remain the fallback. */
+    snprintf(url, sizeof(url),
+             "http://restapi.amap.com/v3/weather/weatherInfo?city=%s&key=%s&extensions=base&output=JSON",
+             adcode, s_weather_api_key);
+    if (http_get_url(url, WEATHER_HTTP_TIMEOUT_MS, false, response) == ESP_OK) {
+        char live_text[32];
+        int live_temp = 0;
+        if (json_get_string_after(response->body, "lives", "temperature", live_text,
+                                  sizeof(live_text)) &&
+            parse_weather_temp(live_text, &live_temp)) {
+            parsed.current_temp_c = live_temp;
+        }
+        if (json_get_string_after(response->body, "lives", "weather", live_text,
+                                  sizeof(live_text)) &&
+            live_text[0] != '\0') {
+            copy_string(parsed.condition, sizeof(parsed.condition), live_text);
+            parsed.weather_code = weather_code_from_china_type(live_text);
+        }
+        ESP_LOGI(TAG, "Weather live %dC in range %d..%dC", parsed.current_temp_c,
+                 parsed.min_temp_c, parsed.max_temp_c);
     }
 
     *weather = parsed;
