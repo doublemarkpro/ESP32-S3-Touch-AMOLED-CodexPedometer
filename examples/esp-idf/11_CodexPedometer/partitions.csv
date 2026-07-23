@@ -3,3 +3,6 @@
 nvs,      data, nvs,     ,         0x6000,
 phy_init, data, phy,     ,         0x1000,
 factory,  app,  factory, ,         4M,
+# Raw 466x466 RGB565 watch-face wallpaper (424 KB) behind a small header.
+# Placed after the app so adding it cannot shift nvs and lose settings.
+wallpaper,data, 0x40,    ,         512K,

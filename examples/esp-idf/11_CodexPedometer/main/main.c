@@ -23,6 +23,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
+#include "esp_partition.h"
 #include "esp_wifi.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
@@ -311,6 +312,8 @@ typedef struct {
     lv_obj_t *px_sub_dial;
     lv_obj_t *px_sub_value;
     lv_obj_t *px_center_ring;
+    lv_obj_t *hour_edge;
+    lv_obj_t *minute_edge;
     /* Pixel tiles face */
     lv_obj_t *tile_hour;
     lv_obj_t *tile_minute;
@@ -328,6 +331,16 @@ typedef enum {
     FACE_PIXEL_TILES,
     FACE_COUNT,
 } watchface_t;
+
+/* Wallpaper: a raw 466x466 RGB565 frame in its own flash partition, written
+ * over Wi-Fi and blitted straight into the dial canvas - no on-device decode,
+ * so an oversized or malformed image can never exhaust memory at boot. */
+#define WALLPAPER_PARTITION_LABEL "wallpaper"
+#define WALLPAPER_MAGIC 0x57503536u /* "WP56" */
+#define WALLPAPER_PIXELS ((size_t)BSP_LCD_H_RES * BSP_LCD_V_RES)
+#define WALLPAPER_BYTES (WALLPAPER_PIXELS * 2)
+#define WALLPAPER_HEADER_BYTES 16
+#define WALLPAPER_CHUNK 4096
 
 /* Material-style palette used by the Pixel faces. */
 #define PX_BLUE_BRIGHT 0xA8C7FA
@@ -548,6 +561,10 @@ static uint32_t s_step_count;
 static lv_point_precise_t s_hour_hand_points[2];
 static lv_point_precise_t s_minute_hand_points[2];
 static lv_point_precise_t s_second_hand_points[2];
+/* lv_line keeps a pointer to the point array rather than copying it, so the
+ * outline hands need their own storage. */
+static lv_point_precise_t s_hour_edge_points[2];
+static lv_point_precise_t s_minute_edge_points[2];
 static volatile int s_battery_percent = -1;
 static volatile float s_board_temp_c = BOARD_TEMP_INVALID;
 static volatile bool s_ntp_resync_requested;
@@ -1678,6 +1695,48 @@ static void canvas_own_buffer(lv_obj_t *canvas, void *buf)
     lv_obj_add_event_cb(canvas, canvas_delete_cb, LV_EVENT_DELETE, buf);
 }
 
+static const esp_partition_t *wallpaper_partition(void)
+{
+    return esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x40,
+                                    WALLPAPER_PARTITION_LABEL);
+}
+
+static bool wallpaper_present(void)
+{
+    const esp_partition_t *part = wallpaper_partition();
+    if (part == NULL) {
+        return false;
+    }
+    uint32_t header[2] = {0};
+    if (esp_partition_read(part, 0, header, sizeof(header)) != ESP_OK) {
+        return false;
+    }
+    return header[0] == WALLPAPER_MAGIC && header[1] == WALLPAPER_BYTES;
+}
+
+/* Copy the stored frame into an already-allocated canvas buffer. */
+static bool wallpaper_load_into(void *dest)
+{
+    const esp_partition_t *part = wallpaper_partition();
+    if (part == NULL || dest == NULL || !wallpaper_present()) {
+        return false;
+    }
+    if (esp_partition_read(part, WALLPAPER_HEADER_BYTES, dest, WALLPAPER_BYTES) != ESP_OK) {
+        ESP_LOGW(TAG, "Wallpaper read failed");
+        return false;
+    }
+    return true;
+}
+
+static esp_err_t wallpaper_erase(void)
+{
+    const esp_partition_t *part = wallpaper_partition();
+    if (part == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    return esp_partition_erase_range(part, 0, part->size);
+}
+
 static lv_obj_t *create_dial_canvas(lv_obj_t *parent)
 {
     size_t buf_size = (size_t)BSP_LCD_H_RES * BSP_LCD_V_RES * 2;
@@ -1692,7 +1751,11 @@ static lv_obj_t *create_dial_canvas(lv_obj_t *parent)
     canvas_own_buffer(canvas, buf);
     lv_obj_set_pos(canvas, 0, 0);
     lv_obj_clear_flag(canvas, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-    lv_canvas_fill_bg(canvas, lv_color_hex(0x000000), LV_OPA_COVER);
+    /* A stored wallpaper becomes the dial background; ticks and numerals are
+     * then drawn over it exactly as they are over plain black. */
+    if (!wallpaper_load_into(buf)) {
+        lv_canvas_fill_bg(canvas, lv_color_hex(0x000000), LV_OPA_COVER);
+    }
 
     lv_layer_t layer;
     lv_canvas_init_layer(canvas, &layer);
@@ -2109,6 +2172,22 @@ static lv_obj_t *create_pixel_dial_canvas(lv_obj_t *parent)
     lv_layer_t layer;
     lv_canvas_init_layer(canvas, &layer);
 
+    /* Layering, outermost first - this order is what makes the reference
+     * dial read as dense but never cluttered:
+     *   r=216  dim even-minute numerals
+     *   r=198  hairline minute ticks
+     *   r=172  bright five-minute numerals
+     *   r=146  dashed inner ring enclosing the complications
+     */
+    for (int m = 0; m < 60; m += 2) {
+        char text[4];
+        snprintf(text, sizeof(text), "%02d", m);
+        float a = WATCH_DEG_TO_RAD(m * 6 - 90);
+        draw_canvas_text(&layer, text, FONT_SMALL, lv_color_hex(0x5A6672),
+                         WATCH_CENTER_X + (int32_t)(cosf(a) * 216),
+                         WATCH_CENTER_Y + (int32_t)(sinf(a) * 216));
+    }
+
     for (int i = 0; i < 60; i++) {
         bool five = (i % 5) == 0;
         float a = WATCH_DEG_TO_RAD(i * 6 - 90);
@@ -2118,38 +2197,43 @@ static lv_obj_t *create_pixel_dial_canvas(lv_obj_t *parent)
         lv_draw_line_dsc_t dsc;
         lv_draw_line_dsc_init(&dsc);
         dsc.color = lv_color_hex(five ? PX_BLUE_BRIGHT : PX_TICK_DIM);
-        dsc.width = five ? 3 : 2;
+        /* Hairlines, not bars: the reference ticks are barely 2 px wide. */
+        dsc.width = 2;
         dsc.round_start = 1;
         dsc.round_end = 1;
-        dsc.p1.x = WATCH_CENTER_X + ca * 228;
-        dsc.p1.y = WATCH_CENTER_Y + sa * 228;
-        dsc.p2.x = WATCH_CENTER_X + ca * (five ? 212 : 218);
-        dsc.p2.y = WATCH_CENTER_Y + sa * (five ? 212 : 218);
+        dsc.p1.x = WATCH_CENTER_X + ca * 199;
+        dsc.p1.y = WATCH_CENTER_Y + sa * 199;
+        dsc.p2.x = WATCH_CENTER_X + ca * (five ? 187 : 192);
+        dsc.p2.y = WATCH_CENTER_Y + sa * (five ? 187 : 192);
         lv_draw_line(&layer, &dsc);
     }
 
-    /* Five-minute numerals, bright, just inside the tick ring. */
     for (int m = 0; m < 60; m += 5) {
         char text[4];
         snprintf(text, sizeof(text), "%02d", m);
         float a = WATCH_DEG_TO_RAD(m * 6 - 90);
-        draw_canvas_text(&layer, text, FONT_MEDIUM, lv_color_hex(PX_BLUE_BRIGHT),
-                         WATCH_CENTER_X + (int32_t)(cosf(a) * 188),
-                         WATCH_CENTER_Y + (int32_t)(sinf(a) * 188));
+        draw_canvas_text(&layer, text, FONT_TITLE, lv_color_hex(PX_BLUE_BRIGHT),
+                         WATCH_CENTER_X + (int32_t)(cosf(a) * 168),
+                         WATCH_CENTER_Y + (int32_t)(sinf(a) * 168));
     }
 
-    /* Dimmer even-minute ring further in - the detail that gives the Pixel
-     * dial its layered density. */
-    for (int m = 0; m < 60; m += 2) {
-        if (m % 10 == 0) {
-            continue;
-        }
-        char text[4];
-        snprintf(text, sizeof(text), "%02d", m);
-        float a = WATCH_DEG_TO_RAD(m * 6 - 90);
-        draw_canvas_text(&layer, text, FONT_SMALL, lv_color_hex(0x4A5560),
-                         WATCH_CENTER_X + (int32_t)(cosf(a) * 152),
-                         WATCH_CENTER_Y + (int32_t)(sinf(a) * 152));
+    /* The dashed ring the complications sit inside. */
+    for (int i = 0; i < 60; i++) {
+        float a = WATCH_DEG_TO_RAD(i * 6 - 90);
+        float ca = cosf(a);
+        float sa = sinf(a);
+
+        lv_draw_line_dsc_t dsc;
+        lv_draw_line_dsc_init(&dsc);
+        dsc.color = lv_color_hex(0x46525E);
+        dsc.width = 2;
+        dsc.round_start = 1;
+        dsc.round_end = 1;
+        dsc.p1.x = WATCH_CENTER_X + ca * 148;
+        dsc.p1.y = WATCH_CENTER_Y + sa * 148;
+        dsc.p2.x = WATCH_CENTER_X + ca * 142;
+        dsc.p2.y = WATCH_CENTER_Y + sa * 142;
+        lv_draw_line(&layer, &dsc);
     }
 
     lv_canvas_finish_layer(canvas, &layer);
@@ -2175,36 +2259,38 @@ static void build_face_pixel_analog(lv_obj_t *page)
 {
     create_pixel_dial_canvas(page);
 
-    /* Digital time in a pill on the left, as on the reference face. */
-    s_time_ui.px_time_pill = create_pixel_pill(page, 116, 46, -96, 0, PX_BLUE_TEXT);
+    /* Everything below is placed to stay inside the r=142 dashed ring so no
+     * complication ever collides with the numeral rings. */
+
+    /* Digital time pill, left of centre. */
+    s_time_ui.px_time_pill = create_pixel_pill(page, 104, 44, -76, 0, PX_BLUE_TEXT);
     s_time_ui.digital_label = create_label(page, "10:10", FONT_VALUE,
                                            lv_color_hex(PX_BLUE_TEXT));
-    lv_obj_center(s_time_ui.digital_label);
     lv_obj_set_parent(s_time_ui.digital_label, s_time_ui.px_time_pill);
     lv_obj_center(s_time_ui.digital_label);
 
-    /* Date pill on the right. */
-    s_time_ui.px_side_pill = create_pixel_pill(page, 72, 42, 100, 0, 0xC7D6E5);
+    /* Date pill, right of centre. */
+    s_time_ui.px_side_pill = create_pixel_pill(page, 64, 40, 92, 0, 0xC7D6E5);
     s_time_ui.corner_value[3] = create_label(page, "23", FONT_MEDIUM,
                                              lv_color_hex(PX_WHITE));
     lv_obj_set_parent(s_time_ui.corner_value[3], s_time_ui.px_side_pill);
     lv_obj_center(s_time_ui.corner_value[3]);
 
-    /* Top ring complication: battery. */
-    s_time_ui.px_top_ring = create_pixel_pill(page, 62, 62, 0, -104, PX_BLUE_BRIGHT);
+    /* Battery ring, top. */
+    s_time_ui.px_top_ring = create_pixel_pill(page, 58, 58, 0, -92, PX_BLUE_BRIGHT);
     s_time_ui.corner_value[0] = create_label(page, "--", FONT_SMALL,
                                              lv_color_hex(PX_BLUE_BRIGHT));
     lv_obj_set_parent(s_time_ui.corner_value[0], s_time_ui.px_top_ring);
     lv_obj_center(s_time_ui.corner_value[0]);
 
-    /* Sub-dial bottom-left with its own mini tick ring. */
-    s_time_ui.px_sub_dial = create_pixel_pill(page, 88, 88, -86, 98, 0x3C4A57);
+    /* Seconds sub-dial, bottom-left. */
+    s_time_ui.px_sub_dial = create_pixel_pill(page, 78, 78, -58, 70, 0x3C4A57);
     s_time_ui.px_sub_value = create_label(page, "--", FONT_MEDIUM, lv_color_hex(PX_WHITE));
     lv_obj_set_parent(s_time_ui.px_sub_value, s_time_ui.px_sub_dial);
     lv_obj_center(s_time_ui.px_sub_value);
 
-    /* Bottom-right ring complication: temperature. */
-    lv_obj_t *br = create_pixel_pill(page, 62, 62, 88, 92, PX_BLUE_BRIGHT);
+    /* Temperature ring, bottom-right. */
+    lv_obj_t *br = create_pixel_pill(page, 58, 58, 66, 74, PX_BLUE_BRIGHT);
     s_time_ui.corner_value[1] = create_label(page, "--", FONT_SMALL,
                                              lv_color_hex(PX_BLUE_BRIGHT));
     lv_obj_set_parent(s_time_ui.corner_value[1], br);
@@ -2212,21 +2298,25 @@ static void build_face_pixel_analog(lv_obj_t *page)
 
     s_time_ui.status_label = create_label(page, "", FONT_SMALL,
                                           lv_color_hex(WATCH_COLOR_CAPTION));
-    lv_obj_align(s_time_ui.status_label, LV_ALIGN_CENTER, 0, 168);
+    lv_obj_align(s_time_ui.status_label, LV_ALIGN_CENTER, 0, 178);
 
-    /* Flat white rounded hands, no second hand: the reference face has none. */
-    s_time_ui.hour_hand = create_watch_hand(page, 16, PX_WHITE, s_hour_hand_points);
-    s_time_ui.minute_hand = create_watch_hand(page, 14, PX_WHITE, s_minute_hand_points);
+    /* Each hand is a dark outline with a pure-white bar on top, so it stays
+     * legible where it crosses a pill - the reference does the same. No
+     * second hand: that face has none. */
+    s_time_ui.hour_edge = create_watch_hand(page, 22, 0x000000, s_hour_edge_points);
+    s_time_ui.minute_edge = create_watch_hand(page, 20, 0x000000, s_minute_edge_points);
+    s_time_ui.hour_hand = create_watch_hand(page, 16, 0xFFFFFF, s_hour_hand_points);
+    s_time_ui.minute_hand = create_watch_hand(page, 14, 0xFFFFFF, s_minute_hand_points);
 
     /* Hollow centre ring rather than a solid cap. */
     s_time_ui.px_center_ring = lv_obj_create(page);
     lv_obj_remove_style_all(s_time_ui.px_center_ring);
-    lv_obj_set_size(s_time_ui.px_center_ring, 24, 24);
+    lv_obj_set_size(s_time_ui.px_center_ring, 22, 22);
     lv_obj_align(s_time_ui.px_center_ring, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(s_time_ui.px_center_ring, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(s_time_ui.px_center_ring, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(s_time_ui.px_center_ring, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(s_time_ui.px_center_ring, lv_color_hex(PX_WHITE), 0);
+    lv_obj_set_style_border_color(s_time_ui.px_center_ring, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_border_width(s_time_ui.px_center_ring, 4, 0);
     lv_obj_clear_flag(s_time_ui.px_center_ring,
                       LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
@@ -3686,12 +3776,20 @@ static void update_time_page_locked(void)
                             (float)local_time.tm_min / 60.0f) * 30.0f;
         /* Pixel hands are longer and blunter than the infograph ones. */
         bool pixel = s_watchface == FACE_PIXEL_ANALOG;
-        set_hand_angle(s_time_ui.hour_hand, s_hour_hand_points, hour_angle,
-                       pixel ? 106.0f : WATCH_HOUR_HAND_LEN,
-                       pixel ? 0.0f : WATCH_HAND_TAIL_LEN, pixel ? 16 : 9);
-        set_hand_angle(s_time_ui.minute_hand, s_minute_hand_points, minute_angle,
-                       pixel ? 158.0f : WATCH_MINUTE_HAND_LEN,
-                       pixel ? 0.0f : WATCH_HAND_TAIL_LEN, pixel ? 14 : 6);
+        float hour_len = pixel ? 108.0f : WATCH_HOUR_HAND_LEN;
+        float minute_len = pixel ? 162.0f : WATCH_MINUTE_HAND_LEN;
+        float tail = pixel ? 0.0f : WATCH_HAND_TAIL_LEN;
+
+        if (s_time_ui.hour_edge != NULL && s_time_ui.minute_edge != NULL) {
+            set_hand_angle(s_time_ui.hour_edge, s_hour_edge_points, hour_angle, hour_len,
+                           tail, 22);
+            set_hand_angle(s_time_ui.minute_edge, s_minute_edge_points, minute_angle,
+                           minute_len, tail, 20);
+        }
+        set_hand_angle(s_time_ui.hour_hand, s_hour_hand_points, hour_angle, hour_len, tail,
+                       pixel ? 16 : 9);
+        set_hand_angle(s_time_ui.minute_hand, s_minute_hand_points, minute_angle, minute_len,
+                       tail, pixel ? 14 : 6);
     }
 
     char text[32];
@@ -5478,6 +5576,19 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
     }
     httpd_resp_sendstr_chunk(req, "</div>");
 
+    {
+        char wp[220];
+        snprintf(wp, sizeof(wp),
+                 "<label>INFO 表盘壁纸</label>"
+                 "<p class='hint'>当前：%s。用 <code>python tools/set_wallpaper.py 图片</code> 上传"
+                 "%s</p>",
+                 wallpaper_present() ? "已设置" : "未设置",
+                 wallpaper_present()
+                     ? "，或 <a href='/wallpaper/clear' style='color:#18d7f5'>清除壁纸</a>"
+                     : "");
+        httpd_resp_sendstr_chunk(req, wp);
+    }
+
     httpd_resp_sendstr_chunk(req,
                              "<button type='submit'>保存并连接</button></form>"
                              "<p class='hint'>当前保存 SSID: ");
@@ -5623,6 +5734,93 @@ static esp_err_t config_page_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/*
+ * Receive a raw 466x466 RGB565 frame and stream it to flash a chunk at a
+ * time, so a 424 KB upload never needs a 424 KB buffer. The magic header is
+ * written last: a connection that drops mid-transfer leaves the partition
+ * failing its validity check rather than showing a half-written image.
+ */
+static esp_err_t wallpaper_post_handler(httpd_req_t *req)
+{
+    const esp_partition_t *part = wallpaper_partition();
+    if (part == NULL) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "no wallpaper partition");
+        return ESP_OK;
+    }
+    if (req->content_len != (int)WALLPAPER_BYTES) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "expected exactly 466x466 RGB565 bytes");
+        return ESP_OK;
+    }
+
+    uint8_t *chunk = malloc(WALLPAPER_CHUNK);
+    if (chunk == NULL) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "out of memory");
+        return ESP_OK;
+    }
+
+    esp_err_t ret = esp_partition_erase_range(part, 0, part->size);
+    size_t written = 0;
+    while (ret == ESP_OK && written < WALLPAPER_BYTES) {
+        size_t want = WALLPAPER_BYTES - written;
+        if (want > WALLPAPER_CHUNK) {
+            want = WALLPAPER_CHUNK;
+        }
+        int got = httpd_req_recv(req, (char *)chunk, want);
+        if (got == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (got <= 0) {
+            ret = ESP_FAIL;
+            break;
+        }
+        ret = esp_partition_write(part, WALLPAPER_HEADER_BYTES + written, chunk,
+                                  (size_t)got);
+        written += (size_t)got;
+    }
+    free(chunk);
+
+    if (ret == ESP_OK && written == WALLPAPER_BYTES) {
+        uint32_t header[4] = {WALLPAPER_MAGIC, WALLPAPER_BYTES, BSP_LCD_H_RES,
+                              BSP_LCD_V_RES};
+        ret = esp_partition_write(part, 0, header, sizeof(header));
+    } else if (ret == ESP_OK) {
+        ret = ESP_FAIL;
+    }
+
+    if (ret != ESP_OK) {
+        (void)esp_partition_erase_range(part, 0, part->size);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "wallpaper write failed");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Wallpaper stored (%u bytes)", (unsigned)written);
+    if (bsp_display_lock(DISPLAY_LOCK_TIMEOUT_MS) == ESP_OK) {
+        rebuild_watchface_locked();
+        bsp_display_unlock();
+    }
+    httpd_resp_sendstr(req, "ok");
+    return ESP_OK;
+}
+
+static esp_err_t wallpaper_delete_handler(httpd_req_t *req)
+{
+    esp_err_t ret = wallpaper_erase();
+    if (ret == ESP_OK && bsp_display_lock(DISPLAY_LOCK_TIMEOUT_MS) == ESP_OK) {
+        rebuild_watchface_locked();
+        bsp_display_unlock();
+    }
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_sendstr(req,
+                       "<!doctype html><meta charset='utf-8'>"
+                       "<body style='font-family:system-ui;background:#0b1017;color:#eef'>"
+                       "<h2>壁纸已清除</h2><p><a href='/' style='color:#18d7f5'>返回</a></p>");
+    return ESP_OK;
+}
+
 static esp_err_t start_config_web_server(void)
 {
     if (s_config_server != NULL) {
@@ -5648,8 +5846,20 @@ static esp_err_t start_config_web_server(void)
         .method = HTTP_POST,
         .handler = config_page_post_handler,
     };
+    httpd_uri_t wallpaper_uri = {
+        .uri = "/wallpaper",
+        .method = HTTP_POST,
+        .handler = wallpaper_post_handler,
+    };
+    httpd_uri_t wallpaper_clear_uri = {
+        .uri = "/wallpaper/clear",
+        .method = HTTP_GET,
+        .handler = wallpaper_delete_handler,
+    };
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_config_server, &root_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_config_server, &save_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_config_server, &wallpaper_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_config_server, &wallpaper_clear_uri));
     ESP_LOGI(TAG, "Config web server started at http://192.168.4.1");
     return ESP_OK;
 }
