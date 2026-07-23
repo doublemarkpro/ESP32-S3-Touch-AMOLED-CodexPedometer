@@ -178,6 +178,8 @@
 #define MUSIC_BASELINE_Y 336
 #define MUSIC_MIC_GAIN_DB 30.0f
 #define MUSIC_SLOW_UI_DIVIDER 8
+/* AMap returns today plus three forecast days in one call. */
+#define WEATHER_FORECAST_DAYS 4
 #define WEATHER_POLL_INTERVAL_MS 1800000
 #define WEATHER_RETRY_INTERVAL_MS 60000
 #define WEATHER_HTTP_TIMEOUT_MS 8000
@@ -372,6 +374,20 @@ typedef struct {
 
 typedef struct {
     lv_obj_t *page;
+    lv_obj_t *range_arc;
+    lv_obj_t *icon;
+    lv_obj_t *day_label;
+    lv_obj_t *date_label;
+    lv_obj_t *range_label;
+    lv_obj_t *cond_label;
+    lv_obj_t *day_value_label;
+    lv_obj_t *night_value_label;
+    lv_obj_t *wind_value_label;
+    lv_obj_t *dots[WEATHER_FORECAST_DAYS];
+} forecast_ui_t;
+
+typedef struct {
+    lv_obj_t *page;
     lv_obj_t *vu_arc;
     lv_obj_t *bars[MUSIC_BANDS];
     lv_obj_t *peaks[MUSIC_BANDS];
@@ -406,6 +422,17 @@ typedef struct {
 } codex_usage_t;
 
 typedef struct {
+    char date[12];      /* MM-DD */
+    char day_cond[24];
+    char night_cond[24];
+    char wind[32];      /* direction + power, e.g. "S 1-3" */
+    int day_temp_c;
+    int night_temp_c;
+    int day_code;
+    bool valid;
+} weather_day_t;
+
+typedef struct {
     char city[WEATHER_CITY_STORAGE_SIZE];
     char region[WEATHER_CITY_STORAGE_SIZE];
     char condition[32];
@@ -415,6 +442,8 @@ typedef struct {
     int min_temp_c;
     int max_temp_c;
     bool valid;
+    weather_day_t days[WEATHER_FORECAST_DAYS];
+    int day_count;
 } weather_data_t;
 
 typedef struct {
@@ -435,6 +464,11 @@ static pedometer_ui_t s_pedometer_ui;
 static codex_ui_t s_codex_ui;
 static agent_ui_t s_agent_ui;
 static music_ui_t s_music_ui;
+static forecast_ui_t s_forecast_ui;
+/* Forecast detail overlays the weather page rather than joining the page
+ * carousel, so it does not lengthen the swipe chain for everyone else. */
+static bool s_forecast_open;
+static int s_forecast_day;
 static agent_status_t s_agent_status = {
     .state = AGENT_STATE_UNKNOWN,
     .codex_state = AGENT_STATE_UNKNOWN,
@@ -557,6 +591,12 @@ static uint32_t agent_state_color(agent_state_t state);
 static const char *agent_state_short(agent_state_t state);
 static void save_ui_settings(void);
 static bool corner_handle_tap(lv_point_t point);
+static bool weather_icon_hit(lv_point_t point);
+static void show_forecast_page(bool show);
+static void render_forecast_locked(void);
+static void page_nav_event_cb(lv_event_t *event);
+static lv_obj_t *create_weather_icon_visual(lv_obj_t *parent);
+static void draw_weather_icon(lv_obj_t *canvas, int code);
 static bool json_get_string(const char *json, const char *key, char *out_value, size_t out_size);
 static bool json_get_u64(const char *json, const char *key, uint64_t *out_value);
 static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bundle,
@@ -1362,6 +1402,12 @@ static app_page_t relative_page(app_page_t base, int delta)
 
 static void set_active_page_locked(app_page_t page)
 {
+    /* The forecast overlay belongs to the weather page only; leaving that
+     * page must not strand it on top of another one. */
+    if (s_forecast_open && page != APP_PAGE_WEATHER) {
+        s_forecast_open = false;
+        set_obj_hidden(s_forecast_ui.page, true);
+    }
     s_current_page = page;
     enforce_page_visibility_locked();
     if (page == APP_PAGE_TIME) {
@@ -1503,6 +1549,20 @@ static void page_nav_event_cb(lv_event_t *event)
     bool horizontal_commit = abs_dx >= PAGE_SWIPE_MIN_PX && abs_dx > abs_dy &&
                              abs_dy <= PAGE_SWIPE_MAX_OFF_AXIS_PX;
 
+    /* While the forecast overlay is up it owns horizontal swipes (day
+     * stepping) and taps (dismiss); everything else stays untouched. */
+    if (s_forecast_open) {
+        if (horizontal_commit) {
+            int count = s_last_weather.day_count > 0 ? s_last_weather.day_count : 1;
+            s_forecast_day = (s_forecast_day + (dx < 0 ? 1 : count - 1)) % count;
+            render_forecast_locked();
+        } else if (code == LV_EVENT_RELEASED && abs_dx < PAGE_SWIPE_MIN_PX &&
+                   abs_dy < PAGE_SWIPE_MIN_PX) {
+            show_forecast_page(false);
+        }
+        return;
+    }
+
     if (horizontal_commit) {
         set_relative_page_locked(dx < 0 ? 1 : -1);
     } else if (dy >= PAGE_SWIPE_MIN_PX && abs_dy > abs_dx &&
@@ -1524,6 +1584,9 @@ static void page_nav_event_cb(lv_event_t *event)
         } else if (s_current_page == APP_PAGE_TIME && corner_handle_tap(release_point)) {
             /* Tap on a watch-face corner cycles that complication instead of
              * switching pages. */
+        } else if (s_current_page == APP_PAGE_WEATHER &&
+                   weather_icon_hit(release_point)) {
+            show_forecast_page(true);
         } else {
             set_relative_page_locked(1);
         }
@@ -2133,6 +2196,15 @@ static void draw_weather_icon(lv_obj_t *canvas, int code)
     lv_obj_invalidate(canvas);
 }
 
+/* The weather-page icon is the entry point to the forecast detail; match
+ * the canvas placement in create_weather_page. */
+static bool weather_icon_hit(lv_point_t point)
+{
+    int32_t dx = point.x - WATCH_CENTER_X;
+    int32_t dy = point.y - (WATCH_CENTER_Y - 124);
+    return dx * dx + dy * dy <= 62 * 62;
+}
+
 static lv_obj_t *create_weather_icon_visual(lv_obj_t *parent)
 {
     size_t buf_size = (size_t)WEATHER_ICON_SIZE * WEATHER_ICON_SIZE * 2;
@@ -2587,6 +2659,84 @@ static uint32_t music_bar_color(int index)
     return 0xFF5A70;
 }
 
+/* Overlay page: today plus the three forecast days, one per swipe. */
+static void create_forecast_page(lv_obj_t *parent)
+{
+    lv_obj_t *page = lv_obj_create(parent);
+    lv_obj_remove_style_all(page);
+    lv_obj_set_size(page, BSP_LCD_H_RES, BSP_LCD_V_RES);
+    lv_obj_align(page, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(page, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(page, LV_OPA_COVER, 0);
+    lv_obj_add_flag(page, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_event_cb(page, page_nav_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(page, page_nav_event_cb, LV_EVENT_PRESSING, NULL);
+    lv_obj_add_event_cb(page, page_nav_event_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(page, page_nav_event_cb, LV_EVENT_PRESS_LOST, NULL);
+    s_forecast_ui.page = page;
+
+    s_forecast_ui.range_arc = lv_arc_create(page);
+    lv_obj_set_size(s_forecast_ui.range_arc, UI_ARC_SIZE, UI_ARC_SIZE);
+    lv_obj_align(s_forecast_ui.range_arc, LV_ALIGN_TOP_MID, 0, UI_ARC_TOP);
+    lv_arc_set_rotation(s_forecast_ui.range_arc, 135);
+    lv_arc_set_bg_angles(s_forecast_ui.range_arc, 0, 270);
+    lv_obj_remove_style(s_forecast_ui.range_arc, NULL, LV_PART_KNOB);
+    lv_obj_clear_flag(s_forecast_ui.range_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(s_forecast_ui.range_arc, UI_ARC_WIDTH, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_forecast_ui.range_arc, UI_ARC_WIDTH, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(s_forecast_ui.range_arc, true, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_forecast_ui.range_arc, lv_color_hex(0x17212B), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_forecast_ui.range_arc,
+                               lv_color_hex(s_theme_color[THEME_WEATHER]), LV_PART_INDICATOR);
+
+    s_forecast_ui.day_label = create_label(page, "TODAY", FONT_MEDIUM,
+                                           lv_color_hex(0x8E99A5));
+    lv_obj_set_style_text_letter_space(s_forecast_ui.day_label, 3, 0);
+    lv_obj_align(s_forecast_ui.day_label, LV_ALIGN_CENTER, 0, -142);
+
+    s_forecast_ui.date_label = create_label(page, "--", FONT_SMALL, lv_color_hex(0x5F6B77));
+    lv_obj_align(s_forecast_ui.date_label, LV_ALIGN_CENTER, 0, -118);
+
+    s_forecast_ui.icon = create_weather_icon_visual(page);
+    if (s_forecast_ui.icon != NULL) {
+        lv_obj_align(s_forecast_ui.icon, LV_ALIGN_CENTER, 0, -62);
+    }
+
+    s_forecast_ui.range_label = create_label(page, "--", FONT_VALUE, lv_color_hex(0xF7FBFF));
+    lv_obj_set_width(s_forecast_ui.range_label, 340);
+    lv_obj_set_style_text_align(s_forecast_ui.range_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_forecast_ui.range_label, LV_LABEL_LONG_CLIP);
+    lv_obj_align(s_forecast_ui.range_label, LV_ALIGN_CENTER, 0, 20);
+
+    s_forecast_ui.cond_label = create_label(page, "--", FONT_CJK,
+                                            lv_color_hex(s_theme_color[THEME_WEATHER]));
+    lv_obj_set_width(s_forecast_ui.cond_label, 300);
+    lv_obj_set_style_text_align(s_forecast_ui.cond_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_forecast_ui.cond_label, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_forecast_ui.cond_label, LV_ALIGN_CENTER, 0, 58);
+
+    s_forecast_ui.day_value_label =
+        create_metric_column(page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED, "DAY", "--");
+    s_forecast_ui.night_value_label =
+        create_metric_column(page, 0, false, METRIC_ICON_LEFT, "NIGHT", "--");
+    s_forecast_ui.wind_value_label =
+        create_metric_column(page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT, "WIND", "--");
+
+    for (int i = 0; i < WEATHER_FORECAST_DAYS; i++) {
+        lv_obj_t *dot = lv_obj_create(page);
+        lv_obj_remove_style_all(dot);
+        lv_obj_set_size(dot, 5, 5);
+        lv_obj_set_style_radius(dot, 3, 0);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        s_forecast_ui.dots[i] = dot;
+    }
+
+    set_obj_hidden(page, true);
+}
+
 static void create_music_page(lv_obj_t *parent)
 {
     s_music_ui.page = create_page(parent);
@@ -2877,6 +3027,7 @@ static void create_app_ui(void)
 
     create_music_page(scr);
     create_agent_page(scr);
+    create_forecast_page(scr);
     create_codex_page(scr);
     create_pedometer_page(scr);
     create_weather_page(scr);
@@ -3515,6 +3666,106 @@ static void render_weather_status(const char *status_text)
     render_weather(&s_last_weather, status_text);
 }
 
+/* Paint one forecast day. The ring draws that day's low..high as a segment
+ * positioned inside the span of all four days, so relative warmth and swing
+ * read at a glance. */
+static void render_forecast_locked(void)
+{
+    if (s_forecast_ui.page == NULL) {
+        return;
+    }
+
+    int count = s_last_weather.day_count;
+    if (count <= 0) {
+        set_label_text_if_changed(s_forecast_ui.day_label, "NO DATA");
+        set_label_text_if_changed(s_forecast_ui.date_label, "");
+        set_label_text_if_changed(s_forecast_ui.range_label, "--");
+        set_label_text_if_changed(s_forecast_ui.cond_label, "");
+        return;
+    }
+    if (s_forecast_day >= count) {
+        s_forecast_day = 0;
+    }
+
+    int span_low = 1000;
+    int span_high = -1000;
+    for (int i = 0; i < count; i++) {
+        if (s_last_weather.days[i].night_temp_c < span_low) {
+            span_low = s_last_weather.days[i].night_temp_c;
+        }
+        if (s_last_weather.days[i].day_temp_c > span_high) {
+            span_high = s_last_weather.days[i].day_temp_c;
+        }
+    }
+    if (span_high <= span_low) {
+        span_high = span_low + 1;
+    }
+
+    const weather_day_t *day = &s_last_weather.days[s_forecast_day];
+    lv_arc_set_range(s_forecast_ui.range_arc, span_low, span_high);
+    /* Both ends move, so drive the indicator angles directly instead of a
+     * value: an arc value always starts from the range minimum. */
+    int32_t start_angle =
+        (int32_t)(270L * (day->night_temp_c - span_low) / (span_high - span_low));
+    int32_t end_angle =
+        (int32_t)(270L * (day->day_temp_c - span_low) / (span_high - span_low));
+    if (end_angle <= start_angle) {
+        end_angle = start_angle + 6;
+    }
+    lv_arc_set_angles(s_forecast_ui.range_arc, start_angle, end_angle);
+
+    static const char *const day_names[WEATHER_FORECAST_DAYS] = {"TODAY", "DAY 2", "DAY 3",
+                                                                 "DAY 4"};
+    set_label_text_if_changed(s_forecast_ui.day_label, day_names[s_forecast_day]);
+    set_label_text_if_changed(s_forecast_ui.date_label, day->date);
+
+    char text[32];
+    snprintf(text, sizeof(text), "%d°~%d°", day->night_temp_c, day->day_temp_c);
+    set_label_text_if_changed(s_forecast_ui.range_label, text);
+
+    const char *cond = text_glyphs_available(FONT_CJK, day->day_cond)
+                           ? day->day_cond
+                           : weather_condition_en(day->day_code);
+    set_label_text_if_changed(s_forecast_ui.cond_label, cond);
+    set_label_text_if_changed(s_forecast_ui.day_value_label, cond);
+
+    const char *night = text_glyphs_available(FONT_CJK, day->night_cond)
+                            ? day->night_cond
+                            : "--";
+    set_label_text_if_changed(s_forecast_ui.night_value_label, night);
+    set_label_text_if_changed(s_forecast_ui.wind_value_label,
+                              day->wind[0] != '\0' ? day->wind : "--");
+
+    draw_weather_icon(s_forecast_ui.icon, day->day_code);
+
+    for (int i = 0; i < WEATHER_FORECAST_DAYS; i++) {
+        bool active = i == s_forecast_day;
+        set_obj_hidden(s_forecast_ui.dots[i], i >= count);
+        lv_obj_set_size(s_forecast_ui.dots[i], active ? 22 : 5, 5);
+        lv_obj_set_style_bg_color(s_forecast_ui.dots[i],
+                                  lv_color_hex(active ? s_theme_color[THEME_WEATHER]
+                                                      : 0x32404E),
+                                  0);
+        lv_obj_align(s_forecast_ui.dots[i], LV_ALIGN_CENTER,
+                     -33 + i * (active ? 22 : 22), 191);
+    }
+}
+
+static void show_forecast_page(bool show)
+{
+    if (s_forecast_ui.page == NULL) {
+        return;
+    }
+    s_forecast_open = show;
+    if (show) {
+        s_forecast_day = 0;
+        render_forecast_locked();
+        lv_obj_move_foreground(s_forecast_ui.page);
+    }
+    set_obj_hidden(s_forecast_ui.page, !show);
+    lv_obj_invalidate(lv_screen_active());
+}
+
 static void format_compact_u64(uint64_t value, char *buffer, size_t buffer_size)
 {
     if (value >= 1000000ULL) {
@@ -4008,6 +4259,37 @@ static bool parse_codex_usage_json(const char *json, codex_usage_t *usage)
     return true;
 }
 
+/* The bundled CJK subset lacks 东 and 风, so wind directions are rendered as
+ * compass letters rather than the Chinese names AMap returns. */
+static const char *wind_direction_en(const char *cn)
+{
+    if (text_contains(cn, "东") && text_contains(cn, "北")) {
+        return "NE";
+    }
+    if (text_contains(cn, "东") && text_contains(cn, "南")) {
+        return "SE";
+    }
+    if (text_contains(cn, "西") && text_contains(cn, "北")) {
+        return "NW";
+    }
+    if (text_contains(cn, "西") && text_contains(cn, "南")) {
+        return "SW";
+    }
+    if (text_contains(cn, "东")) {
+        return "E";
+    }
+    if (text_contains(cn, "南")) {
+        return "S";
+    }
+    if (text_contains(cn, "西")) {
+        return "W";
+    }
+    if (text_contains(cn, "北")) {
+        return "N";
+    }
+    return "--";
+}
+
 static bool parse_amap_weather_json(const char *json, weather_data_t *weather,
                                     const char *display_city)
 {
@@ -4055,6 +4337,63 @@ static bool parse_amap_weather_json(const char *json, weather_data_t *weather,
         snprintf(weather->updated, sizeof(weather->updated), "%02d:%02d AMap",
                  local_time.tm_hour, local_time.tm_min);
     }
+    /* Walk the casts array for the forecast detail page. Each entry is
+     * scanned from the previous one's position, so per-day keys resolve to
+     * the right day instead of always hitting the first match. */
+    weather->day_count = 0;
+    const char *cursor = strstr(json, "\"casts\"");
+    for (int i = 0; cursor != NULL && i < WEATHER_FORECAST_DAYS; i++) {
+        const char *entry = strstr(cursor, "\"date\"");
+        if (entry == NULL) {
+            break;
+        }
+
+        weather_day_t *day = &weather->days[weather->day_count];
+        char field[32];
+        int day_temp = 0;
+        int night_temp = 0;
+
+        if (!json_get_string(entry, "daytemp", field, sizeof(field)) ||
+            !parse_weather_temp(field, &day_temp)) {
+            break;
+        }
+        if (!json_get_string(entry, "nighttemp", field, sizeof(field)) ||
+            !parse_weather_temp(field, &night_temp)) {
+            break;
+        }
+        day->day_temp_c = day_temp;
+        day->night_temp_c = night_temp;
+
+        if (json_get_string(entry, "date", field, sizeof(field)) && strlen(field) >= 10) {
+            /* "2026-07-23" -> "07-23" */
+            snprintf(day->date, sizeof(day->date), "%.5s", field + 5);
+        } else {
+            day->date[0] = '\0';
+        }
+
+        if (json_get_string(entry, "dayweather", field, sizeof(field))) {
+            copy_string(day->day_cond, sizeof(day->day_cond), field);
+            day->day_code = weather_code_from_china_type(field);
+        }
+        if (json_get_string(entry, "nightweather", field, sizeof(field))) {
+            copy_string(day->night_cond, sizeof(day->night_cond), field);
+        }
+
+        char power[16];
+        if (json_get_string(entry, "daywind", field, sizeof(field))) {
+            if (json_get_string(entry, "daypower", power, sizeof(power))) {
+                snprintf(day->wind, sizeof(day->wind), "%s %s",
+                         wind_direction_en(field), power);
+            } else {
+                copy_string(day->wind, sizeof(day->wind), wind_direction_en(field));
+            }
+        }
+
+        day->valid = true;
+        weather->day_count++;
+        cursor = entry + 6;
+    }
+
     weather->valid = true;
     return true;
 }
@@ -4358,6 +4697,11 @@ static esp_err_t fetch_weather(weather_data_t *weather)
         }
         ESP_LOGI(TAG, "Weather live %dC in range %d..%dC", parsed.current_temp_c,
                  parsed.min_temp_c, parsed.max_temp_c);
+        for (int i = 0; i < parsed.day_count; i++) {
+            ESP_LOGI(TAG, "  forecast[%d] %s %d..%dC wind=%s", i, parsed.days[i].date,
+                     parsed.days[i].night_temp_c, parsed.days[i].day_temp_c,
+                     parsed.days[i].wind);
+        }
     }
 
     *weather = parsed;
