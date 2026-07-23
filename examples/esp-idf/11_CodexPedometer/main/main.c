@@ -299,14 +299,23 @@ typedef struct {
     lv_obj_t *status_label;
     lv_obj_t *wifi_icon;
     lv_obj_t *ntp_icon;
-    lv_obj_t *battery_arc;
-    lv_obj_t *battery_label;
-    lv_obj_t *temp_arc;
-    lv_obj_t *temp_label;
-    lv_obj_t *weekday_label;
-    lv_obj_t *month_label;
-    lv_obj_t *day_label;
+    lv_obj_t *corner_arc[4];
+    lv_obj_t *corner_value[4];
+    lv_obj_t *corner_caption[4];
 } time_ui_t;
+
+/* Tap-cyclable corner complications on the watch face. Order here is the
+ * cycle order. */
+typedef enum {
+    CW_BATTERY,
+    CW_TEMP,
+    CW_WEEKDAY,
+    CW_DATE,
+    CW_WEATHER,
+    CW_CODEX,
+    CW_AGENT,
+    CW_COUNT,
+} corner_widget_t;
 
 typedef struct {
     lv_obj_t *page;
@@ -473,6 +482,7 @@ static lv_point_precise_t s_second_hand_points[2];
 static volatile int s_battery_percent = -1;
 static volatile float s_board_temp_c = BOARD_TEMP_INVALID;
 static volatile bool s_ntp_resync_requested;
+static uint8_t s_corner_widget[4] = {CW_BATTERY, CW_TEMP, CW_WEEKDAY, CW_DATE};
 
 typedef struct {
     lv_obj_t *panel;
@@ -520,6 +530,13 @@ static void render_weather_status(const char *status_text);
 static esp_err_t request_ntp_sync(void);
 static void show_settings_panel(bool show);
 static void agent_refresh_lamp(void);
+static bool text_glyphs_available(const lv_font_t *font, const char *text);
+static const char *weather_condition_en(int code);
+static uint32_t agent_state_color(agent_state_t state);
+static const char *agent_state_short(agent_state_t state);
+static const char *weekday_cn(int wday);
+static void save_ui_settings(void);
+static bool corner_handle_tap(lv_point_t point);
 static bool json_get_string(const char *json, const char *key, char *out_value, size_t out_size);
 static bool json_get_u64(const char *json, const char *key, uint64_t *out_value);
 static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bundle,
@@ -737,6 +754,13 @@ static void load_ui_settings(void)
         value >= SETTINGS_STANDBY_MIN_MINUTES && value <= SETTINGS_STANDBY_MAX_MINUTES) {
         s_cfg_standby_minutes = value;
     }
+    for (int corner = 0; corner < 4; corner++) {
+        char key[12];
+        snprintf(key, sizeof(key), "corner%d", corner);
+        if (nvs_get_u8(nvs, key, &value) == ESP_OK && value < CW_COUNT) {
+            s_corner_widget[corner] = value;
+        }
+    }
     nvs_close(nvs);
 }
 
@@ -750,6 +774,11 @@ static void save_ui_settings(void)
     (void)nvs_set_u8(nvs, SETTINGS_NVS_VOLUME_KEY, s_cfg_volume);
     (void)nvs_set_u8(nvs, SETTINGS_NVS_STANDBY_EN_KEY, s_cfg_standby_enabled ? 1 : 0);
     (void)nvs_set_u8(nvs, SETTINGS_NVS_STANDBY_MIN_KEY, s_cfg_standby_minutes);
+    for (int corner = 0; corner < 4; corner++) {
+        char key[12];
+        snprintf(key, sizeof(key), "corner%d", corner);
+        (void)nvs_set_u8(nvs, key, s_corner_widget[corner]);
+    }
     (void)nvs_commit(nvs);
     nvs_close(nvs);
 }
@@ -1459,6 +1488,9 @@ static void page_nav_event_cb(lv_event_t *event)
                        s_current_page == APP_PAGE_AGENT) {
                 request_codex_refresh();
             }
+        } else if (s_current_page == APP_PAGE_TIME && corner_handle_tap(release_point)) {
+            /* Tap on a watch-face corner cycles that complication instead of
+             * switching pages. */
         } else {
             set_relative_page_locked(1);
         }
@@ -1537,14 +1569,8 @@ static lv_obj_t *create_dial_canvas(lv_obj_t *parent)
     draw_canvas_text(&layer, "9", FONT_VALUE, numeral_color, WATCH_CENTER_X - WATCH_NUMERAL_R,
                      WATCH_CENTER_Y);
 
-    lv_color_t caption_color = lv_color_hex(WATCH_COLOR_CAPTION);
-    draw_canvas_text(&layer, "电量", FONT_CJK, caption_color, WATCH_CENTER_X - WATCH_CORNER_OFS,
-                     WATCH_CENTER_Y - WATCH_CORNER_OFS + 45);
-    draw_canvas_text(&layer, "温度", FONT_CJK, caption_color, WATCH_CENTER_X + WATCH_CORNER_OFS,
-                     WATCH_CENTER_Y - WATCH_CORNER_OFS + 45);
-    draw_canvas_text(&layer, "星期", FONT_CJK, caption_color, WATCH_CENTER_X - WATCH_CORNER_OFS,
-                     WATCH_CENTER_Y + WATCH_CORNER_OFS - 26);
-
+    /* Corner captions are live labels now that the corners are tap-cyclable
+     * widgets, so the canvas only carries the ticks and numerals. */
     lv_canvas_finish_layer(canvas, &layer);
     return canvas;
 }
@@ -1567,6 +1593,212 @@ static lv_obj_t *create_corner_gauge(lv_obj_t *parent, int32_t x_ofs, int32_t y_
     lv_obj_set_style_arc_color(arc, lv_color_hex(WATCH_COLOR_GAUGE_BG), LV_PART_MAIN);
     lv_obj_set_style_arc_color(arc, lv_color_hex(accent), LV_PART_INDICATOR);
     return arc;
+}
+
+static int32_t corner_x_ofs(int corner)
+{
+    return (corner == 0 || corner == 2) ? -WATCH_CORNER_OFS : WATCH_CORNER_OFS;
+}
+
+static int32_t corner_y_ofs(int corner)
+{
+    return corner < 2 ? -WATCH_CORNER_OFS : WATCH_CORNER_OFS;
+}
+
+/* Configure one corner's shared objects (gauge + value + caption) for the
+ * widget type it currently shows. Values are filled by
+ * corner_render_widget_locked each second. */
+static void corner_apply_widget_locked(int corner)
+{
+    lv_obj_t *arc = s_time_ui.corner_arc[corner];
+    lv_obj_t *value = s_time_ui.corner_value[corner];
+    lv_obj_t *caption = s_time_ui.corner_caption[corner];
+    if (arc == NULL || value == NULL || caption == NULL) {
+        return;
+    }
+
+    corner_widget_t type = (corner_widget_t)s_corner_widget[corner];
+    int32_t cx = corner_x_ofs(corner);
+    int32_t cy = corner_y_ofs(corner);
+    /* Top corners put the caption under the content, bottom corners above. */
+    int32_t caption_y = corner < 2 ? cy + 45 : cy - 45;
+
+    bool uses_arc = type == CW_BATTERY || type == CW_TEMP || type == CW_CODEX ||
+                    type == CW_AGENT;
+    set_obj_hidden(arc, !uses_arc);
+
+    uint32_t arc_color = WATCH_COLOR_BATTERY;
+    int32_t range_min = 0;
+    int32_t range_max = 100;
+    const lv_font_t *value_font = FONT_SMALL;
+    uint32_t value_color = 0xFFFFFF;
+    int32_t value_y = cy;
+    const char *caption_text = "";
+    uint32_t caption_color = WATCH_COLOR_CAPTION;
+
+    switch (type) {
+    case CW_BATTERY:
+        caption_text = "电量";
+        break;
+    case CW_TEMP:
+        arc_color = WATCH_COLOR_TEMP;
+        range_min = -10;
+        range_max = 50;
+        caption_text = "温度";
+        break;
+    case CW_WEEKDAY:
+        value_font = FONT_CJK;
+        value_color = WATCH_COLOR_WEEKDAY;
+        caption_text = "星期";
+        break;
+    case CW_DATE:
+        /* Caption doubles as the red month, value is the big day number. */
+        value_font = FONT_VALUE;
+        value_y = cy + (corner < 2 ? -8 : 10);
+        caption_y = corner < 2 ? cy + 30 : cy - 22;
+        caption_color = WATCH_COLOR_MONTH;
+        break;
+    case CW_WEATHER:
+        value_font = FONT_MEDIUM;
+        caption_text = "天气";
+        caption_color = WATCH_COLOR_WEEKDAY;
+        break;
+    case CW_CODEX:
+        arc_color = 0xFFD166;
+        caption_text = "Codex";
+        break;
+    case CW_AGENT:
+        caption_text = "AI";
+        break;
+    default:
+        break;
+    }
+
+    if (uses_arc) {
+        lv_arc_set_range(arc, range_min, range_max);
+        lv_arc_set_value(arc, range_min);
+        lv_obj_set_style_arc_color(arc, lv_color_hex(arc_color), LV_PART_INDICATOR);
+    }
+
+    lv_obj_set_style_text_font(value, value_font, 0);
+    lv_obj_set_style_text_color(value, lv_color_hex(value_color), 0);
+    lv_obj_align(value, LV_ALIGN_CENTER, cx, value_y);
+    lv_label_set_text(value, "--");
+
+    lv_obj_set_style_text_color(caption, lv_color_hex(caption_color), 0);
+    lv_obj_align(caption, LV_ALIGN_CENTER, cx, caption_y);
+    lv_label_set_text(caption, caption_text);
+}
+
+static void corner_render_widget_locked(int corner, const struct tm *local_time)
+{
+    lv_obj_t *arc = s_time_ui.corner_arc[corner];
+    lv_obj_t *value = s_time_ui.corner_value[corner];
+    lv_obj_t *caption = s_time_ui.corner_caption[corner];
+    if (arc == NULL || value == NULL || caption == NULL) {
+        return;
+    }
+
+    char text[24];
+    switch ((corner_widget_t)s_corner_widget[corner]) {
+    case CW_BATTERY: {
+        int battery = s_battery_percent;
+        if (battery >= 0) {
+            snprintf(text, sizeof(text), "%d%%", battery);
+            if (lv_arc_get_value(arc) != battery) {
+                lv_arc_set_value(arc, battery);
+            }
+        } else {
+            snprintf(text, sizeof(text), "--");
+        }
+        set_label_text_if_changed(value, text);
+        break;
+    }
+    case CW_TEMP: {
+        float temp_c = s_board_temp_c;
+        if (temp_c > -100.0f) {
+            int temp_rounded = (int)lroundf(temp_c);
+            snprintf(text, sizeof(text), "%d°", temp_rounded);
+            if (lv_arc_get_value(arc) != temp_rounded) {
+                lv_arc_set_value(arc, temp_rounded);
+            }
+        } else {
+            snprintf(text, sizeof(text), "--");
+        }
+        set_label_text_if_changed(value, text);
+        break;
+    }
+    case CW_WEEKDAY:
+        set_label_text_if_changed(value, weekday_cn(local_time->tm_wday));
+        break;
+    case CW_DATE:
+        snprintf(text, sizeof(text), "%d月", local_time->tm_mon + 1);
+        set_label_text_if_changed(caption, text);
+        snprintf(text, sizeof(text), "%d", local_time->tm_mday);
+        set_label_text_if_changed(value, text);
+        break;
+    case CW_WEATHER:
+        if (s_last_weather.valid) {
+            snprintf(text, sizeof(text), "%d°", s_last_weather.current_temp_c);
+            set_label_text_if_changed(value, text);
+            const char *cond = text_glyphs_available(FONT_CJK, s_last_weather.condition)
+                                   ? s_last_weather.condition
+                                   : weather_condition_en(s_last_weather.weather_code);
+            set_label_text_if_changed(caption, cond);
+        } else {
+            set_label_text_if_changed(value, "--");
+            set_label_text_if_changed(caption, "天气");
+        }
+        break;
+    case CW_CODEX: {
+        uint64_t limit = s_last_codex_usage.limit_tokens;
+        if (limit > 0) {
+            int percent = (int)clamp_u32(
+                (uint32_t)((s_last_codex_usage.used_tokens * 100ULL) / limit), 100U);
+            snprintf(text, sizeof(text), "%d%%", percent);
+            if (lv_arc_get_value(arc) != percent) {
+                lv_arc_set_value(arc, percent);
+            }
+        } else {
+            snprintf(text, sizeof(text), "--");
+        }
+        set_label_text_if_changed(value, text);
+        break;
+    }
+    case CW_AGENT: {
+        agent_state_t state = s_agent_status.valid ? s_agent_status.state
+                                                   : AGENT_STATE_UNKNOWN;
+        lv_obj_set_style_arc_color(arc, lv_color_hex(agent_state_color(state)),
+                                   LV_PART_INDICATOR);
+        if (lv_arc_get_value(arc) != 100) {
+            lv_arc_set_value(arc, 100);
+        }
+        set_label_text_if_changed(value, agent_state_short(state));
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* A short tap on the clock face cycles the corner under the finger to the
+ * next widget type; returns false when the tap missed every corner. */
+static bool corner_handle_tap(lv_point_t point)
+{
+    for (int corner = 0; corner < 4; corner++) {
+        int32_t dx = point.x - (WATCH_CENTER_X + corner_x_ofs(corner));
+        int32_t dy = point.y - (WATCH_CENTER_Y + corner_y_ofs(corner));
+        if (dx * dx + dy * dy <= 58 * 58) {
+            s_corner_widget[corner] = (s_corner_widget[corner] + 1) % CW_COUNT;
+            corner_apply_widget_locked(corner);
+            struct tm local_time;
+            get_local_clock(&local_time);
+            corner_render_widget_locked(corner, &local_time);
+            save_ui_settings();
+            return true;
+        }
+    }
+    return false;
 }
 
 static lv_obj_t *create_watch_hand(lv_obj_t *parent, int32_t width, uint32_t color,
@@ -1619,27 +1851,16 @@ static void create_time_page(lv_obj_t *parent)
 
     create_dial_canvas(s_time_ui.page);
 
-    s_time_ui.battery_arc = create_corner_gauge(s_time_ui.page, -WATCH_CORNER_OFS,
-                                                -WATCH_CORNER_OFS, WATCH_COLOR_BATTERY, 0, 100);
-    s_time_ui.battery_label = create_label(s_time_ui.page, "--", FONT_SMALL,
-                                           lv_color_hex(0xFFFFFF));
-    lv_obj_align(s_time_ui.battery_label, LV_ALIGN_CENTER, -WATCH_CORNER_OFS, -WATCH_CORNER_OFS);
-
-    s_time_ui.temp_arc = create_corner_gauge(s_time_ui.page, WATCH_CORNER_OFS,
-                                             -WATCH_CORNER_OFS, WATCH_COLOR_TEMP, -10, 50);
-    s_time_ui.temp_label = create_label(s_time_ui.page, "--", FONT_SMALL, lv_color_hex(0xFFFFFF));
-    lv_obj_align(s_time_ui.temp_label, LV_ALIGN_CENTER, WATCH_CORNER_OFS, -WATCH_CORNER_OFS);
-
-    s_time_ui.weekday_label = create_label(s_time_ui.page, "星期一", FONT_CJK,
-                                           lv_color_hex(WATCH_COLOR_WEEKDAY));
-    lv_obj_align(s_time_ui.weekday_label, LV_ALIGN_CENTER, -WATCH_CORNER_OFS, WATCH_CORNER_OFS);
-
-    s_time_ui.month_label = create_label(s_time_ui.page, "7月", FONT_CJK,
-                                         lv_color_hex(WATCH_COLOR_MONTH));
-    lv_obj_align(s_time_ui.month_label, LV_ALIGN_CENTER, WATCH_CORNER_OFS, WATCH_CORNER_OFS - 22);
-
-    s_time_ui.day_label = create_label(s_time_ui.page, "20", FONT_VALUE, lv_color_hex(0xFFFFFF));
-    lv_obj_align(s_time_ui.day_label, LV_ALIGN_CENTER, WATCH_CORNER_OFS, WATCH_CORNER_OFS + 10);
+    for (int corner = 0; corner < 4; corner++) {
+        s_time_ui.corner_arc[corner] =
+            create_corner_gauge(s_time_ui.page, corner_x_ofs(corner), corner_y_ofs(corner),
+                                WATCH_COLOR_BATTERY, 0, 100);
+        s_time_ui.corner_value[corner] = create_label(s_time_ui.page, "--", FONT_SMALL,
+                                                      lv_color_hex(0xFFFFFF));
+        s_time_ui.corner_caption[corner] = create_label(s_time_ui.page, "", FONT_CJK,
+                                                        lv_color_hex(WATCH_COLOR_CAPTION));
+        corner_apply_widget_locked(corner);
+    }
 
     s_time_ui.digital_label = create_label(s_time_ui.page, "00:00:00", FONT_TITLE,
                                            lv_color_hex(WATCH_COLOR_DIGITAL));
@@ -2687,10 +2908,10 @@ static void dump_layout_report(void)
 
     print_area_report("OBJ", "time_digital", s_time_ui.digital_label, true);
     print_area_report("OBJ", "time_status", s_time_ui.status_label, false);
-    print_area_report("ARC", "battery_arc", s_time_ui.battery_arc, false);
-    print_area_report("ARC", "temp_arc", s_time_ui.temp_arc, false);
-    print_area_report("OBJ", "weekday_value", s_time_ui.weekday_label, false);
-    print_area_report("OBJ", "date_day", s_time_ui.day_label, false);
+    print_area_report("ARC", "corner0_arc", s_time_ui.corner_arc[0], false);
+    print_area_report("ARC", "corner1_arc", s_time_ui.corner_arc[1], false);
+    print_area_report("OBJ", "corner2_value", s_time_ui.corner_value[2], false);
+    print_area_report("OBJ", "corner3_value", s_time_ui.corner_value[3], false);
 
     print_area_report("ARC", "weather_arc", s_weather_ui.temp_arc, false);
     print_area_report("OBJ", "weather_icon_bg", s_weather_ui.icon_bg, false);
@@ -2724,10 +2945,10 @@ static void dump_layout_report(void)
 
     print_label_text_report("time_digital", s_time_ui.digital_label);
     print_label_text_report("time_status", s_time_ui.status_label);
-    print_label_text_report("battery", s_time_ui.battery_label);
-    print_label_text_report("temperature", s_time_ui.temp_label);
-    print_label_text_report("weekday", s_time_ui.weekday_label);
-    print_label_text_report("date_day", s_time_ui.day_label);
+    print_label_text_report("corner0", s_time_ui.corner_value[0]);
+    print_label_text_report("corner1", s_time_ui.corner_value[1]);
+    print_label_text_report("corner2", s_time_ui.corner_value[2]);
+    print_label_text_report("corner3", s_time_ui.corner_value[3]);
     print_label_text_report("weather_city", s_weather_ui.city_label);
     print_label_text_report("weather_temp", s_weather_ui.temp_label);
     print_label_text_report("weather_condition", s_weather_ui.condition_label);
@@ -2853,34 +3074,9 @@ static void update_time_page_locked(void)
              local_time.tm_sec);
     set_label_text_if_changed(s_time_ui.digital_label, text);
 
-    set_label_text_if_changed(s_time_ui.weekday_label, weekday_cn(local_time.tm_wday));
-    snprintf(text, sizeof(text), "%d月", local_time.tm_mon + 1);
-    set_label_text_if_changed(s_time_ui.month_label, text);
-    snprintf(text, sizeof(text), "%d", local_time.tm_mday);
-    set_label_text_if_changed(s_time_ui.day_label, text);
-
-    int battery = s_battery_percent;
-    if (battery >= 0) {
-        snprintf(text, sizeof(text), "%d%%", battery);
-        if (lv_arc_get_value(s_time_ui.battery_arc) != battery) {
-            lv_arc_set_value(s_time_ui.battery_arc, battery);
-        }
-    } else {
-        snprintf(text, sizeof(text), "--");
+    for (int corner = 0; corner < 4; corner++) {
+        corner_render_widget_locked(corner, &local_time);
     }
-    set_label_text_if_changed(s_time_ui.battery_label, text);
-
-    float temp_c = s_board_temp_c;
-    if (temp_c > -100.0f) {
-        int temp_rounded = (int)lroundf(temp_c);
-        snprintf(text, sizeof(text), "%d°", temp_rounded);
-        if (lv_arc_get_value(s_time_ui.temp_arc) != temp_rounded) {
-            lv_arc_set_value(s_time_ui.temp_arc, temp_rounded);
-        }
-    } else {
-        snprintf(text, sizeof(text), "--");
-    }
-    set_label_text_if_changed(s_time_ui.temp_label, text);
 
     EventBits_t bits = s_wifi_event_group != NULL ? xEventGroupGetBits(s_wifi_event_group) : 0;
     bool configured = wifi_configured();
