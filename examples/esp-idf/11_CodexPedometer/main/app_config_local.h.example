@@ -1,0 +1,13 @@
+#pragma once
+
+/*
+ * Copy this file to app_config_local.h and fill in your values.
+ * app_config_local.h is gitignored, so your credentials never get
+ * committed. Any define you omit falls back to app_config.h.
+ */
+
+/* #define WIFI_SSID "MyHomeWifi" */
+/* #define WIFI_PASSWORD "secret" */
+/* #define CODEX_USAGE_URL "http://192.168.1.10:8765/usage" */
+/* #define AGENT_STATUS_URL "http://192.168.1.10:8766/status" */
+/* #define AMAP_WEATHER_KEY "your amap web service key" */

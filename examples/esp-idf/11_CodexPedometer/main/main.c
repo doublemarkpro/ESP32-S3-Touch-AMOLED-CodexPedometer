@@ -559,16 +559,19 @@ static bool wifi_configured(void)
     return s_wifi_credentials.ssid[0] != '\0';
 }
 
+/* The placeholder hostname must match app_config.h exactly, otherwise an
+ * unconfigured URL is "configured" as far as this check can tell and the UI
+ * reports a misleading "Bridge offline" instead of asking for setup. */
 static bool codex_configured(void)
 {
     return wifi_configured() &&
-           config_value_is_set(CODEX_USAGE_URL, "http://YOUR_PC_IP:8765/usage");
+           config_value_is_set(CODEX_USAGE_URL, "http://YOUR_PC_LAN_IP:8765/usage");
 }
 
 static bool agent_status_configured(void)
 {
     return wifi_configured() &&
-           config_value_is_set(AGENT_STATUS_URL, "http://YOUR_PC_IP:8766/status");
+           config_value_is_set(AGENT_STATUS_URL, "http://YOUR_PC_LAN_IP:8766/status");
 }
 
 static bool weather_api_key_configured(void)

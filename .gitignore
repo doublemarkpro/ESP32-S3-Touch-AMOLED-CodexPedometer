@@ -21,3 +21,6 @@ releases/downloads/
 # Runtime log written by tools/agent_status_server.py
 tools/agent_status.log
 tools/agent_status.log.old
+
+# Per-machine secrets overriding app_config.h defaults
+**/app_config_local.h
