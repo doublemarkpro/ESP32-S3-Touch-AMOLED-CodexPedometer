@@ -34,6 +34,7 @@
 #include "bsp/esp-bsp.h"
 #include "bsp/touch.h"
 #include "driver/i2c_master.h"
+#include "esp_codec_dev.h"
 #include "esp_heap_caps.h"
 #include "esp_lv_adapter.h"
 
@@ -164,6 +165,19 @@
  * than the quota page. */
 #define AGENT_POLL_INTERVAL_MS 2000
 #define AGENT_HTTP_TIMEOUT_MS 3000
+
+/* Music visualizer: mic -> 512-pt FFT -> 18 log-spaced bands. One 32 ms
+ * capture block per frame gives ~31 updates/s. The mic only runs while the
+ * music page is showing. */
+#define MUSIC_SAMPLE_RATE 16000
+#define MUSIC_FFT_SIZE 512
+#define MUSIC_BANDS 18
+#define MUSIC_BAR_MAX_H 150
+#define MUSIC_BAR_WIDTH 10
+#define MUSIC_BAR_PITCH 15
+#define MUSIC_BASELINE_Y 336
+#define MUSIC_MIC_GAIN_DB 30.0f
+#define MUSIC_SLOW_UI_DIVIDER 8
 #define WEATHER_POLL_INTERVAL_MS 1800000
 #define WEATHER_RETRY_INTERVAL_MS 60000
 #define WEATHER_HTTP_TIMEOUT_MS 8000
@@ -243,6 +257,7 @@ typedef enum {
     APP_PAGE_PEDOMETER,
     APP_PAGE_CODEX,
     APP_PAGE_AGENT,
+    APP_PAGE_MUSIC,
     APP_PAGE_COUNT,
 } app_page_t;
 
@@ -347,6 +362,16 @@ typedef struct {
 } agent_ui_t;
 
 typedef struct {
+    lv_obj_t *page;
+    lv_obj_t *vu_arc;
+    lv_obj_t *bars[MUSIC_BANDS];
+    lv_obj_t *peaks[MUSIC_BANDS];
+    lv_obj_t *bass_value_label;
+    lv_obj_t *vol_value_label;
+    lv_obj_t *treb_value_label;
+} music_ui_t;
+
+typedef struct {
     agent_state_t state;
     agent_state_t codex_state;
     agent_state_t claude_state;
@@ -400,6 +425,7 @@ static weather_ui_t s_weather_ui;
 static pedometer_ui_t s_pedometer_ui;
 static codex_ui_t s_codex_ui;
 static agent_ui_t s_agent_ui;
+static music_ui_t s_music_ui;
 static agent_status_t s_agent_status = {
     .state = AGENT_STATE_UNKNOWN,
     .codex_state = AGENT_STATE_UNKNOWN,
@@ -907,6 +933,8 @@ static const char *page_name(app_page_t page)
         return "codex";
     case APP_PAGE_AGENT:
         return "agent";
+    case APP_PAGE_MUSIC:
+        return "music";
     default:
         return "unknown";
     }
@@ -1110,6 +1138,8 @@ static void update_status_bar_locked(void)
         title = "Codex";
     } else if (s_current_page == APP_PAGE_AGENT) {
         title = "AI";
+    } else if (s_current_page == APP_PAGE_MUSIC) {
+        title = "MUSIC";
     }
     set_label_text_if_changed(s_status_ui.title_label, title);
 }
@@ -1227,12 +1257,14 @@ static void enforce_page_visibility_locked(void)
     bool pedometer_active = s_current_page == APP_PAGE_PEDOMETER;
     bool codex_active = s_current_page == APP_PAGE_CODEX;
     bool agent_active = s_current_page == APP_PAGE_AGENT;
+    bool music_active = s_current_page == APP_PAGE_MUSIC;
 
     set_obj_tree_hidden(s_time_ui.page, !time_active);
     set_obj_tree_hidden(s_weather_ui.page, !weather_active);
     set_obj_tree_hidden(s_pedometer_ui.page, !pedometer_active);
     set_obj_tree_hidden(s_codex_ui.page, !codex_active);
     set_obj_tree_hidden(s_agent_ui.page, !agent_active);
+    set_obj_tree_hidden(s_music_ui.page, !music_active);
 
     if (time_active && s_time_ui.page != NULL) {
         lv_obj_move_foreground(s_time_ui.page);
@@ -1244,6 +1276,8 @@ static void enforce_page_visibility_locked(void)
         lv_obj_move_foreground(s_codex_ui.page);
     } else if (agent_active && s_agent_ui.page != NULL) {
         lv_obj_move_foreground(s_agent_ui.page);
+    } else if (music_active && s_music_ui.page != NULL) {
+        lv_obj_move_foreground(s_music_ui.page);
     }
 
     move_overlay_ui_foreground_locked();
@@ -2200,6 +2234,87 @@ static void create_agent_page(lv_obj_t *parent)
 
 }
 
+static uint32_t music_bar_color(int index)
+{
+    if (index < 5) {
+        return 0x18D7F5;
+    }
+    if (index < 10) {
+        return 0x9DFF35;
+    }
+    if (index < 14) {
+        return 0xFFD166;
+    }
+    return 0xFF5A70;
+}
+
+static void create_music_page(lv_obj_t *parent)
+{
+    s_music_ui.page = create_page(parent);
+
+    s_music_ui.vu_arc = lv_arc_create(s_music_ui.page);
+    lv_obj_set_size(s_music_ui.vu_arc, UI_ARC_SIZE, UI_ARC_SIZE);
+    lv_obj_align(s_music_ui.vu_arc, LV_ALIGN_TOP_MID, 0, UI_ARC_TOP);
+    lv_arc_set_range(s_music_ui.vu_arc, 0, 100);
+    lv_arc_set_value(s_music_ui.vu_arc, 0);
+    lv_arc_set_rotation(s_music_ui.vu_arc, 135);
+    lv_arc_set_bg_angles(s_music_ui.vu_arc, 0, 270);
+    lv_obj_remove_style(s_music_ui.vu_arc, NULL, LV_PART_KNOB);
+    lv_obj_clear_flag(s_music_ui.vu_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(s_music_ui.vu_arc, UI_ARC_WIDTH, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_music_ui.vu_arc, UI_ARC_WIDTH, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(s_music_ui.vu_arc, true, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_music_ui.vu_arc, lv_color_hex(0x17212B), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_music_ui.vu_arc, lv_color_hex(0x18D7F5), LV_PART_INDICATOR);
+
+    /* Caption sits high so the tallest bars never crowd it. */
+    lv_obj_t *caption = create_label(s_music_ui.page, "MUSIC", FONT_TITLE,
+                                     lv_color_hex(0xE6EDF5));
+    lv_obj_align(caption, LV_ALIGN_CENTER, 0, -118);
+
+    int32_t start_x = (BSP_LCD_H_RES - (MUSIC_BANDS * MUSIC_BAR_PITCH - 5)) / 2;
+    for (int i = 0; i < MUSIC_BANDS; i++) {
+        lv_color_t color = lv_color_hex(music_bar_color(i));
+
+        lv_obj_t *bar = lv_obj_create(s_music_ui.page);
+        lv_obj_remove_style_all(bar);
+        lv_obj_set_style_bg_color(bar, color, 0);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(bar, 3, 0);
+        lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_size(bar, MUSIC_BAR_WIDTH, 4);
+        lv_obj_set_pos(bar, start_x + i * MUSIC_BAR_PITCH, MUSIC_BASELINE_Y - 4);
+        s_music_ui.bars[i] = bar;
+
+        lv_obj_t *peak = lv_obj_create(s_music_ui.page);
+        lv_obj_remove_style_all(peak);
+        lv_obj_set_style_bg_color(peak, color, 0);
+        lv_obj_set_style_bg_opa(peak, LV_OPA_70, 0);
+        lv_obj_set_style_radius(peak, 1, 0);
+        lv_obj_clear_flag(peak, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_size(peak, MUSIC_BAR_WIDTH, 3);
+        lv_obj_set_pos(peak, start_x + i * MUSIC_BAR_PITCH, MUSIC_BASELINE_Y - 12);
+        s_music_ui.peaks[i] = peak;
+    }
+
+    lv_obj_t *baseline = lv_obj_create(s_music_ui.page);
+    lv_obj_remove_style_all(baseline);
+    lv_obj_set_size(baseline, 270, 2);
+    lv_obj_align(baseline, LV_ALIGN_CENTER, 0, MUSIC_BASELINE_Y - 233 + 2);
+    lv_obj_set_style_bg_color(baseline, lv_color_hex(0x1A2734), 0);
+    lv_obj_set_style_bg_opa(baseline, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(baseline, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
+    s_music_ui.bass_value_label =
+        create_metric_column(s_music_ui.page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED,
+                             "BASS", "--");
+    s_music_ui.vol_value_label =
+        create_metric_column(s_music_ui.page, 0, false, METRIC_ICON_LEFT, "VOL dB", "--");
+    s_music_ui.treb_value_label =
+        create_metric_column(s_music_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT,
+                             "TREB", "--");
+}
+
 static void create_page_dots(lv_obj_t *parent)
 {
     s_dot_time = lv_obj_create(parent);
@@ -2420,6 +2535,7 @@ static void create_app_ui(void)
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
 
+    create_music_page(scr);
     create_agent_page(scr);
     create_codex_page(scr);
     create_pedometer_page(scr);
@@ -2854,6 +2970,7 @@ static void clock_task(void *arg)
         }
 
         if (s_cfg_standby_enabled && !s_screen_off &&
+            s_current_page != APP_PAGE_MUSIC &&
             (current_ms - s_last_activity_ms) >=
                 (uint32_t)s_cfg_standby_minutes * 60000U) {
             s_screen_off = true;
@@ -4511,6 +4628,247 @@ static esp_err_t start_wifi_station(void)
     return ESP_OK;
 }
 
+/* In-place radix-2 FFT; 512 points at ~31 fps is light work for the S3, so
+ * no DSP-library dependency is needed. */
+static void music_fft(float *re, float *im, int n)
+{
+    for (int i = 1, j = 0; i < n; i++) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) {
+            j ^= bit;
+        }
+        j |= bit;
+        if (i < j) {
+            float tmp = re[i];
+            re[i] = re[j];
+            re[j] = tmp;
+            tmp = im[i];
+            im[i] = im[j];
+            im[j] = tmp;
+        }
+    }
+
+    for (int len = 2; len <= n; len <<= 1) {
+        float ang = -2.0f * (float)M_PI / (float)len;
+        float wr = cosf(ang);
+        float wi = sinf(ang);
+        for (int i = 0; i < n; i += len) {
+            float cr = 1.0f;
+            float ci = 0.0f;
+            for (int k = 0; k < len / 2; k++) {
+                float vr = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci;
+                float vi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
+                float ur = re[i + k];
+                float ui_ = im[i + k];
+                re[i + k] = ur + vr;
+                im[i + k] = ui_ + vi;
+                re[i + k + len / 2] = ur - vr;
+                im[i + k + len / 2] = ui_ - vi;
+                float ncr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr;
+                cr = ncr;
+            }
+        }
+    }
+}
+
+static void render_music_bars_locked(const float *levels, const float *peaks)
+{
+    int32_t start_x = (BSP_LCD_H_RES - (MUSIC_BANDS * MUSIC_BAR_PITCH - 5)) / 2;
+    for (int i = 0; i < MUSIC_BANDS; i++) {
+        int32_t h = (int32_t)(levels[i] * MUSIC_BAR_MAX_H);
+        if (h < 4) {
+            h = 4;
+        }
+        lv_obj_set_pos(s_music_ui.bars[i], start_x + i * MUSIC_BAR_PITCH,
+                       MUSIC_BASELINE_Y - h);
+        lv_obj_set_height(s_music_ui.bars[i], h);
+
+        int32_t p = (int32_t)(peaks[i] * MUSIC_BAR_MAX_H);
+        if (p < h) {
+            p = h;
+        }
+        lv_obj_set_y(s_music_ui.peaks[i], MUSIC_BASELINE_Y - p - 8);
+    }
+}
+
+static void music_audio_task(void *arg)
+{
+    (void)arg;
+
+    esp_codec_dev_handle_t mic = NULL;
+    bool mic_open = false;
+    int band_edge[MUSIC_BANDS + 1];
+    float bar_level[MUSIC_BANDS] = {0};
+    float bar_peak[MUSIC_BANDS] = {0};
+    float agc_ref = 1000.0f;
+    uint32_t frame = 0;
+
+    /* Log-spaced band edges from ~62 Hz to ~7.5 kHz (bin = 31.25 Hz). */
+    for (int i = 0; i <= MUSIC_BANDS; i++) {
+        band_edge[i] = (int)lroundf(2.0f * powf(120.0f, (float)i / MUSIC_BANDS));
+    }
+
+    static int16_t samples[MUSIC_FFT_SIZE];
+    float *re = heap_caps_malloc(MUSIC_FFT_SIZE * sizeof(float),
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    float *im = heap_caps_malloc(MUSIC_FFT_SIZE * sizeof(float),
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    float *hann = heap_caps_malloc(MUSIC_FFT_SIZE * sizeof(float),
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (re == NULL || im == NULL || hann == NULL) {
+        ESP_LOGE(TAG, "Music FFT buffers alloc failed");
+        vTaskDelete(NULL);
+        return;
+    }
+    for (int i = 0; i < MUSIC_FFT_SIZE; i++) {
+        hann[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / (MUSIC_FFT_SIZE - 1)));
+    }
+
+    esp_codec_dev_sample_info_t fs = {
+        .bits_per_sample = 16,
+        .channel = 1,
+        .channel_mask = 0,
+        .sample_rate = MUSIC_SAMPLE_RATE,
+        .mclk_multiple = 0,
+    };
+
+    /* One boot-time capture proves the mic path end to end in the serial
+     * log, since the page itself can only be exercised by touch. */
+    mic = bsp_audio_codec_microphone_init();
+    if (mic == NULL) {
+        ESP_LOGE(TAG, "Microphone codec init failed");
+        vTaskDelete(NULL);
+        return;
+    }
+    if (esp_codec_dev_open(mic, &fs) == 0) {
+        (void)esp_codec_dev_set_in_gain(mic, MUSIC_MIC_GAIN_DB);
+        /* The first blocks after open are zero until DMA fills; sample the
+         * fifth so the log shows real room noise. */
+        int rms = -1;
+        for (int block = 0; block < 5; block++) {
+            if (esp_codec_dev_read(mic, samples, sizeof(samples)) != 0) {
+                rms = -1;
+                break;
+            }
+            int64_t acc = 0;
+            for (int i = 0; i < MUSIC_FFT_SIZE; i++) {
+                acc += (int32_t)samples[i] * samples[i];
+            }
+            rms = (int)sqrtf((float)(acc / MUSIC_FFT_SIZE));
+        }
+        if (rms >= 0) {
+            ESP_LOGI(TAG, "Mic self-test OK, RMS=%d", rms);
+        } else {
+            ESP_LOGW(TAG, "Mic self-test read failed");
+        }
+        esp_codec_dev_close(mic);
+    } else {
+        ESP_LOGW(TAG, "Mic self-test open failed");
+    }
+
+    while (true) {
+        if (s_current_page != APP_PAGE_MUSIC) {
+            if (mic_open) {
+                esp_codec_dev_close(mic);
+                mic_open = false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(150));
+            continue;
+        }
+
+        if (!mic_open) {
+            if (esp_codec_dev_open(mic, &fs) != 0) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
+            }
+            (void)esp_codec_dev_set_in_gain(mic, MUSIC_MIC_GAIN_DB);
+            mic_open = true;
+        }
+
+        if (esp_codec_dev_read(mic, samples, sizeof(samples)) != 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        int64_t acc = 0;
+        for (int i = 0; i < MUSIC_FFT_SIZE; i++) {
+            acc += (int32_t)samples[i] * samples[i];
+            re[i] = (float)samples[i] * hann[i];
+            im[i] = 0.0f;
+        }
+        float rms = sqrtf((float)(acc / MUSIC_FFT_SIZE));
+        music_fft(re, im, MUSIC_FFT_SIZE);
+
+        float band_mag[MUSIC_BANDS];
+        float band_max = 0.0f;
+        for (int b = 0; b < MUSIC_BANDS; b++) {
+            float sum = 0.0f;
+            int lo = band_edge[b];
+            int hi = band_edge[b + 1];
+            if (hi <= lo) {
+                hi = lo + 1;
+            }
+            for (int k = lo; k < hi; k++) {
+                sum += sqrtf(re[k] * re[k] + im[k] * im[k]);
+            }
+            band_mag[b] = sum / (float)(hi - lo);
+            if (band_mag[b] > band_max) {
+                band_max = band_mag[b];
+            }
+        }
+
+        /* Slow-release AGC keeps the display lively at any volume. */
+        agc_ref *= 0.995f;
+        if (band_max > agc_ref) {
+            agc_ref = band_max;
+        }
+        if (agc_ref < 400.0f) {
+            agc_ref = 400.0f;
+        }
+
+        for (int b = 0; b < MUSIC_BANDS; b++) {
+            float level = powf(band_mag[b] / agc_ref, 0.6f);
+            if (level > 1.0f) {
+                level = 1.0f;
+            }
+            bar_level[b] = level > bar_level[b] ? level : bar_level[b] * 0.78f;
+            float fall = bar_peak[b] - 0.02f;
+            bar_peak[b] = bar_level[b] > fall ? bar_level[b] : fall;
+        }
+
+        if (bsp_display_lock(DISPLAY_LOCK_TIMEOUT_MS) == ESP_OK) {
+            render_music_bars_locked(bar_level, bar_peak);
+
+            if ((frame++ % MUSIC_SLOW_UI_DIVIDER) == 0) {
+                float db = 20.0f * log10f(rms / 32768.0f + 1e-6f);
+                int vu = (int)((db + 60.0f) * (100.0f / 60.0f));
+                vu = clamp_int(vu, 0, 100);
+                if (lv_arc_get_value(s_music_ui.vu_arc) != vu) {
+                    lv_arc_set_value(s_music_ui.vu_arc, vu);
+                }
+
+                float bass = 0.0f;
+                float treb = 0.0f;
+                for (int b = 0; b < 6; b++) {
+                    bass += bar_level[b];
+                }
+                for (int b = MUSIC_BANDS - 6; b < MUSIC_BANDS; b++) {
+                    treb += bar_level[b];
+                }
+                char text[16];
+                snprintf(text, sizeof(text), "%d", (int)(bass * 100.0f / 6.0f));
+                set_label_text_if_changed(s_music_ui.bass_value_label, text);
+                snprintf(text, sizeof(text), "%d", (int)db);
+                set_label_text_if_changed(s_music_ui.vol_value_label, text);
+                snprintf(text, sizeof(text), "%d", (int)(treb * 100.0f / 6.0f));
+                set_label_text_if_changed(s_music_ui.treb_value_label, text);
+            }
+            bsp_display_unlock();
+        }
+    }
+}
+
 static void pedometer_task(void *arg)
 {
     qmi8658_dev_t *dev = (qmi8658_dev_t *)arg;
@@ -4934,6 +5292,9 @@ void app_main(void)
     if (xTaskCreate(codex_usage_task, "codex_usage_task", 4096, NULL, 4, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Codex task create failed");
         render_codex_status("Codex task failed");
+    }
+    if (xTaskCreate(music_audio_task, "music_audio", 4096, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "Music audio task create failed");
     }
     xTaskCreate(screenshot_console_task, "shot_console", SCREENSHOT_CMD_TASK_STACK, NULL, 2,
                 NULL);
