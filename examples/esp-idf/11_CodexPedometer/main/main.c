@@ -549,6 +549,7 @@ static uint32_t s_last_ntp_attempt_ms;
 static httpd_handle_t s_config_server;
 static wifi_credentials_t s_wifi_credentials;
 static volatile int s_ap_client_count;
+static char s_sta_ip[16];
 static wifi_ap_record_t s_wifi_scan_cache[WIFI_SCAN_MAX_AP];
 static uint16_t s_wifi_scan_cache_count;
 static uint32_t s_wifi_scan_cache_ms;
@@ -601,6 +602,7 @@ typedef struct {
     lv_obj_t *standby_checkbox;
     lv_obj_t *standby_slider;
     lv_obj_t *face_buttons[FACE_COUNT];
+    lv_obj_t *ip_label;
 } settings_ui_t;
 
 static settings_ui_t s_settings_ui;
@@ -3253,6 +3255,21 @@ static void settings_update_labels(void)
         snprintf(text, sizeof(text), "STANDBY %d MIN", s_cfg_standby_minutes);
         lv_checkbox_set_text(s_settings_ui.standby_checkbox, text);
     }
+
+    if (s_settings_ui.ip_label != NULL) {
+        char line[48];
+        if (s_sta_ip[0] != '\0') {
+            snprintf(line, sizeof(line), "IP  %s", s_sta_ip);
+        } else if (wifi_configured()) {
+            snprintf(line, sizeof(line), "IP  connecting...");
+        } else {
+            snprintf(line, sizeof(line), "AP  192.168.4.1");
+        }
+        set_label_text_if_changed(s_settings_ui.ip_label, line);
+        lv_obj_set_style_text_color(s_settings_ui.ip_label,
+                                    lv_color_hex(s_sta_ip[0] != '\0' ? 0x30D158 : 0x92A0AD),
+                                    0);
+    }
 }
 
 static void show_settings_panel(bool show)
@@ -3405,7 +3422,12 @@ static void create_settings_panel(lv_obj_t *parent)
     s_settings_ui.panel = panel;
 
     lv_obj_t *title = create_label(panel, "SETTINGS", FONT_TITLE, lv_color_hex(0xF7FBFF));
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 62);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 56);
+
+    /* Where to reach the device, so uploading a wallpaper or opening the
+     * config page does not mean digging through the router. */
+    s_settings_ui.ip_label = create_label(panel, "", FONT_SMALL, lv_color_hex(0x92A0AD));
+    lv_obj_align(s_settings_ui.ip_label, LV_ALIGN_TOP_MID, 0, 88);
 
     s_settings_ui.brightness_label = create_label(panel, "BRIGHTNESS", FONT_SMALL,
                                                   lv_color_hex(0x9AA7B5));
@@ -5868,7 +5890,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                                void *event_data)
 {
     (void)arg;
-    (void)event_data;
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
         s_ap_client_count++;
@@ -5889,6 +5910,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             esp_wifi_connect();
         }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        /* A stale address is worse than none - it sends you to a dead host. */
+        s_sta_ip[0] = '\0';
         if (s_wifi_event_group != NULL) {
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             xEventGroupSetBits(s_wifi_event_group, WEATHER_REFRESH_REQUEST_BIT);
@@ -5908,6 +5931,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        /* Keep the address so the settings panel can show where to reach the
+         * device without hunting through the router or a serial log. */
+        const ip_event_got_ip_t *got = (const ip_event_got_ip_t *)event_data;
+        if (got != NULL) {
+            snprintf(s_sta_ip, sizeof(s_sta_ip), IPSTR, IP2STR(&got->ip_info.ip));
+        }
         s_wifi_retry_num = 0;
         s_ntp_sync_in_progress = false;
         s_last_ntp_attempt_ms = 0;
