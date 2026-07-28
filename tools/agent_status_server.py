@@ -140,7 +140,84 @@ class BridgeServer(ThreadingHTTPServer):
     allow_reuse_address = False
 
 
+STOCK_CACHE_SECONDS = 25
+_stock_lock = threading.Lock()
+_stock_cache: dict[str, tuple[float, str]] = {}
+
+
+def _fetch_chart(code: str) -> str:
+    """Return the watch's chart payload for one symbol.
+
+    Tencent's chart endpoints now redirect to HTTPS, which the watch cannot
+    speak - it has no TLS and not enough internal RAM to add one. So the
+    fetch happens here and the result is flattened into fixed plain-text
+    lines that the firmware can read with strtof and no JSON parser:
+
+        T <p1> <p2> ...        intraday prices, oldest first
+        K <o> <c> <h> <l>      one line per day, oldest first
+    """
+    import urllib.request
+
+    lines: list[str] = []
+
+    def get(url: str) -> str:
+        request = urllib.request.Request(url, headers={"User-Agent": "watch-bridge/1"})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.read().decode("utf-8", "replace")
+
+    try:
+        raw = get(f"https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={code}")
+        points = json.loads(raw)["data"][code]["data"]["data"]
+        prices = [entry.split()[1] for entry in points if len(entry.split()) > 1]
+        # The watch draws 60 columns; send an evenly spaced subset.
+        if len(prices) > 60:
+            step = (len(prices) - 1) / 59
+            prices = [prices[round(i * step)] for i in range(60)]
+        if prices:
+            lines.append("T " + " ".join(prices))
+    except Exception as exc:  # noqa: BLE001 - a missing chart must not 500
+        print(f"  stock {code}: intraday unavailable ({exc})", flush=True)
+
+    try:
+        raw = get(
+            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+            f"?param={code},day,,,20,qfq"
+        )
+        data = json.loads(raw)["data"][code]
+        candles = data.get("qfqday") or data.get("day") or []
+        for candle in candles[-20:]:
+            # date, open, close, high, low, volume
+            lines.append(f"K {candle[1]} {candle[2]} {candle[3]} {candle[4]}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  stock {code}: daily bars unavailable ({exc})", flush=True)
+
+    return "\n".join(lines) + "\n"
+
+
+def stock_chart(code: str) -> str:
+    """Cached wrapper: several watches (or a fast poll) share one upstream hit."""
+    now = time.monotonic()
+    with _stock_lock:
+        hit = _stock_cache.get(code)
+        if hit and now - hit[0] < STOCK_CACHE_SECONDS:
+            return hit[1]
+
+    payload = _fetch_chart(code)
+    with _stock_lock:
+        _stock_cache[code] = (now, payload)
+    return payload
+
+
 class Handler(BaseHTTPRequestHandler):
+    def _send_text(self, text: str, code: int = 200) -> None:
+        data = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _send(self, payload: dict[str, Any], code: int = 200) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -167,6 +244,14 @@ class Handler(BaseHTTPRequestHandler):
                 fields.get("note", ""),
             )
             self._send({"ok": True})
+            return
+        # /stock?code=sz002241 - chart data the watch cannot fetch itself
+        if path == "/stock":
+            code = _parse_query(self.path).get("code", "").strip()
+            if not code or not code.replace(".", "").isalnum():
+                self._send_text("", 400)
+                return
+            self._send_text(stock_chart(code))
             return
         self.send_error(404, "Not found")
 

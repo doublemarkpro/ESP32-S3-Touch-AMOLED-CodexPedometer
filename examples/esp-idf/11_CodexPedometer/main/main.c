@@ -709,6 +709,8 @@ static esp_err_t request_ntp_sync(void);
 static void show_settings_panel(bool show);
 static void agent_refresh_lamp(void);
 static void request_stock_refresh(void);
+static void stock_parse_config(const char *text);
+static void stock_format_config(char *out, size_t out_size);
 static void render_stock_locked(const char *status_text);
 static bool text_glyphs_available(const lv_font_t *font, const char *text);
 static const char *weather_condition_en(int code);
@@ -922,6 +924,61 @@ static void request_codex_refresh(void)
     }
 }
 
+/* Watchlist config is one string: "sz002241:歌尔股份,hk09903:天数智芯".
+ * The name is carried alongside because the quote feed only speaks GBK and
+ * this build has no converter. */
+static void stock_parse_config(const char *text)
+{
+    int count = 0;
+    const char *cursor = text;
+    while (cursor != NULL && *cursor != '\0' && count < STOCK_MAX_SYMBOLS) {
+        const char *comma = strchr(cursor, ',');
+        size_t entry_len = comma != NULL ? (size_t)(comma - cursor) : strlen(cursor);
+        const char *colon = memchr(cursor, ':', entry_len);
+
+        size_t code_len = colon != NULL ? (size_t)(colon - cursor) : entry_len;
+        if (code_len > 0 && code_len < STOCK_CODE_LEN) {
+            memcpy(s_stock_codes[count], cursor, code_len);
+            s_stock_codes[count][code_len] = '\0';
+
+            if (colon != NULL) {
+                size_t name_len = entry_len - code_len - 1;
+                if (name_len >= STOCK_NAME_LEN) {
+                    name_len = STOCK_NAME_LEN - 1;
+                }
+                memcpy(s_stock_names[count], colon + 1, name_len);
+                s_stock_names[count][name_len] = '\0';
+            } else {
+                copy_string(s_stock_names[count], STOCK_NAME_LEN, s_stock_codes[count]);
+            }
+            count++;
+        }
+
+        cursor = comma != NULL ? comma + 1 : NULL;
+    }
+
+    if (count > 0) {
+        s_stock_count = count;
+        if (s_stock_index >= count) {
+            s_stock_index = 0;
+        }
+    }
+}
+
+static void stock_format_config(char *out, size_t out_size)
+{
+    out[0] = '\0';
+    size_t used = 0;
+    for (int i = 0; i < s_stock_count; i++) {
+        int written = snprintf(out + used, out_size - used, "%s%s:%s", i > 0 ? "," : "",
+                               s_stock_codes[i], s_stock_names[i]);
+        if (written <= 0 || (size_t)written >= out_size - used) {
+            break;
+        }
+        used += (size_t)written;
+    }
+}
+
 static void load_ui_settings(void)
 {
     nvs_handle_t nvs;
@@ -962,6 +1019,12 @@ static void load_ui_settings(void)
     if (nvs_get_u8(nvs, "face", &value) == ESP_OK && value < FACE_COUNT) {
         s_watchface = value;
     }
+    /* Stored as "code:name,code:name,..." so one key covers the whole list. */
+    char stocks[STOCK_MAX_SYMBOLS * (STOCK_CODE_LEN + STOCK_NAME_LEN) + 8];
+    size_t stocks_len = sizeof(stocks);
+    if (nvs_get_str(nvs, STOCK_NVS_CODES_KEY, stocks, &stocks_len) == ESP_OK) {
+        stock_parse_config(stocks);
+    }
     nvs_close(nvs);
 }
 
@@ -986,6 +1049,11 @@ static void save_ui_settings(void)
         (void)nvs_set_u32(nvs, key, s_theme_color[i]);
     }
     (void)nvs_set_u8(nvs, "face", s_watchface);
+    {
+        char stocks[STOCK_MAX_SYMBOLS * (STOCK_CODE_LEN + STOCK_NAME_LEN) + 8];
+        stock_format_config(stocks, sizeof(stocks));
+        (void)nvs_set_str(nvs, STOCK_NVS_CODES_KEY, stocks);
+    }
     (void)nvs_commit(nvs);
     nvs_close(nvs);
 }
@@ -4624,6 +4692,11 @@ static void render_stock_locked(const char *status_text)
 
     if (status_text != NULL) {
         set_label_text_if_changed(s_stock_ui.status_label, status_text);
+    } else if (s_stock_kline_view && d->k_count == 0) {
+        /* Charts come from the bridge; say so rather than show a blank. */
+        set_label_text_if_changed(s_stock_ui.status_label, "需要电脑端桥接");
+    } else if (!s_stock_kline_view && d->trend_count == 0) {
+        set_label_text_if_changed(s_stock_ui.status_label, "需要电脑端桥接");
     } else if (d->updated[0] != '\0') {
         snprintf(text, sizeof(text), "%.5s  ·  轻点看日K", d->updated);
         set_label_text_if_changed(s_stock_ui.status_label, text);
@@ -5076,135 +5149,89 @@ static esp_err_t stock_fetch_quote(const char *code, stock_data_t *out)
     return out->valid ? ESP_OK : ESP_FAIL;
 }
 
-/* Intraday: {"data":{"<code>":{"data":{"data":["0930 22.57 5413 ...", ...]
- * A full session runs ~9 KB, so this uses the large PSRAM response buffer
- * rather than the 4 KB one shared by the other feeds. */
-static esp_err_t stock_fetch_trend(const char *code, stock_data_t *out)
+/*
+ * Charts come from the PC bridge rather than the exchange feeds: those now
+ * redirect to HTTPS, and this client has no TLS (mbedTLS needs ~35 KB of
+ * internal RAM, which this build does not have). The bridge flattens both
+ * series into plain lines so no JSON parser is needed here:
+ *     T <p1> <p2> ...      intraday prices, oldest first
+ *     K <open> <close> <high> <low>   one per day, oldest first
+ */
+static esp_err_t stock_fetch_charts(const char *code, stock_data_t *out)
 {
-    stock_response_t *response = stock_response_alloc();
-    if (response == NULL) {
-        return ESP_ERR_NO_MEM;
+    if (!config_value_is_set(AGENT_STATUS_URL, "http://YOUR_PC_LAN_IP:8766/status")) {
+        return ESP_ERR_INVALID_STATE;
     }
 
-    char url[128];
-    snprintf(url, sizeof(url),
-             "http://web.ifzq.gtimg.cn/appstock/app/minute/query?code=%s", code);
-    esp_err_t ret = http_get_url_big(url, STOCK_HTTP_TIMEOUT_MS, response);
-    if (ret != ESP_OK) {
-        stock_response_free(response);
-        return ret;
+    /* Reuse the agent bridge's host and port, swapping the path. */
+    char base[96];
+    copy_string(base, sizeof(base), AGENT_STATUS_URL);
+    char *tail = strstr(base, "/status");
+    if (tail == NULL) {
+        return ESP_ERR_INVALID_STATE;
     }
-    /* Collect every "HHMM price ..." entry, then keep an evenly spaced
-     * subset - a full session is ~240 points for 60 pixels of chart. */
-    static float samples[256];
-    int total = 0;
-    const char *cursor = response->body;
-    while (total < (int)(sizeof(samples) / sizeof(samples[0]))) {
-        cursor = strchr(cursor, '"');
-        if (cursor == NULL) {
-            break;
-        }
-        cursor++;
-        /* Entries look like 0930 22.57 5413 12217141.00 */
-        if (!isdigit((unsigned char)cursor[0]) || cursor[4] != ' ') {
-            continue;
-        }
-        float price = strtof(cursor + 5, NULL);
-        if (price > 0.0f) {
-            samples[total++] = price;
-        }
-    }
+    *tail = '\0';
 
-    if (total <= 0) {
-        stock_response_free(response);
-        return ESP_FAIL;
-    }
-
-    int wanted = total < STOCK_TREND_POINTS ? total : STOCK_TREND_POINTS;
-    for (int i = 0; i < wanted; i++) {
-        int src = wanted == 1 ? 0 : (i * (total - 1)) / (wanted - 1);
-        out->trend[i] = samples[src];
-    }
-    out->trend_count = wanted;
-
-    stock_response_free(response);
-    return ESP_OK;
-}
-
-/* Daily candles: {"data":{"<code>":{"qfqday":[["2026-07-28","22.57","22.93",
- * "23.41","22.55","746405"], ...]}}} - date, open, close, high, low, volume. */
-static esp_err_t stock_fetch_kline(const char *code, stock_data_t *out)
-{
     stock_response_t *response = stock_response_alloc();
     if (response == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
     char url[160];
-    snprintf(url, sizeof(url),
-             "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s,day,,,%d,qfq",
-             code, STOCK_KLINE_DAYS);
+    snprintf(url, sizeof(url), "%s/stock?code=%s", base, code);
     esp_err_t ret = http_get_url_big(url, STOCK_HTTP_TIMEOUT_MS, response);
     if (ret != ESP_OK) {
         stock_response_free(response);
         return ret;
     }
 
-    const char *cursor = strstr(response->body, "qfqday");
-    if (cursor == NULL) {
-        cursor = strstr(response->body, "day");
-    }
-    if (cursor == NULL) {
-        stock_response_free(response);
-        return ESP_FAIL;
-    }
-
+    out->trend_count = 0;
     out->k_count = 0;
-    while (out->k_count < STOCK_KLINE_DAYS) {
-        /* Each candle starts with its quoted date. */
-        cursor = strstr(cursor, "[\"");
-        if (cursor == NULL) {
-            break;
-        }
-        cursor += 2;
-        const char *date_end = strchr(cursor, '"');
-        if (date_end == NULL || date_end - cursor < 8) {
-            continue;
+
+    char *line = response->body;
+    while (line != NULL && *line != '\0') {
+        char *next = strchr(line, '\n');
+        if (next != NULL) {
+            *next = '\0';
         }
 
-        /* Then four quoted numbers: open, close, high, low. */
-        float values[4];
-        const char *scan = date_end + 1;
-        bool ok = true;
-        for (int i = 0; i < 4; i++) {
-            scan = strchr(scan, '"');
-            if (scan == NULL) {
-                ok = false;
-                break;
+        if (line[0] == 'T' && line[1] == ' ') {
+            const char *cursor = line + 2;
+            while (out->trend_count < STOCK_TREND_POINTS) {
+                char *end = NULL;
+                float value = strtof(cursor, &end);
+                if (end == cursor) {
+                    break;
+                }
+                out->trend[out->trend_count++] = value;
+                cursor = end;
             }
-            values[i] = strtof(scan + 1, NULL);
-            scan = strchr(scan + 1, '"');
-            if (scan == NULL) {
-                ok = false;
-                break;
+        } else if (line[0] == 'K' && line[1] == ' ' && out->k_count < STOCK_KLINE_DAYS) {
+            float v[4];
+            const char *cursor = line + 2;
+            int parsed = 0;
+            for (; parsed < 4; parsed++) {
+                char *end = NULL;
+                v[parsed] = strtof(cursor, &end);
+                if (end == cursor) {
+                    break;
+                }
+                cursor = end;
             }
-            scan++;
-        }
-        if (!ok) {
-            break;
+            if (parsed == 4) {
+                int i = out->k_count++;
+                out->k_open[i] = v[0];
+                out->k_close[i] = v[1];
+                out->k_high[i] = v[2];
+                out->k_low[i] = v[3];
+            }
         }
 
-        int i = out->k_count;
-        out->k_open[i] = values[0];
-        out->k_close[i] = values[1];
-        out->k_high[i] = values[2];
-        out->k_low[i] = values[3];
-        out->k_count++;
-        cursor = scan;
+        line = next != NULL ? next + 1 : NULL;
     }
 
     stock_response_free(response);
-    return out->k_count > 0 ? ESP_OK : ESP_FAIL;
+    return (out->trend_count > 0 || out->k_count > 0) ? ESP_OK : ESP_FAIL;
 }
 
 static esp_err_t fetch_agent_status(agent_status_t *status)
@@ -6258,6 +6285,25 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
     httpd_resp_sendstr_chunk(req, goal_input);
 
     {
+        char stocks[STOCK_MAX_SYMBOLS * (STOCK_CODE_LEN + STOCK_NAME_LEN) + 8];
+        char escaped[sizeof(stocks)];
+        /* Only the value is variable; the prose is sent as its own chunk so
+         * the buffer does not have to cover multi-byte help text. */
+        char field[sizeof(stocks) + 120];
+        stock_format_config(stocks, sizeof(stocks));
+        html_escape_copy(escaped, sizeof(escaped), stocks);
+        httpd_resp_sendstr_chunk(req, "<label>股票代码</label>");
+        snprintf(field, sizeof(field),
+                 "<input name='stocks' maxlength='%d' value='%s' "
+                 "placeholder='sz002241:name,hk09903:name'>",
+                 (int)sizeof(stocks) - 1, escaped);
+        httpd_resp_sendstr_chunk(req, field);
+        httpd_resp_sendstr_chunk(req,
+                                 "<p class='hint'>格式 代码:名称，逗号分隔，最多 6 支。"
+                                 "沪市 sh、深市 sz、港股 hk 开头。名称仅用于显示。</p>");
+    }
+
+    {
         static const char *const face_names[FACE_COUNT] = {"信息图文", "Pixel 指针",
                                                            "Pixel 磁贴"};
         httpd_resp_sendstr_chunk(req, "<label>表盘</label><select name='face'>");
@@ -6376,6 +6422,15 @@ static esp_err_t config_page_post_handler(httpd_req_t *req)
             ret = save_pedometer_goal((uint32_t)parsed_goal);
         } else {
             ret = ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    {
+        char stocks[STOCK_MAX_SYMBOLS * (STOCK_CODE_LEN + STOCK_NAME_LEN) + 8];
+        if (get_form_value(body, "stocks", stocks, sizeof(stocks)) && stocks[0] != '\0') {
+            stock_parse_config(stocks);
+            save_ui_settings();
+            request_stock_refresh();
         }
     }
 
@@ -6818,11 +6873,10 @@ static void stock_task(void *arg)
         stock_data_t fetched = {0};
         esp_err_t ret = stock_fetch_quote(code, &fetched);
         if (ret == ESP_OK) {
-            /* Charts are optional: a quote alone is still worth showing. */
-            if (stock_fetch_trend(code, &fetched) != ESP_OK) {
+            /* Charts need the PC bridge; a quote alone is still worth
+             * showing when it is not running. */
+            if (stock_fetch_charts(code, &fetched) != ESP_OK) {
                 fetched.trend_count = 0;
-            }
-            if (stock_fetch_kline(code, &fetched) != ESP_OK) {
                 fetched.k_count = 0;
             }
             s_stock_data = fetched;
