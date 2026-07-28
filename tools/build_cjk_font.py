@@ -93,6 +93,11 @@ def main() -> int:
         default=None,
         help="FontAwesome file for LV_SYMBOL_*; skipped when absent",
     )
+    parser.add_argument(
+        "--chars",
+        default=None,
+        help="explicit subset (a string of characters); skips the GB2312 sweep",
+    )
     parser.add_argument("--out", default=None, help="output .c path")
     args = parser.parse_args()
 
@@ -108,12 +113,13 @@ def main() -> int:
         repo / "examples/esp-idf/11_CodexPedometer/main/fonts/app_font_cjk_16.c"
     )
 
-    ranges = compress_ranges(
-        list(range(0x20, 0x80)) + EXTRA_CODEPOINTS + gb2312_hanzi()
-    )
+    # A subset cut is how the large sizes stay affordable: the 32 px face only
+    # needs the handful of words the UI prints at that size.
+    hanzi = [ord(c) for c in args.chars] if args.chars else gb2312_hanzi()
+    ranges = compress_ranges(list(range(0x20, 0x80)) + EXTRA_CODEPOINTS + hanzi)
 
     print(f"Building {args.size}px font -> {out.name}")
-    print(f"  glyphs: ASCII + {len(EXTRA_CODEPOINTS)} symbols + GB2312 level 1+2")
+    print(f"  glyphs: ASCII + {len(EXTRA_CODEPOINTS)} symbols + {len(set(hanzi))} hanzi")
 
     # 3755 ranges blow past the Windows command-line limit, so drive
     # lv_font_conv through Node instead of argv.

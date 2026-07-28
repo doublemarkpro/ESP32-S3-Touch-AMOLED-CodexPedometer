@@ -267,8 +267,12 @@
  * component so it survives a managed_components refresh. */
 LV_FONT_DECLARE(app_font_cjk_16)
 LV_FONT_DECLARE(app_font_cjk_22)
+LV_FONT_DECLARE(app_font_cjk_ui_32)
 #define FONT_CJK (&app_font_cjk_16)
 #define FONT_CJK_LARGE (&app_font_cjk_22)
+/* Headline size. A subset cut: only the words the UI itself prints, because a
+ * full GB2312 sweep at 32 px would cost several megabytes. */
+#define FONT_CJK_XL (&app_font_cjk_ui_32)
 
 typedef enum {
     APP_PAGE_TIME,
@@ -834,21 +838,22 @@ typedef struct {
     const char *match_b;
     const char *match_c;
     const char *display;
+    const char *display_zh;
     const char *city_code;
     double latitude;
     double longitude;
 } weather_city_preset_t;
 
 static const weather_city_preset_t s_weather_city_presets[] = {
-    {"青岛", "青岛市", "Qingdao", "Qingdao", "370200", 36.06488, 120.38042},
-    {"青口", "青口市", NULL, "Qingdao", "370200", 36.06488, 120.38042},
-    {"上海", "上海市", "Shanghai", "Shanghai", "310000", 31.23040, 121.47370},
-    {"北京", "北京市", "Beijing", "Beijing", "110000", 39.90420, 116.40740},
-    {"深圳", "深圳市", "Shenzhen", "Shenzhen", "440300", 22.54310, 114.05790},
-    {"广州", "广州市", "Guangzhou", "Guangzhou", "440100", 23.12910, 113.26440},
-    {"杭州", "杭州市", "Hangzhou", "Hangzhou", "330100", 30.27410, 120.15510},
-    {"南京", "南京市", "Nanjing", "Nanjing", "320100", 32.06030, 118.79690},
-    {"济南", "济南市", "Jinan", "Jinan", "370100", 36.65120, 117.12010},
+    {"青岛", "青岛市", "Qingdao", "Qingdao", "青岛", "370200", 36.06488, 120.38042},
+    {"青口", "青口市", NULL, "Qingdao", "青岛", "370200", 36.06488, 120.38042},
+    {"上海", "上海市", "Shanghai", "Shanghai", "上海", "310000", 31.23040, 121.47370},
+    {"北京", "北京市", "Beijing", "Beijing", "北京", "110000", 39.90420, 116.40740},
+    {"深圳", "深圳市", "Shenzhen", "Shenzhen", "深圳", "440300", 22.54310, 114.05790},
+    {"广州", "广州市", "Guangzhou", "Guangzhou", "广州", "440100", 23.12910, 113.26440},
+    {"杭州", "杭州市", "Hangzhou", "Hangzhou", "杭州", "330100", 30.27410, 120.15510},
+    {"南京", "南京市", "Nanjing", "Nanjing", "南京", "320100", 32.06030, 118.79690},
+    {"济南", "济南市", "Jinan", "Jinan", "济南", "370100", 36.65120, 117.12010},
 };
 
 static bool weather_city_matches(const char *city, const weather_city_preset_t *preset)
@@ -859,6 +864,12 @@ static bool weather_city_matches(const char *city, const weather_city_preset_t *
             (preset->match_c != NULL && strcmp(city, preset->match_c) == 0));
 }
 
+static const char *preset_display_name(const weather_city_preset_t *preset)
+{
+    return s_lang_chinese && preset->display_zh != NULL ? preset->display_zh
+                                                        : preset->display;
+}
+
 static bool lookup_weather_city_preset(const char *city, double *latitude, double *longitude,
                                        char *display, size_t display_size)
 {
@@ -867,7 +878,7 @@ static bool lookup_weather_city_preset(const char *city, double *latitude, doubl
         if (weather_city_matches(city, &s_weather_city_presets[i])) {
             *latitude = s_weather_city_presets[i].latitude;
             *longitude = s_weather_city_presets[i].longitude;
-            copy_string(display, display_size, s_weather_city_presets[i].display);
+            copy_string(display, display_size, preset_display_name(&s_weather_city_presets[i]));
             return true;
         }
     }
@@ -894,42 +905,37 @@ static bool lookup_weather_city_code(const char *city, char *city_code, size_t c
          i++) {
         if (weather_city_matches(city, &s_weather_city_presets[i])) {
             copy_string(city_code, city_code_size, s_weather_city_presets[i].city_code);
-            copy_string(display, display_size, s_weather_city_presets[i].display);
+            copy_string(display, display_size, preset_display_name(&s_weather_city_presets[i]));
             return true;
         }
     }
 
     if (looks_like_weather_city_code(city)) {
         copy_string(city_code, city_code_size, city);
-        copy_string(display, display_size, "China City");
+        copy_string(display, display_size, tr("未知城市", "China City"));
         return true;
     }
 
     copy_string(city_code, city_code_size, s_weather_city_presets[0].city_code);
-    copy_string(display, display_size, s_weather_city_presets[0].display);
+    copy_string(display, display_size, preset_display_name(&s_weather_city_presets[0]));
     return true;
 }
 
 static void build_weather_display_city(const char *city, char *out, size_t out_size)
 {
-    /* In Chinese mode the configured name is already what we want to show;
-     * the font covers it now, so there is no reason to romanise it. */
-    if (s_lang_chinese && city != NULL && city[0] != '\0') {
-        copy_string(out, out_size, city);
-        return;
-    }
-
+    /* The preset table knows both spellings, so a city configured as "Qingdao"
+     * shows as 青岛 in Chinese mode and 青岛市 shows as Qingdao in English. */
     double unused_latitude = 0.0;
     double unused_longitude = 0.0;
     if (lookup_weather_city_preset(city, &unused_latitude, &unused_longitude, out, out_size)) {
         return;
     }
-    if (has_non_ascii(city)) {
-        copy_string(out, out_size, "China City");
-    } else {
-        copy_string(out, out_size,
-                    city != NULL && city[0] != '\0' ? city : tr("天气", "Weather"));
+    /* Not a preset: show whatever was typed - the CJK face can draw it now. */
+    if (city != NULL && city[0] != '\0') {
+        copy_string(out, out_size, city);
+        return;
     }
+    copy_string(out, out_size, tr("天气", "Weather"));
 }
 
 static void request_weather_refresh(void)
@@ -1312,6 +1318,9 @@ static const lv_font_t *cjk_font_for(const lv_font_t *latin)
     if (latin == NULL) {
         return FONT_CJK;
     }
+    if (latin->line_height >= 34) {
+        return FONT_CJK_XL;
+    }
     return latin->line_height >= 24 ? FONT_CJK_LARGE : FONT_CJK;
 }
 
@@ -1330,9 +1339,14 @@ static lv_obj_t *create_label(lv_obj_t *parent, const char *text, const lv_font_
      * when the CJK cut can actually draw the string - LV_SYMBOL icons live in
      * Montserrat and would turn into boxes otherwise. */
     if (!text_glyphs_available(font, text)) {
-        const lv_font_t *cjk = cjk_font_for(font);
-        if (text_glyphs_available(cjk, text)) {
-            font = cjk;
+        /* Largest first, then down: the 32 px cut is a subset, so a string it
+         * cannot draw still gets a chance at the full faces. */
+        const lv_font_t *candidates[] = {cjk_font_for(font), FONT_CJK_LARGE, FONT_CJK};
+        for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+            if (text_glyphs_available(candidates[i], text)) {
+                font = candidates[i];
+                break;
+            }
         }
     }
     lv_obj_t *label = lv_label_create(parent);
@@ -2146,6 +2160,9 @@ static void corner_apply_widget_locked(int corner)
         caption_text = "Codex";
         break;
     case CW_AGENT:
+        /* The state word is Chinese in Chinese mode, which Montserrat cannot
+         * draw - the ring showed boxes. */
+        value_font = lang_font(FONT_SMALL);
         caption_text = "AI";
         break;
     default:
@@ -3030,7 +3047,7 @@ static void create_codex_page(lv_obj_t *parent)
     lv_label_set_long_mode(s_codex_ui.percent_label, LV_LABEL_LONG_CLIP);
     lv_obj_align(s_codex_ui.percent_label, LV_ALIGN_CENTER, 0, UI_VALUE_CENTER_Y);
 
-    s_codex_ui.label_label = create_label(s_codex_ui.page, "", FONT_SMALL,
+    s_codex_ui.label_label = create_label(s_codex_ui.page, "", lang_font(FONT_SMALL),
                                            lv_color_hex(0x92A0AD));
     lv_obj_set_width(s_codex_ui.label_label, 300);
     lv_obj_set_style_text_align(s_codex_ui.label_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -3251,7 +3268,7 @@ static void create_agent_page(lv_obj_t *parent)
     lv_obj_set_width(s_agent_ui.state_label, 320);
     lv_obj_set_style_text_align(s_agent_ui.state_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_agent_ui.state_label, LV_LABEL_LONG_CLIP);
-    lv_obj_align(s_agent_ui.state_label, LV_ALIGN_CENTER, 0, UI_VALUE_CENTER_Y);
+    lv_obj_align(s_agent_ui.state_label, LV_ALIGN_CENTER, 0, UI_VALUE_CENTER_Y - 14);
 
     /* Time of the last state change, right under the state word. */
     s_agent_ui.updated_label = create_label(s_agent_ui.page, "", FONT_MEDIUM,
@@ -3283,6 +3300,12 @@ static void create_agent_page(lv_obj_t *parent)
     s_agent_ui.elapsed_value_label =
         create_metric_column(s_agent_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT,
                              tr("时长", "FOR"), "--");
+
+    /* These three columns carry words and units, not plain numbers, so they
+     * need a face that can draw Chinese. */
+    lv_obj_set_style_text_font(s_agent_ui.codex_value_label, lang_font(FONT_TITLE), 0);
+    lv_obj_set_style_text_font(s_agent_ui.claude_value_label, lang_font(FONT_TITLE), 0);
+    lv_obj_set_style_text_font(s_agent_ui.elapsed_value_label, lang_font(FONT_TITLE), 0);
 
 }
 
@@ -3492,6 +3515,34 @@ static void create_stock_page(lv_obj_t *parent)
     }
 }
 
+/* Two beamed eighth notes, drawn from primitives: a bitmap font symbol would
+ * be stuck at one size and LVGL's own symbol set has no note. */
+static void create_music_note_icon(lv_obj_t *parent, int32_t center_y)
+{
+    uint32_t accent = s_theme_color[THEME_MUSIC];
+
+    static const struct {
+        int32_t x, y, w, h, radius;
+    } parts[] = {
+        {-20, 14, 22, 16, 8},   /* left note head  */
+        {14, 8, 22, 16, 8},     /* right note head */
+        {-11, -3, 4, 20, 2},    /* left stem       */
+        {23, -9, 4, 20, 2},     /* right stem      */
+        {6, -14, 30, 5, 2},     /* beam            */
+    };
+
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        lv_obj_t *part = lv_obj_create(parent);
+        lv_obj_remove_style_all(part);
+        lv_obj_set_size(part, parts[i].w, parts[i].h);
+        lv_obj_align(part, LV_ALIGN_CENTER, parts[i].x, center_y + parts[i].y);
+        lv_obj_set_style_radius(part, parts[i].radius, 0);
+        lv_obj_set_style_bg_color(part, lv_color_hex(accent), 0);
+        lv_obj_set_style_bg_opa(part, LV_OPA_COVER, 0);
+        lv_obj_clear_flag(part, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    }
+}
+
 static void create_music_page(lv_obj_t *parent)
 {
     s_music_ui.page = create_page(parent);
@@ -3511,6 +3562,8 @@ static void create_music_page(lv_obj_t *parent)
     lv_obj_set_style_arc_color(s_music_ui.vu_arc, lv_color_hex(0x17212B), LV_PART_MAIN);
     lv_obj_set_style_arc_color(s_music_ui.vu_arc,
                                lv_color_hex(s_theme_color[THEME_MUSIC]), LV_PART_INDICATOR);
+
+    create_music_note_icon(s_music_ui.page, UI_MAIN_ICON_CENTER_Y - 8);
 
     /* Caption sits high so the tallest bars never crowd it. */
     lv_obj_t *caption = create_label(s_music_ui.page, tr("音乐", "MUSIC"), FONT_TITLE,
@@ -5007,12 +5060,15 @@ static void render_codex_usage(const codex_usage_t *usage, const char *status_te
     uint32_t percent = limit > 0 ? (uint32_t)((used * 100ULL) / limit) : 0;
     percent = clamp_u32(percent, 100U);
 
+    /* The quota feed reports percentages, so the columns read as percentages
+     * too; a bare "2" next to "100" told you nothing. */
     char used_text[16];
     char limit_text[16];
     char left_text[16];
-    format_compact_u64(used, used_text, sizeof(used_text));
-    format_compact_u64(limit, limit_text, sizeof(limit_text));
-    format_compact_u64(left, left_text, sizeof(left_text));
+    (void)left;
+    snprintf(used_text, sizeof(used_text), "%lu%%", (unsigned long)percent);
+    snprintf(limit_text, sizeof(limit_text), "100%%");
+    snprintf(left_text, sizeof(left_text), "%lu%%", (unsigned long)(100U - percent));
 
     if (bsp_display_lock(DISPLAY_LOCK_TIMEOUT_MS) != ESP_OK) {
         return;
@@ -5024,7 +5080,9 @@ static void render_codex_usage(const codex_usage_t *usage, const char *status_te
 
     char percent_text[16];
     char reset_text[48];
-    snprintf(percent_text, sizeof(percent_text), "%lu%%", (unsigned long)percent);
+    /* The headline is what is left, not what is spent - that is the number you
+     * actually decide on. */
+    snprintf(percent_text, sizeof(percent_text), "%lu%%", (unsigned long)(100U - percent));
     format_codex_reset_text(usage->updated, reset_text, sizeof(reset_text));
 
     bool online = strcmp(status_text, tr("在线", "Online")) == 0;
