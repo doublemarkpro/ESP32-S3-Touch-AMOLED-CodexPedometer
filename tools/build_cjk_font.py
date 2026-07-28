@@ -99,10 +99,10 @@ def main() -> int:
         return 1
 
     repo = Path(__file__).resolve().parent.parent
+    # Kept in main/fonts/ - a managed_components path would be wiped by any
+    # component refresh and is gitignored, so the font would silently revert.
     out = Path(args.out) if args.out else (
-        repo
-        / "examples/esp-idf/11_CodexPedometer/managed_components/lvgl__lvgl"
-        / "src/font/lv_font_source_han_sans_sc_16_cjk.c"
+        repo / "examples/esp-idf/11_CodexPedometer/main/fonts/app_font_cjk_16.c"
     )
 
     ranges = compress_ranges(
@@ -141,8 +141,18 @@ def main() -> int:
         print("lv_font_conv failed", file=sys.stderr)
         return result.returncode
 
+    # lv_font_conv names symbols after the output file; rewrite them to the
+    # project's own names and fix the include path for an in-project build.
+    text = out.read_text(encoding="utf-8")
+    stem = out.stem
+    text = text.replace(stem.upper(), "APP_FONT_CJK_16")
+    text = text.replace(stem, "app_font_cjk_16")
+    text = text.replace('#include "../../lvgl.h"', '#include "lvgl.h"')
+    out.write_text(text, encoding="utf-8")
+
     size_kb = out.stat().st_size / 1024
     print(f"Wrote {out} ({size_kb:.0f} KB of C source)")
+    print("Symbol: app_font_cjk_16  (declared with LV_FONT_DECLARE in main.c)")
     return 0
 
 
