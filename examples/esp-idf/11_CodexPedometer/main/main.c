@@ -422,7 +422,8 @@ typedef struct {
     lv_obj_t *label_label;
     lv_obj_t *status_label;
     lv_obj_t *used_value_label;
-    lv_obj_t *limit_value_label;
+    lv_obj_t *state_value_label;
+    lv_obj_t *target_label;
     lv_obj_t *left_value_label;
     lv_obj_t *updated_label;
 } codex_ui_t;
@@ -3078,11 +3079,23 @@ static void create_codex_page(lv_obj_t *parent)
     s_codex_ui.used_value_label =
         create_metric_column(s_codex_ui.page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED,
                              tr("已用", "USED"), "0");
-    s_codex_ui.limit_value_label =
-        create_metric_column(s_codex_ui.page, 0, false, METRIC_ICON_LIMIT, tr("上限", "LIMIT"), "500K");
+    /* The quota ceiling is always 100%, which told you nothing; the slot is
+     * worth more as Codex's own working state. */
+    s_codex_ui.state_value_label =
+        create_metric_column(s_codex_ui.page, 0, false, METRIC_ICON_LIMIT,
+                             tr("状态", "STATE"), "--");
+    lv_obj_set_style_text_font(s_codex_ui.state_value_label, lang_font(FONT_TITLE), 0);
     s_codex_ui.left_value_label =
         create_metric_column(s_codex_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LEFT,
                              tr("剩余", "LEFT"), "500K");
+
+    /* What Codex is working on, between the headline and the status line. */
+    s_codex_ui.target_label = create_label(s_codex_ui.page, "", lang_font(FONT_SMALL),
+                                           lv_color_hex(0x8DA0B4));
+    lv_obj_set_width(s_codex_ui.target_label, 320);
+    lv_obj_set_style_text_align(s_codex_ui.target_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_codex_ui.target_label, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_codex_ui.target_label, LV_ALIGN_CENTER, 0, 32);
 
     s_codex_ui.updated_label = create_label(s_codex_ui.page, "", FONT_SMALL,
                                              lv_color_hex(0x63717F));
@@ -4126,7 +4139,7 @@ static void dump_layout_report(void)
     print_area_report("OBJ", "codex_label", s_codex_ui.label_label, false);
     print_area_report("OBJ", "codex_status", s_codex_ui.status_label, false);
     print_area_report("OBJ", "used_value", s_codex_ui.used_value_label, true);
-    print_area_report("OBJ", "limit_value", s_codex_ui.limit_value_label, true);
+    print_area_report("OBJ", "state_value", s_codex_ui.state_value_label, true);
     print_area_report("OBJ", "left_value", s_codex_ui.left_value_label, true);
     print_area_report("OBJ", "page_dot_time", s_dot_time, false);
     print_area_report("OBJ", "page_dot_weather", s_dot_weather, false);
@@ -5062,11 +5075,10 @@ static void render_codex_usage(const codex_usage_t *usage, const char *status_te
     /* The quota feed reports percentages, so the columns read as percentages
      * too; a bare "2" next to "100" told you nothing. */
     char used_text[16];
-    char limit_text[16];
     char left_text[16];
     (void)left;
+    (void)limit;
     snprintf(used_text, sizeof(used_text), "%lu%%", (unsigned long)percent);
-    snprintf(limit_text, sizeof(limit_text), "100%%");
     snprintf(left_text, sizeof(left_text), "%lu%%", (unsigned long)(100U - percent));
 
     if (bsp_display_lock(DISPLAY_LOCK_TIMEOUT_MS) != ESP_OK) {
@@ -5092,7 +5104,6 @@ static void render_codex_usage(const codex_usage_t *usage, const char *status_te
     lv_obj_set_style_text_color(s_codex_ui.status_label,
                                 lv_color_hex(online ? 0x9DFF35 : 0x92A0AD), 0);
     set_label_text_if_changed(s_codex_ui.used_value_label, used_text);
-    set_label_text_if_changed(s_codex_ui.limit_value_label, limit_text);
     set_label_text_if_changed(s_codex_ui.left_value_label, left_text);
     set_label_text_if_changed(s_codex_ui.updated_label, "");
     update_status_bar_locked();
@@ -5114,6 +5125,36 @@ static void format_elapsed_short(uint32_t seconds, char *buffer, size_t buffer_s
     } else {
         snprintf(buffer, buffer_size, tr("%lu秒", "%lus"), (unsigned long)seconds);
     }
+}
+
+/* The Codex page doubles as Codex's status page: the icon takes the state
+ * colour, one column carries the state word, and the line under the headline
+ * says what it is working on. Runs with the display already locked. */
+static void update_codex_state_locked(const agent_status_t *data)
+{
+    if (s_codex_ui.state_value_label == NULL) {
+        return;
+    }
+
+    agent_state_t state = data->valid ? data->codex_state : AGENT_STATE_UNKNOWN;
+    uint32_t accent = agent_state_color(state);
+
+    set_icon_color(s_codex_ui.main_icon,
+                   data->valid ? accent : s_theme_color[THEME_CODEX]);
+    set_label_text_if_changed(s_codex_ui.state_value_label, agent_state_short(state));
+    lv_obj_set_style_text_color(s_codex_ui.state_value_label, lv_color_hex(accent), 0);
+
+    /* agent/project describe whichever agent is active, so only borrow them
+     * when that agent is Codex. */
+    char target[64];
+    target[0] = '\0';
+    bool codex_active = data->valid && strcasecmp(data->agent, "codex") == 0;
+    if (codex_active && data->project[0] != '\0') {
+        char elapsed[12];
+        format_elapsed_short(data->elapsed_s, elapsed, sizeof(elapsed));
+        snprintf(target, sizeof(target), "%s - %s", data->project, elapsed);
+    }
+    set_label_text_if_changed(s_codex_ui.target_label, target);
 }
 
 static void render_agent_status(const agent_status_t *status, const char *fallback_detail)
@@ -5165,6 +5206,7 @@ static void render_agent_status(const agent_status_t *status, const char *fallba
                               agent_state_short(data->valid ? data->claude_state
                                                             : AGENT_STATE_UNKNOWN));
     set_label_text_if_changed(s_agent_ui.elapsed_value_label, elapsed_text);
+    update_codex_state_locked(data);
     set_label_text_if_changed(s_agent_ui.updated_label, data->valid ? data->updated : "");
     agent_refresh_lamp();
     update_status_bar_locked();
