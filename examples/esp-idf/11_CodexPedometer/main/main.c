@@ -430,6 +430,7 @@ typedef struct {
 typedef struct {
     lv_obj_t *page;
     lv_obj_t *ring;
+    lv_obj_t *icon;
     lv_obj_t *title_label;
     lv_obj_t *state_label;
     lv_obj_t *detail_label;
@@ -1409,6 +1410,16 @@ static lv_obj_t *create_main_icon(lv_obj_t *parent, const lv_image_dsc_t *source
     lv_obj_t *icon = create_icon_image(parent, source);
     lv_obj_align(icon, LV_ALIGN_CENTER, 0, UI_MAIN_ICON_CENTER_Y);
     return icon;
+}
+
+/* The artwork is white, so a page tints its icon to match its own arc. */
+static void set_icon_color(lv_obj_t *icon, uint32_t color)
+{
+    if (icon == NULL) {
+        return;
+    }
+    lv_obj_set_style_image_recolor(icon, lv_color_hex(color), 0);
+    lv_obj_set_style_image_recolor_opa(icon, LV_OPA_COVER, 0);
 }
 
 static lv_obj_t *create_metric_icon(lv_obj_t *parent, metric_icon_t type, lv_color_t color)
@@ -3036,9 +3047,12 @@ static void create_codex_page(lv_obj_t *parent)
     lv_obj_set_style_arc_color(s_codex_ui.usage_arc,
                                lv_color_hex(s_theme_color[THEME_CODEX]), LV_PART_INDICATOR);
 
-    s_codex_ui.main_icon = create_label(s_codex_ui.page, "Codex", FONT_TITLE,
-                                        lv_color_hex(0xFFD166));
-    lv_obj_align(s_codex_ui.main_icon, LV_ALIGN_CENTER, 0, UI_MAIN_ICON_CENTER_Y);
+    s_codex_ui.main_icon = create_main_icon(s_codex_ui.page, &ui_icon_terminal);
+    set_icon_color(s_codex_ui.main_icon, s_theme_color[THEME_CODEX]);
+
+    lv_obj_t *codex_caption = create_label(s_codex_ui.page, "Codex", FONT_TITLE,
+                                           lv_color_hex(0xFFD166));
+    lv_obj_align(codex_caption, LV_ALIGN_CENTER, 0, UI_CAPTION_CENTER_Y);
 
     s_codex_ui.percent_label = create_label(s_codex_ui.page, "0%", FONT_STEPS,
                                               lv_color_hex(0xF7FBFF));
@@ -3259,9 +3273,12 @@ static void create_agent_page(lv_obj_t *parent)
     lv_obj_set_style_arc_color(s_agent_ui.ring, lv_color_hex(agent_state_color(AGENT_STATE_UNKNOWN)),
                                LV_PART_INDICATOR);
 
+    s_agent_ui.icon = create_main_icon(s_agent_ui.page, &ui_icon_ai);
+    set_icon_color(s_agent_ui.icon, agent_state_color(AGENT_STATE_UNKNOWN));
+
     s_agent_ui.title_label = create_label(s_agent_ui.page, tr("AI 状态", "AI STATUS"), FONT_TITLE,
                                           lv_color_hex(0xE6EDF5));
-    lv_obj_align(s_agent_ui.title_label, LV_ALIGN_CENTER, 0, UI_MAIN_ICON_CENTER_Y);
+    lv_obj_align(s_agent_ui.title_label, LV_ALIGN_CENTER, 0, UI_CAPTION_CENTER_Y);
 
     s_agent_ui.state_label = create_label(s_agent_ui.page, "--", lang_font(FONT_VALUE),
                                           lv_color_hex(0xF7FBFF));
@@ -3519,12 +3536,9 @@ static void create_stock_page(lv_obj_t *parent)
  * The artwork is white, so the theme colour comes from a recolor. */
 static void create_music_note_icon(lv_obj_t *parent, int32_t center_y)
 {
-    lv_obj_t *icon = lv_image_create(parent);
-    lv_image_set_src(icon, &ui_icon_music);
+    lv_obj_t *icon = create_icon_image(parent, &ui_icon_music);
     lv_obj_align(icon, LV_ALIGN_CENTER, 0, center_y);
-    lv_obj_set_style_image_recolor(icon, lv_color_hex(s_theme_color[THEME_MUSIC]), 0);
-    lv_obj_set_style_image_recolor_opa(icon, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(icon, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    set_icon_color(icon, s_theme_color[THEME_MUSIC]);
 }
 
 static void create_music_page(lv_obj_t *parent)
@@ -5139,6 +5153,7 @@ static void render_agent_status(const agent_status_t *status, const char *fallba
 
     lv_obj_set_style_arc_color(s_agent_ui.ring, lv_color_hex(accent), LV_PART_INDICATOR);
     lv_obj_set_style_text_color(s_agent_ui.state_label, lv_color_hex(accent), 0);
+    set_icon_color(s_agent_ui.icon, accent);
 
     set_label_text_if_changed(s_agent_ui.state_label, agent_state_text(state));
     set_label_text_if_changed(s_agent_ui.target_label, target_text);
