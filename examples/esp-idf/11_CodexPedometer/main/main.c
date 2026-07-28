@@ -266,7 +266,9 @@
  * tools/build_cjk_font.py. It lives in main/fonts/ rather than the LVGL
  * component so it survives a managed_components refresh. */
 LV_FONT_DECLARE(app_font_cjk_16)
+LV_FONT_DECLARE(app_font_cjk_22)
 #define FONT_CJK (&app_font_cjk_16)
+#define FONT_CJK_LARGE (&app_font_cjk_22)
 
 typedef enum {
     APP_PAGE_TIME,
@@ -3349,13 +3351,13 @@ static void create_stock_page(lv_obj_t *parent)
     lv_obj_set_style_arc_color(s_stock_ui.pos_arc, lv_color_hex(STOCK_UP_COLOR),
                                LV_PART_INDICATOR);
 
-    s_stock_ui.code_label = create_label(s_stock_ui.page, "------", FONT_SMALL,
-                                         lv_color_hex(0x8E99A5));
+    s_stock_ui.code_label = create_label(s_stock_ui.page, "------", FONT_MEDIUM,
+                                         lv_color_hex(0x9AA7B5));
     lv_obj_set_style_text_letter_space(s_stock_ui.code_label, 2, 0);
-    lv_obj_align(s_stock_ui.code_label, LV_ALIGN_CENTER, 0, -148);
+    lv_obj_align(s_stock_ui.code_label, LV_ALIGN_CENTER, 0, -150);
 
-    s_stock_ui.name_label = create_label(s_stock_ui.page, "--", FONT_CJK,
-                                         lv_color_hex(0xE6EDF5));
+    s_stock_ui.name_label = create_label(s_stock_ui.page, "--", FONT_CJK_LARGE,
+                                         lv_color_hex(0xF4FAFF));
     lv_obj_set_width(s_stock_ui.name_label, 300);
     lv_obj_set_style_text_align(s_stock_ui.name_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_stock_ui.name_label, LV_LABEL_LONG_DOT);
@@ -3400,6 +3402,8 @@ static void create_stock_page(lv_obj_t *parent)
     s_stock_ui.vol_value_label =
         create_metric_column(s_stock_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LEFT,
                              "成交", "--");
+
+    lv_obj_set_style_text_font(s_stock_ui.vol_value_label, FONT_CJK, 0);
 
     s_stock_ui.status_label = create_label(s_stock_ui.page, "等待行情", FONT_CJK,
                                             lv_color_hex(0x63717F));
@@ -4644,7 +4648,14 @@ static void render_stock_locked(const char *status_text)
     const stock_data_t *d = &s_stock_data;
     char text[48];
 
-    set_label_text_if_changed(s_stock_ui.code_label, s_stock_codes[s_stock_index]);
+    /* Codes are stored lowercase (the feed wants sz002241) but read better
+     * uppercase on the face. */
+    char code_upper[STOCK_CODE_LEN];
+    copy_string(code_upper, sizeof(code_upper), s_stock_codes[s_stock_index]);
+    for (char *c = code_upper; *c != '\0'; c++) {
+        *c = (char)toupper((unsigned char)*c);
+    }
+    set_label_text_if_changed(s_stock_ui.code_label, code_upper);
     set_label_text_if_changed(s_stock_ui.name_label, s_stock_names[s_stock_index]);
 
     if (!d->valid) {
@@ -4684,9 +4695,9 @@ static void render_stock_locked(const char *status_text)
 
     /* Raw 手 counts are unwieldy; switch to 万手 past ten thousand. */
     if (d->volume_lots >= 10000.0f) {
-        snprintf(text, sizeof(text), "%.1f万", d->volume_lots / 10000.0f);
+        snprintf(text, sizeof(text), "%.1f万手", d->volume_lots / 10000.0f);
     } else {
-        snprintf(text, sizeof(text), "%.0f", d->volume_lots);
+        snprintf(text, sizeof(text), "%.0f手", d->volume_lots);
     }
     set_label_text_if_changed(s_stock_ui.vol_value_label, text);
 

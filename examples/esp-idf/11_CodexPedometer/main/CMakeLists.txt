@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS main.c ui_icons.c fonts/app_font_cjk_16.c
+    SRCS main.c ui_icons.c fonts/app_font_cjk_16.c fonts/app_font_cjk_22.c
     INCLUDE_DIRS .
     PRIV_REQUIRES driver nvs_flash lvgl__lvgl waveshare__qmi8658 esp_wifi esp_http_client esp_http_server esp_netif esp_event mbedtls
 )

@@ -141,18 +141,16 @@ def main() -> int:
         print("lv_font_conv failed", file=sys.stderr)
         return result.returncode
 
-    # lv_font_conv names symbols after the output file; rewrite them to the
-    # project's own names and fix the include path for an in-project build.
+    # lv_font_conv derives its symbol from the output filename, so the name
+    # follows whatever the caller asked for - two sizes must not collide.
+    symbol = out.stem
     text = out.read_text(encoding="utf-8")
-    stem = out.stem
-    text = text.replace(stem.upper(), "APP_FONT_CJK_16")
-    text = text.replace(stem, "app_font_cjk_16")
     text = text.replace('#include "../../lvgl.h"', '#include "lvgl.h"')
     out.write_text(text, encoding="utf-8")
 
     size_kb = out.stat().st_size / 1024
     print(f"Wrote {out} ({size_kb:.0f} KB of C source)")
-    print("Symbol: app_font_cjk_16  (declared with LV_FONT_DECLARE in main.c)")
+    print(f"Symbol: {symbol}  (declare with LV_FONT_DECLARE in main.c)")
     return 0
 
 
