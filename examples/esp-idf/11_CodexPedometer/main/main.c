@@ -105,10 +105,31 @@
 #define WATCH_COLOR_CAPTION 0x8E8E93
 #define WATCH_COLOR_GAUGE_BG 0x26292E
 
-#define BATTERY_POLL_MS 30000
+#define BATTERY_POLL_MS 15000
 #define TEMP_POLL_TICKS 125
 #define AXP2101_I2C_ADDR 0x34
 #define AXP2101_REG_BATT_PERCENT 0xA4
+/* Register map per XPowersLib (examples/arduino/libraries/XPowersLib). */
+#define AXP2101_REG_STATUS1 0x00      /* bit3: battery present */
+#define AXP2101_REG_STATUS2 0x01      /* bits6:5: 1=charging, 2=discharging */
+#define AXP2101_REG_GAUGE_CTRL 0x18   /* bit3: fuel gauge enable */
+#define AXP2101_REG_ADC_CTRL 0x30     /* bit0: VBAT channel */
+#define AXP2101_REG_VBAT_H 0x34
+#define AXP2101_REG_VBAT_L 0x35
+#define AXP2101_REG_ICC_CHG 0x62      /* bits4:0: 4=100mA, 8=200mA, 11=500mA */
+#define AXP2101_REG_ITERM_CHG 0x63
+#define AXP2101_REG_CV_CHG 0x64       /* bits2:0: 3=4.2V */
+#define AXP2101_REG_BAT_DETECT 0x68   /* bit0: battery detection */
+
+/* Capacity of the pack actually fitted; only used to turn the gauge's slope
+ * into a current estimate in the log. */
+#define BATTERY_PACK_MAH 400.0f
+/* Termination current index for register 0x63: 0 = 25 mA, one step per 25 mA. */
+#define AXP2101_ITERM_25MA 0
+
+/* While the screen is dark nobody is reading the AI ring, so the radio can
+ * stay asleep between polls instead of waking every two seconds. */
+#define AGENT_POLL_DARK_INTERVAL_MS 20000
 #define BOARD_TEMP_INVALID (-1000.0f)
 
 #define PEDOMETER_DEFAULT_GOAL_STEPS 12000U
@@ -4362,6 +4383,9 @@ static void render_time_page(void)
     bsp_display_unlock();
 }
 
+static void log_battery_config(void);
+static void configure_battery_charging(void);
+
 static void init_battery_monitor(void)
 {
     i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
@@ -4377,7 +4401,113 @@ static void init_battery_monitor(void)
     if (i2c_master_bus_add_device(bus, &dev_cfg, &s_axp2101_dev) != ESP_OK) {
         ESP_LOGW(TAG, "AXP2101 not available; battery gauge disabled");
         s_axp2101_dev = NULL;
+        return;
     }
+    log_battery_config();
+    configure_battery_charging();
+}
+
+static bool axp2101_write(uint8_t reg, uint8_t value)
+{
+    if (s_axp2101_dev == NULL) {
+        return false;
+    }
+    uint8_t payload[2] = {reg, value};
+    return i2c_master_transmit(s_axp2101_dev, payload, sizeof(payload), 100) == ESP_OK;
+}
+
+static bool axp2101_read(uint8_t reg, uint8_t *value)
+{
+    if (s_axp2101_dev == NULL) {
+        return false;
+    }
+    return i2c_master_transmit_receive(s_axp2101_dev, &reg, 1, value, 1, 100) == ESP_OK;
+}
+
+/* VBAT sits in 0x34/0x35 as a 13-bit value in millivolts (H5:L8). */
+static int axp2101_battery_mv(void)
+{
+    uint8_t high = 0;
+    uint8_t low = 0;
+    if (!axp2101_read(AXP2101_REG_VBAT_H, &high) || !axp2101_read(AXP2101_REG_VBAT_L, &low)) {
+        return -1;
+    }
+    return ((int)(high & 0x1F) << 8) | low;
+}
+
+/* Read-only PMU report: pairing the gauge reading with the raw cell voltage is
+ * the only way to tell a fast-draining pack from a gauge that is just tracking
+ * voltage sag under load. */
+static void log_battery_diagnostics(int percent)
+{
+    static uint32_t last_ms;
+    static int last_percent = -1;
+    static int last_mv = -1;
+
+    uint8_t status1 = 0;
+    uint8_t status2 = 0;
+    (void)axp2101_read(AXP2101_REG_STATUS1, &status1);
+    (void)axp2101_read(AXP2101_REG_STATUS2, &status2);
+    int millivolts = axp2101_battery_mv();
+
+    uint32_t now = now_ms();
+    float minutes = last_ms == 0 ? 0.0f : (float)(now - last_ms) / 60000.0f;
+    float drop_per_min = (minutes > 0.01f && last_percent >= 0)
+                             ? (float)(last_percent - percent) / minutes
+                             : 0.0f;
+    /* At 400 mAh, one percent a minute is 240 mA out of the pack. */
+    float milliamps = drop_per_min * BATTERY_PACK_MAH * 60.0f / 100.0f;
+
+    ESP_LOGI(TAG,
+             "PMU batt=%d%% vbat=%dmV charge_state=%u present=%u "
+             "drop=%.2f%%/min (~%.0fmA) dV=%dmV",
+             percent, millivolts, (unsigned)((status2 >> 5) & 0x03),
+             (unsigned)((status1 >> 3) & 0x01), drop_per_min, milliamps,
+             last_mv >= 0 && millivolts >= 0 ? millivolts - last_mv : 0);
+
+    last_ms = now;
+    last_percent = percent;
+    last_mv = millivolts;
+}
+
+/* The only charge parameter worth changing for the 400 mAh pack. The PMU
+ * powers up terminating at 150 mA, which on a pack this small ends the charge
+ * while the cell is still well short of full - the charge current has already
+ * tapered below that before the cell is topped off, so it never gets there.
+ * Target voltage (4.2 V) and constant current (200 mA = 0.5C) are already
+ * right, and both are safety-relevant, so they are left alone. */
+static void configure_battery_charging(void)
+{
+    uint8_t iterm = 0;
+    if (!axp2101_read(AXP2101_REG_ITERM_CHG, &iterm)) {
+        return;
+    }
+    uint8_t wanted = (uint8_t)((iterm & 0xF0) | AXP2101_ITERM_25MA);
+    if (wanted == iterm) {
+        return;
+    }
+    if (axp2101_write(AXP2101_REG_ITERM_CHG, wanted)) {
+        ESP_LOGI(TAG, "PMU charge termination 0x%02X -> 0x%02X (25mA)", iterm, wanted);
+    }
+}
+
+static void log_battery_config(void)
+{
+    uint8_t adc = 0;
+    uint8_t gauge = 0;
+    uint8_t icc = 0;
+    uint8_t iterm = 0;
+    uint8_t cv = 0;
+    uint8_t detect = 0;
+    (void)axp2101_read(AXP2101_REG_ADC_CTRL, &adc);
+    (void)axp2101_read(AXP2101_REG_GAUGE_CTRL, &gauge);
+    (void)axp2101_read(AXP2101_REG_ICC_CHG, &icc);
+    (void)axp2101_read(AXP2101_REG_ITERM_CHG, &iterm);
+    (void)axp2101_read(AXP2101_REG_CV_CHG, &cv);
+    (void)axp2101_read(AXP2101_REG_BAT_DETECT, &detect);
+    ESP_LOGI(TAG,
+             "PMU cfg adc=0x%02X gauge=0x%02X icc=0x%02X iterm=0x%02X cv=0x%02X det=0x%02X",
+             adc, gauge, icc, iterm, cv, detect);
 }
 
 static void refresh_battery_percent(void)
@@ -4386,11 +4516,10 @@ static void refresh_battery_percent(void)
         return;
     }
 
-    uint8_t reg = AXP2101_REG_BATT_PERCENT;
     uint8_t value = 0;
-    esp_err_t ret = i2c_master_transmit_receive(s_axp2101_dev, &reg, 1, &value, 1, 100);
-    if (ret == ESP_OK && value <= 100) {
+    if (axp2101_read(AXP2101_REG_BATT_PERCENT, &value) && value <= 100) {
         s_battery_percent = value;
+        log_battery_diagnostics(value);
     }
 }
 
@@ -4424,7 +4553,11 @@ static void clock_task(void *arg)
             (void)bsp_display_brightness_set(0);
         }
 
-        render_time_page();
+        /* Nothing to see on a dark panel, and redrawing it keeps both the CPU
+         * and the display bus busy for no reason. */
+        if (!s_screen_off) {
+            render_time_page();
+        }
         vTaskDelay(pdMS_TO_TICKS(CLOCK_TASK_DELAY_MS));
     }
 }
@@ -6907,6 +7040,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         /* A stale address is worse than none - it sends you to a dead host. */
         s_sta_ip[0] = '\0';
+        /* Reconnecting (and possibly provisioning again): full power. */
+        (void)esp_wifi_set_ps(WIFI_PS_NONE);
         if (s_wifi_event_group != NULL) {
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             xEventGroupSetBits(s_wifi_event_group, WEATHER_REFRESH_REQUEST_BIT);
@@ -6935,6 +7070,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         s_wifi_retry_num = 0;
         s_ntp_sync_in_progress = false;
         s_last_ntp_attempt_ms = 0;
+        /* Connected to the router: nobody is hunting for the setup hotspot any
+         * more, so let the radio sleep between beacons. */
+        (void)esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         if (s_wifi_event_group != NULL) {
             xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT |
@@ -7001,8 +7139,9 @@ static esp_err_t start_wifi_station(void)
         ESP_RETURN_ON_ERROR(apply_station_config(), TAG, "set STA config failed");
     }
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "start wifi failed");
-    /* Modem power save makes softAP beaconing irregular; keep it off so the
-     * setup hotspot stays discoverable. */
+    /* Modem power save makes softAP beaconing irregular, so provisioning runs
+     * with the radio fully awake; it is turned back on once the station has an
+     * address (see IP_EVENT_STA_GOT_IP), where it is worth ~70 mA. */
     (void)esp_wifi_set_ps(WIFI_PS_NONE);
 
     s_wifi_started = true;
@@ -7456,7 +7595,9 @@ static void codex_usage_task(void *arg)
             /* Sleep until the next poll or a manual refresh (long press). */
             (void)xEventGroupWaitBits(s_wifi_event_group, CODEX_REFRESH_REQUEST_BIT,
                                       pdTRUE, pdFALSE,
-                                      pdMS_TO_TICKS(AGENT_POLL_INTERVAL_MS));
+                                      pdMS_TO_TICKS(s_screen_off
+                                                        ? AGENT_POLL_DARK_INTERVAL_MS
+                                                        : AGENT_POLL_INTERVAL_MS));
         } else if ((bits & WIFI_FAIL_BIT) != 0) {
             render_codex_status(tr("Wi-Fi 失败", "Wi-Fi failed"));
             render_time_page();
