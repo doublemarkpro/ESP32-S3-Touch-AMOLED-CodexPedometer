@@ -126,6 +126,7 @@
 #define WIFI_FAIL_BIT BIT1
 #define WEATHER_REFRESH_REQUEST_BIT BIT2
 #define CODEX_REFRESH_REQUEST_BIT BIT3
+#define STOCK_REFRESH_REQUEST_BIT BIT4
 /* Short immediate-retry burst, then long backoff: every STA connect attempt
  * drags the shared radio off the setup-AP channel for seconds, which is what
  * makes the CodexPedometer hotspot undiscoverable. */
@@ -181,6 +182,21 @@
 #define MUSIC_SLOW_UI_DIVIDER 8
 /* AMap returns today plus three forecast days in one call. */
 #define WEATHER_FORECAST_DAYS 4
+
+/* Stocks: Tencent's quote endpoints are plain HTTP and cover both A-shares
+ * and HK, which the TLS-less HTTP client here requires. Codes use their
+ * native prefixes: sz002241, sh600519, hk09903. */
+#define STOCK_MAX_SYMBOLS 6
+#define STOCK_CODE_LEN 12
+#define STOCK_NAME_LEN 32
+#define STOCK_TREND_POINTS 60
+#define STOCK_KLINE_DAYS 20
+#define STOCK_POLL_OPEN_MS 30000
+#define STOCK_POLL_CLOSED_MS 300000
+#define STOCK_HTTP_TIMEOUT_MS 6000
+#define STOCK_NVS_CODES_KEY "stocks"
+#define STOCK_UP_COLOR 0xFF453A   /* red = up, CN convention */
+#define STOCK_DOWN_COLOR 0x30D158 /* green = down */
 #define WEATHER_POLL_INTERVAL_MS 1800000
 #define WEATHER_RETRY_INTERVAL_MS 60000
 #define WEATHER_HTTP_TIMEOUT_MS 8000
@@ -259,6 +275,7 @@ typedef enum {
     APP_PAGE_CODEX,
     APP_PAGE_AGENT,
     APP_PAGE_MUSIC,
+    APP_PAGE_STOCK,
     APP_PAGE_COUNT,
 } app_page_t;
 
@@ -418,6 +435,47 @@ typedef struct {
 } agent_ui_t;
 
 typedef struct {
+    char code[STOCK_CODE_LEN];
+    char name[STOCK_NAME_LEN];
+    float price;
+    float prev_close;
+    float open;
+    float high;
+    float low;
+    float change;
+    float change_pct;
+    float volume_lots;   /* 手 */
+    float turnover_yi;   /* 成交额, 亿 */
+    char updated[8];     /* HH:MM */
+    bool valid;
+    /* Intraday trend, oldest first, downsampled to fit the screen. */
+    float trend[STOCK_TREND_POINTS];
+    int trend_count;
+    /* Daily candles, oldest first. */
+    float k_open[STOCK_KLINE_DAYS];
+    float k_close[STOCK_KLINE_DAYS];
+    float k_high[STOCK_KLINE_DAYS];
+    float k_low[STOCK_KLINE_DAYS];
+    int k_count;
+} stock_data_t;
+
+typedef struct {
+    lv_obj_t *page;
+    lv_obj_t *pos_arc;
+    lv_obj_t *code_label;
+    lv_obj_t *name_label;
+    lv_obj_t *price_label;
+    lv_obj_t *change_label;
+    lv_obj_t *chart;          /* trend line or candles, rebuilt per view */
+    lv_obj_t *chart_canvas;
+    lv_obj_t *high_value_label;
+    lv_obj_t *low_value_label;
+    lv_obj_t *vol_value_label;
+    lv_obj_t *status_label;
+    lv_obj_t *dots[2];
+} stock_ui_t;
+
+typedef struct {
     lv_obj_t *page;
     lv_obj_t *range_arc;
     lv_obj_t *icon;
@@ -511,6 +569,16 @@ static pedometer_ui_t s_pedometer_ui;
 static codex_ui_t s_codex_ui;
 static agent_ui_t s_agent_ui;
 static music_ui_t s_music_ui;
+static stock_ui_t s_stock_ui;
+static stock_data_t s_stock_data;
+/* Codes plus a display name each. The quote feed only speaks GBK and
+ * esp-idf has no iconv, so rather than ship a conversion table the name is
+ * configured alongside the code - it never changes anyway. */
+static char s_stock_codes[STOCK_MAX_SYMBOLS][STOCK_CODE_LEN] = {"sz002241", "hk09903"};
+static char s_stock_names[STOCK_MAX_SYMBOLS][STOCK_NAME_LEN] = {"歌尔股份", "天数智芯"};
+static int s_stock_count = 2;
+static int s_stock_index;
+static bool s_stock_kline_view;
 static forecast_ui_t s_forecast_ui;
 /* Forecast detail overlays the weather page rather than joining the page
  * carousel, so it does not lengthen the swipe chain for everyone else. */
@@ -640,6 +708,8 @@ static void render_weather_status(const char *status_text);
 static esp_err_t request_ntp_sync(void);
 static void show_settings_panel(bool show);
 static void agent_refresh_lamp(void);
+static void request_stock_refresh(void);
+static void render_stock_locked(const char *status_text);
 static bool text_glyphs_available(const lv_font_t *font, const char *text);
 static const char *weather_condition_en(int code);
 static uint32_t agent_state_color(agent_state_t state);
@@ -658,6 +728,9 @@ static bool json_get_string(const char *json, const char *key, char *out_value, 
 static bool json_get_u64(const char *json, const char *key, uint64_t *out_value);
 static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bundle,
                               http_response_t *response);
+typedef struct stock_response stock_response_t;
+static esp_err_t http_get_url_big(const char *url, int timeout_ms,
+                                  stock_response_t *response);
 static void render_pedometer(uint32_t steps, int motion_mg, const char *status_text);
 static void update_time_page_locked(void);
 static void screenshot_console_task(void *arg);
@@ -1101,6 +1174,8 @@ static const char *page_name(app_page_t page)
         return "agent";
     case APP_PAGE_MUSIC:
         return "music";
+    case APP_PAGE_STOCK:
+        return "stock";
     default:
         return "unknown";
     }
@@ -1306,6 +1381,8 @@ static void update_status_bar_locked(void)
         title = "AI";
     } else if (s_current_page == APP_PAGE_MUSIC) {
         title = "MUSIC";
+    } else if (s_current_page == APP_PAGE_STOCK) {
+        title = "STOCK";
     }
     set_label_text_if_changed(s_status_ui.title_label, title);
 }
@@ -1428,6 +1505,7 @@ static void enforce_page_visibility_locked(void)
     bool codex_active = s_current_page == APP_PAGE_CODEX;
     bool agent_active = s_current_page == APP_PAGE_AGENT;
     bool music_active = s_current_page == APP_PAGE_MUSIC;
+    bool stock_active = s_current_page == APP_PAGE_STOCK;
 
     set_obj_tree_hidden(s_time_ui.page, !time_active);
     set_obj_tree_hidden(s_weather_ui.page, !weather_active);
@@ -1435,6 +1513,7 @@ static void enforce_page_visibility_locked(void)
     set_obj_tree_hidden(s_codex_ui.page, !codex_active);
     set_obj_tree_hidden(s_agent_ui.page, !agent_active);
     set_obj_tree_hidden(s_music_ui.page, !music_active);
+    set_obj_tree_hidden(s_stock_ui.page, !stock_active);
 
     if (time_active && s_time_ui.page != NULL) {
         lv_obj_move_foreground(s_time_ui.page);
@@ -1448,6 +1527,8 @@ static void enforce_page_visibility_locked(void)
         lv_obj_move_foreground(s_agent_ui.page);
     } else if (music_active && s_music_ui.page != NULL) {
         lv_obj_move_foreground(s_music_ui.page);
+    } else if (stock_active && s_stock_ui.page != NULL) {
+        lv_obj_move_foreground(s_stock_ui.page);
     }
 
     move_overlay_ui_foreground_locked();
@@ -1645,7 +1726,20 @@ static void page_nav_event_cb(lv_event_t *event)
             } else if (s_current_page == APP_PAGE_CODEX ||
                        s_current_page == APP_PAGE_AGENT) {
                 request_codex_refresh();
+            } else if (s_current_page == APP_PAGE_STOCK) {
+                /* Long press steps to the next symbol. */
+                if (s_stock_count > 0) {
+                    s_stock_index = (s_stock_index + 1) % s_stock_count;
+                    memset(&s_stock_data, 0, sizeof(s_stock_data));
+                    render_stock_locked("载入中");
+                    request_stock_refresh();
+                }
             }
+        } else if (s_current_page == APP_PAGE_STOCK && code == LV_EVENT_RELEASED &&
+                   abs_dx < PAGE_SWIPE_MIN_PX && abs_dy < PAGE_SWIPE_MIN_PX) {
+            /* Short tap toggles between the intraday line and daily candles. */
+            s_stock_kline_view = !s_stock_kline_view;
+            render_stock_locked(s_stock_kline_view ? "20日K线  ·  轻点返回" : NULL);
         } else if (s_current_page == APP_PAGE_TIME && corner_handle_tap(release_point)) {
             /* Tap on a watch-face corner cycles that complication instead of
              * switching pages. */
@@ -3151,6 +3245,114 @@ static void create_forecast_page(lv_obj_t *parent)
     set_obj_hidden(page, true);
 }
 
+#define STOCK_CHART_W 300
+#define STOCK_CHART_H 96
+#define STOCK_CHART_TOP 262
+
+static uint32_t stock_move_color(float change)
+{
+    if (change > 0.0f) {
+        return STOCK_UP_COLOR;
+    }
+    if (change < 0.0f) {
+        return STOCK_DOWN_COLOR;
+    }
+    return 0xC9D3DC;
+}
+
+static void create_stock_page(lv_obj_t *parent)
+{
+    s_stock_ui.page = create_page(parent);
+
+    /* Ring shows where the last price sits between today's low and high. */
+    s_stock_ui.pos_arc = lv_arc_create(s_stock_ui.page);
+    lv_obj_set_size(s_stock_ui.pos_arc, UI_ARC_SIZE, UI_ARC_SIZE);
+    lv_obj_align(s_stock_ui.pos_arc, LV_ALIGN_TOP_MID, 0, UI_ARC_TOP);
+    lv_arc_set_range(s_stock_ui.pos_arc, 0, 100);
+    lv_arc_set_value(s_stock_ui.pos_arc, 0);
+    lv_arc_set_rotation(s_stock_ui.pos_arc, 135);
+    lv_arc_set_bg_angles(s_stock_ui.pos_arc, 0, 270);
+    lv_obj_remove_style(s_stock_ui.pos_arc, NULL, LV_PART_KNOB);
+    lv_obj_clear_flag(s_stock_ui.pos_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(s_stock_ui.pos_arc, UI_ARC_WIDTH, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_stock_ui.pos_arc, UI_ARC_WIDTH, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(s_stock_ui.pos_arc, true, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_stock_ui.pos_arc, lv_color_hex(0x17212B), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_stock_ui.pos_arc, lv_color_hex(STOCK_UP_COLOR),
+                               LV_PART_INDICATOR);
+
+    s_stock_ui.code_label = create_label(s_stock_ui.page, "------", FONT_SMALL,
+                                         lv_color_hex(0x8E99A5));
+    lv_obj_set_style_text_letter_space(s_stock_ui.code_label, 2, 0);
+    lv_obj_align(s_stock_ui.code_label, LV_ALIGN_CENTER, 0, -148);
+
+    s_stock_ui.name_label = create_label(s_stock_ui.page, "--", FONT_CJK,
+                                         lv_color_hex(0xE6EDF5));
+    lv_obj_set_width(s_stock_ui.name_label, 300);
+    lv_obj_set_style_text_align(s_stock_ui.name_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_stock_ui.name_label, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_stock_ui.name_label, LV_ALIGN_CENTER, 0, -118);
+
+    s_stock_ui.price_label = create_label(s_stock_ui.page, "--", FONT_STEPS,
+                                          lv_color_hex(0xF7FBFF));
+    lv_obj_set_width(s_stock_ui.price_label, 340);
+    lv_obj_set_style_text_align(s_stock_ui.price_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_stock_ui.price_label, LV_LABEL_LONG_CLIP);
+    lv_obj_align(s_stock_ui.price_label, LV_ALIGN_CENTER, 0, -58);
+
+    s_stock_ui.change_label = create_label(s_stock_ui.page, "--", FONT_TITLE,
+                                           lv_color_hex(0xC9D3DC));
+    lv_obj_set_width(s_stock_ui.change_label, 320);
+    lv_obj_set_style_text_align(s_stock_ui.change_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_stock_ui.change_label, LV_LABEL_LONG_CLIP);
+    lv_obj_align(s_stock_ui.change_label, LV_ALIGN_CENTER, 0, -14);
+
+    /* Trend line and candles are both drawn into one canvas: the shapes
+     * differ too much for a shared widget, and a canvas keeps it to a
+     * single object either way. */
+    size_t buf_size = (size_t)STOCK_CHART_W * STOCK_CHART_H * 2;
+    void *buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf != NULL) {
+        s_stock_ui.chart_canvas = lv_canvas_create(s_stock_ui.page);
+        lv_canvas_set_buffer(s_stock_ui.chart_canvas, buf, STOCK_CHART_W, STOCK_CHART_H,
+                             LV_COLOR_FORMAT_RGB565);
+        canvas_own_buffer(s_stock_ui.chart_canvas, buf);
+        lv_obj_set_pos(s_stock_ui.chart_canvas, (BSP_LCD_H_RES - STOCK_CHART_W) / 2,
+                       STOCK_CHART_TOP);
+        lv_obj_clear_flag(s_stock_ui.chart_canvas,
+                          LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        lv_canvas_fill_bg(s_stock_ui.chart_canvas, lv_color_hex(0x000000), LV_OPA_COVER);
+    }
+
+    s_stock_ui.high_value_label =
+        create_metric_column(s_stock_ui.page, -UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT,
+                             "最高", "--");
+    s_stock_ui.low_value_label =
+        create_metric_column(s_stock_ui.page, 0, false, METRIC_ICON_USED, "最低", "--");
+    s_stock_ui.vol_value_label =
+        create_metric_column(s_stock_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LEFT,
+                             "成交", "--");
+
+    s_stock_ui.status_label = create_label(s_stock_ui.page, "等待行情", FONT_CJK,
+                                            lv_color_hex(0x63717F));
+    lv_obj_set_width(s_stock_ui.status_label, 300);
+    lv_obj_set_style_text_align(s_stock_ui.status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_stock_ui.status_label, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_stock_ui.status_label, LV_ALIGN_CENTER, 0, 172);
+
+    for (int i = 0; i < 2; i++) {
+        lv_obj_t *dot = lv_obj_create(s_stock_ui.page);
+        lv_obj_remove_style_all(dot);
+        lv_obj_set_size(dot, i == 0 ? 22 : 5, 5);
+        lv_obj_set_style_radius(dot, 3, 0);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(i == 0 ? 0x18D7F5 : 0x32404E), 0);
+        lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_align(dot, LV_ALIGN_CENTER, i == 0 ? -14 : 14, 196);
+        s_stock_ui.dots[i] = dot;
+    }
+}
+
 static void create_music_page(lv_obj_t *parent)
 {
     s_music_ui.page = create_page(parent);
@@ -3508,6 +3710,7 @@ static void create_app_ui(void)
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
 
+    create_stock_page(scr);
     create_music_page(scr);
     create_agent_page(scr);
     create_forecast_page(scr);
@@ -4214,6 +4417,241 @@ static void render_weather_status(const char *status_text)
 /* Paint one forecast day. The ring draws that day's low..high as a segment
  * positioned inside the span of all four days, so relative warmth and swing
  * read at a glance. */
+/* Intraday line, with the previous close as a dashed baseline so gains and
+ * losses read against the right reference rather than the window minimum. */
+static void stock_draw_trend_locked(void)
+{
+    lv_obj_t *canvas = s_stock_ui.chart_canvas;
+    if (canvas == NULL) {
+        return;
+    }
+    lv_canvas_fill_bg(canvas, lv_color_hex(0x000000), LV_OPA_COVER);
+    if (s_stock_data.trend_count < 2) {
+        lv_obj_invalidate(canvas);
+        return;
+    }
+
+    float lo = s_stock_data.trend[0];
+    float hi = lo;
+    for (int i = 1; i < s_stock_data.trend_count; i++) {
+        lo = fminf(lo, s_stock_data.trend[i]);
+        hi = fmaxf(hi, s_stock_data.trend[i]);
+    }
+    float prev = s_stock_data.prev_close;
+    if (prev > 0.0f) {
+        lo = fminf(lo, prev);
+        hi = fmaxf(hi, prev);
+    }
+    float span = hi - lo;
+    if (span < 0.0001f) {
+        span = 0.0001f;
+    }
+
+    lv_layer_t layer;
+    lv_canvas_init_layer(canvas, &layer);
+
+    const int32_t pad = 6;
+    const int32_t usable = STOCK_CHART_H - pad * 2;
+
+    if (prev > 0.0f) {
+        int32_t y = pad + (int32_t)((hi - prev) / span * usable);
+        lv_draw_line_dsc_t dsc;
+        lv_draw_line_dsc_init(&dsc);
+        dsc.color = lv_color_hex(0x2A3540);
+        dsc.width = 1;
+        for (int32_t x = 0; x < STOCK_CHART_W; x += 8) {
+            dsc.p1.x = x;
+            dsc.p1.y = y;
+            dsc.p2.x = x + 4;
+            dsc.p2.y = y;
+            lv_draw_line(&layer, &dsc);
+        }
+    }
+
+    uint32_t colour = stock_move_color(s_stock_data.change);
+    lv_draw_line_dsc_t dsc;
+    lv_draw_line_dsc_init(&dsc);
+    dsc.color = lv_color_hex(colour);
+    dsc.width = 2;
+    dsc.round_start = 1;
+    dsc.round_end = 1;
+
+    for (int i = 1; i < s_stock_data.trend_count; i++) {
+        int32_t x0 = ((i - 1) * (STOCK_CHART_W - 1)) / (s_stock_data.trend_count - 1);
+        int32_t x1 = (i * (STOCK_CHART_W - 1)) / (s_stock_data.trend_count - 1);
+        dsc.p1.x = x0;
+        dsc.p1.y = pad + (int32_t)((hi - s_stock_data.trend[i - 1]) / span * usable);
+        dsc.p2.x = x1;
+        dsc.p2.y = pad + (int32_t)((hi - s_stock_data.trend[i]) / span * usable);
+        lv_draw_line(&layer, &dsc);
+    }
+
+    lv_canvas_finish_layer(canvas, &layer);
+    lv_obj_invalidate(canvas);
+}
+
+/* Daily candles: filled body when up, hollow when down, wick behind. */
+static void stock_draw_candles_locked(void)
+{
+    lv_obj_t *canvas = s_stock_ui.chart_canvas;
+    if (canvas == NULL) {
+        return;
+    }
+    lv_canvas_fill_bg(canvas, lv_color_hex(0x000000), LV_OPA_COVER);
+    if (s_stock_data.k_count < 1) {
+        lv_obj_invalidate(canvas);
+        return;
+    }
+
+    float lo = s_stock_data.k_low[0];
+    float hi = s_stock_data.k_high[0];
+    for (int i = 1; i < s_stock_data.k_count; i++) {
+        lo = fminf(lo, s_stock_data.k_low[i]);
+        hi = fmaxf(hi, s_stock_data.k_high[i]);
+    }
+    float span = hi - lo;
+    if (span < 0.0001f) {
+        span = 0.0001f;
+    }
+
+    lv_layer_t layer;
+    lv_canvas_init_layer(canvas, &layer);
+
+    const int32_t pad = 5;
+    const int32_t usable = STOCK_CHART_H - pad * 2;
+    int32_t slot = STOCK_CHART_W / s_stock_data.k_count;
+    int32_t body_w = slot > 5 ? slot - 3 : 2;
+
+    for (int i = 0; i < s_stock_data.k_count; i++) {
+        int32_t cx = slot * i + slot / 2;
+        bool up = s_stock_data.k_close[i] >= s_stock_data.k_open[i];
+        uint32_t colour = up ? STOCK_UP_COLOR : STOCK_DOWN_COLOR;
+
+        int32_t y_high = pad + (int32_t)((hi - s_stock_data.k_high[i]) / span * usable);
+        int32_t y_low = pad + (int32_t)((hi - s_stock_data.k_low[i]) / span * usable);
+        lv_draw_line_dsc_t wick;
+        lv_draw_line_dsc_init(&wick);
+        wick.color = lv_color_hex(colour);
+        wick.width = 1;
+        wick.p1.x = cx;
+        wick.p1.y = y_high;
+        wick.p2.x = cx;
+        wick.p2.y = y_low;
+        lv_draw_line(&layer, &wick);
+
+        int32_t y_open = pad + (int32_t)((hi - s_stock_data.k_open[i]) / span * usable);
+        int32_t y_close = pad + (int32_t)((hi - s_stock_data.k_close[i]) / span * usable);
+        int32_t y_top = y_open < y_close ? y_open : y_close;
+        int32_t y_bottom = y_open < y_close ? y_close : y_open;
+        if (y_bottom - y_top < 1) {
+            y_bottom = y_top + 1;
+        }
+
+        lv_draw_rect_dsc_t body;
+        lv_draw_rect_dsc_init(&body);
+        if (up) {
+            body.bg_color = lv_color_hex(colour);
+            body.bg_opa = LV_OPA_COVER;
+        } else {
+            /* Down days stay hollow, matching how CN charts are read. */
+            body.bg_opa = LV_OPA_TRANSP;
+            body.border_color = lv_color_hex(colour);
+            body.border_width = 1;
+            body.border_opa = LV_OPA_COVER;
+        }
+        lv_area_t area = {cx - body_w / 2, y_top, cx - body_w / 2 + body_w - 1, y_bottom};
+        lv_draw_rect(&layer, &body, &area);
+    }
+
+    lv_canvas_finish_layer(canvas, &layer);
+    lv_obj_invalidate(canvas);
+}
+
+static void render_stock_locked(const char *status_text)
+{
+    if (s_stock_ui.page == NULL) {
+        return;
+    }
+
+    const stock_data_t *d = &s_stock_data;
+    char text[48];
+
+    set_label_text_if_changed(s_stock_ui.code_label, s_stock_codes[s_stock_index]);
+    set_label_text_if_changed(s_stock_ui.name_label, s_stock_names[s_stock_index]);
+
+    if (!d->valid) {
+        set_label_text_if_changed(s_stock_ui.price_label, "--");
+        set_label_text_if_changed(s_stock_ui.change_label, "");
+        set_label_text_if_changed(s_stock_ui.high_value_label, "--");
+        set_label_text_if_changed(s_stock_ui.low_value_label, "--");
+        set_label_text_if_changed(s_stock_ui.vol_value_label, "--");
+        if (status_text != NULL) {
+            set_label_text_if_changed(s_stock_ui.status_label, status_text);
+        }
+        return;
+    }
+
+    uint32_t colour = stock_move_color(d->change);
+
+    snprintf(text, sizeof(text), "%.2f", d->price);
+    set_label_text_if_changed(s_stock_ui.price_label, text);
+    lv_obj_set_style_text_color(s_stock_ui.price_label, lv_color_hex(colour), 0);
+
+    snprintf(text, sizeof(text), "%+.2f  %+.2f%%", d->change, d->change_pct);
+    set_label_text_if_changed(s_stock_ui.change_label, text);
+    lv_obj_set_style_text_color(s_stock_ui.change_label, lv_color_hex(colour), 0);
+
+    lv_obj_set_style_arc_color(s_stock_ui.pos_arc, lv_color_hex(colour), LV_PART_INDICATOR);
+    float range = d->high - d->low;
+    int pos = range > 0.0001f ? (int)((d->price - d->low) / range * 100.0f) : 50;
+    pos = clamp_int(pos, 0, 100);
+    if (lv_arc_get_value(s_stock_ui.pos_arc) != pos) {
+        lv_arc_set_value(s_stock_ui.pos_arc, pos);
+    }
+
+    snprintf(text, sizeof(text), "%.2f", d->high);
+    set_label_text_if_changed(s_stock_ui.high_value_label, text);
+    snprintf(text, sizeof(text), "%.2f", d->low);
+    set_label_text_if_changed(s_stock_ui.low_value_label, text);
+
+    /* Raw 手 counts are unwieldy; switch to 万手 past ten thousand. */
+    if (d->volume_lots >= 10000.0f) {
+        snprintf(text, sizeof(text), "%.1f万", d->volume_lots / 10000.0f);
+    } else {
+        snprintf(text, sizeof(text), "%.0f", d->volume_lots);
+    }
+    set_label_text_if_changed(s_stock_ui.vol_value_label, text);
+
+    if (status_text != NULL) {
+        set_label_text_if_changed(s_stock_ui.status_label, status_text);
+    } else if (d->updated[0] != '\0') {
+        snprintf(text, sizeof(text), "%.5s  ·  轻点看日K", d->updated);
+        set_label_text_if_changed(s_stock_ui.status_label, text);
+    }
+
+    if (s_stock_kline_view) {
+        stock_draw_candles_locked();
+    } else {
+        stock_draw_trend_locked();
+    }
+
+    for (int i = 0; i < 2; i++) {
+        bool active = (i == 1) == s_stock_kline_view;
+        lv_obj_set_size(s_stock_ui.dots[i], active ? 22 : 5, 5);
+        lv_obj_set_style_bg_color(s_stock_ui.dots[i],
+                                  lv_color_hex(active ? 0x18D7F5 : 0x32404E), 0);
+    }
+}
+
+static void render_stock(const char *status_text)
+{
+    if (bsp_display_lock(DISPLAY_LOCK_TIMEOUT_MS) != ESP_OK) {
+        return;
+    }
+    render_stock_locked(status_text);
+    bsp_display_unlock();
+}
+
 static void render_forecast_locked(void)
 {
     if (s_forecast_ui.page == NULL) {
@@ -4520,6 +4958,253 @@ static bool parse_agent_status_json(const char *json, agent_status_t *status)
     parsed.valid = true;
     *status = parsed;
     return true;
+}
+
+/*
+ * A full trading session of minute bars is ~9 KB, over twice the shared
+ * http_response_t. Give the stock feeds their own PSRAM-backed buffer that
+ * is allocated for the call and released straight after.
+ */
+#define STOCK_RESPONSE_BUFFER_SIZE 16384
+
+struct stock_response {
+    char body[STOCK_RESPONSE_BUFFER_SIZE];
+    int length;
+};
+
+static stock_response_t *stock_response_alloc(void)
+{
+    stock_response_t *r = heap_caps_calloc(1, sizeof(stock_response_t),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (r == NULL) {
+        ESP_LOGW(TAG, "stock buffer alloc failed (%u bytes, psram largest %u)",
+                 (unsigned)sizeof(stock_response_t),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    }
+    return r;
+}
+
+static void stock_response_free(stock_response_t *response)
+{
+    heap_caps_free(response);
+}
+
+static float stock_field_float(char **fields, int count, int index)
+{
+    if (index >= count || fields[index] == NULL) {
+        return 0.0f;
+    }
+    return strtof(fields[index], NULL);
+}
+
+/* Split a "~"-separated Tencent quote payload in place. */
+static int stock_split_fields(char *payload, char **fields, int max_fields)
+{
+    int count = 0;
+    char *cursor = payload;
+    while (count < max_fields) {
+        fields[count++] = cursor;
+        char *sep = strchr(cursor, '~');
+        if (sep == NULL) {
+            break;
+        }
+        *sep = '\0';
+        cursor = sep + 1;
+    }
+    return count;
+}
+
+/* Live quote: v_<code>="f0~name~code~price~prev~open~volume~...". */
+static esp_err_t stock_fetch_quote(const char *code, stock_data_t *out)
+{
+    http_response_t *response = calloc(1, sizeof(*response));
+    if (response == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    char url[96];
+    snprintf(url, sizeof(url), "http://qt.gtimg.cn/q=%s", code);
+    esp_err_t ret = http_get_url(url, STOCK_HTTP_TIMEOUT_MS, false, response);
+    if (ret != ESP_OK) {
+        free(response);
+        return ret;
+    }
+
+    char *payload = strchr(response->body, '"');
+    if (payload == NULL) {
+        free(response);
+        return ESP_FAIL;
+    }
+    payload++;
+    char *end = strchr(payload, '"');
+    if (end != NULL) {
+        *end = '\0';
+    }
+
+    char *fields[64];
+    int count = stock_split_fields(payload, fields, 64);
+    if (count < 35) {
+        ESP_LOGW(TAG, "Stock quote too short for %s (%d fields)", code, count);
+        free(response);
+        return ESP_FAIL;
+    }
+
+    out->price = stock_field_float(fields, count, 3);
+    out->prev_close = stock_field_float(fields, count, 4);
+    out->open = stock_field_float(fields, count, 5);
+    out->volume_lots = stock_field_float(fields, count, 6);
+    out->change = stock_field_float(fields, count, 31);
+    out->change_pct = stock_field_float(fields, count, 32);
+    out->high = stock_field_float(fields, count, 33);
+    out->low = stock_field_float(fields, count, 34);
+    out->turnover_yi = count > 37 ? stock_field_float(fields, count, 37) / 10000.0f : 0.0f;
+
+    /* Field 30 is the trade timestamp: yyyymmddHHMMSS for A-shares,
+     * "yyyy/mm/dd HH:MM:SS" for HK. Take the HH:MM either way. */
+    if (count > 30 && fields[30] != NULL) {
+        const char *stamp = fields[30];
+        size_t len = strlen(stamp);
+        if (len >= 14 && strchr(stamp, '/') == NULL) {
+            snprintf(out->updated, sizeof(out->updated), "%.2s:%.2s", stamp + 8, stamp + 10);
+        } else if (len >= 16) {
+            snprintf(out->updated, sizeof(out->updated), "%.5s", stamp + 11);
+        }
+    }
+
+    out->valid = out->price > 0.0f;
+    free(response);
+    return out->valid ? ESP_OK : ESP_FAIL;
+}
+
+/* Intraday: {"data":{"<code>":{"data":{"data":["0930 22.57 5413 ...", ...]
+ * A full session runs ~9 KB, so this uses the large PSRAM response buffer
+ * rather than the 4 KB one shared by the other feeds. */
+static esp_err_t stock_fetch_trend(const char *code, stock_data_t *out)
+{
+    stock_response_t *response = stock_response_alloc();
+    if (response == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    char url[128];
+    snprintf(url, sizeof(url),
+             "http://web.ifzq.gtimg.cn/appstock/app/minute/query?code=%s", code);
+    esp_err_t ret = http_get_url_big(url, STOCK_HTTP_TIMEOUT_MS, response);
+    if (ret != ESP_OK) {
+        stock_response_free(response);
+        return ret;
+    }
+    /* Collect every "HHMM price ..." entry, then keep an evenly spaced
+     * subset - a full session is ~240 points for 60 pixels of chart. */
+    static float samples[256];
+    int total = 0;
+    const char *cursor = response->body;
+    while (total < (int)(sizeof(samples) / sizeof(samples[0]))) {
+        cursor = strchr(cursor, '"');
+        if (cursor == NULL) {
+            break;
+        }
+        cursor++;
+        /* Entries look like 0930 22.57 5413 12217141.00 */
+        if (!isdigit((unsigned char)cursor[0]) || cursor[4] != ' ') {
+            continue;
+        }
+        float price = strtof(cursor + 5, NULL);
+        if (price > 0.0f) {
+            samples[total++] = price;
+        }
+    }
+
+    if (total <= 0) {
+        stock_response_free(response);
+        return ESP_FAIL;
+    }
+
+    int wanted = total < STOCK_TREND_POINTS ? total : STOCK_TREND_POINTS;
+    for (int i = 0; i < wanted; i++) {
+        int src = wanted == 1 ? 0 : (i * (total - 1)) / (wanted - 1);
+        out->trend[i] = samples[src];
+    }
+    out->trend_count = wanted;
+
+    stock_response_free(response);
+    return ESP_OK;
+}
+
+/* Daily candles: {"data":{"<code>":{"qfqday":[["2026-07-28","22.57","22.93",
+ * "23.41","22.55","746405"], ...]}}} - date, open, close, high, low, volume. */
+static esp_err_t stock_fetch_kline(const char *code, stock_data_t *out)
+{
+    stock_response_t *response = stock_response_alloc();
+    if (response == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    char url[160];
+    snprintf(url, sizeof(url),
+             "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s,day,,,%d,qfq",
+             code, STOCK_KLINE_DAYS);
+    esp_err_t ret = http_get_url_big(url, STOCK_HTTP_TIMEOUT_MS, response);
+    if (ret != ESP_OK) {
+        stock_response_free(response);
+        return ret;
+    }
+
+    const char *cursor = strstr(response->body, "qfqday");
+    if (cursor == NULL) {
+        cursor = strstr(response->body, "day");
+    }
+    if (cursor == NULL) {
+        stock_response_free(response);
+        return ESP_FAIL;
+    }
+
+    out->k_count = 0;
+    while (out->k_count < STOCK_KLINE_DAYS) {
+        /* Each candle starts with its quoted date. */
+        cursor = strstr(cursor, "[\"");
+        if (cursor == NULL) {
+            break;
+        }
+        cursor += 2;
+        const char *date_end = strchr(cursor, '"');
+        if (date_end == NULL || date_end - cursor < 8) {
+            continue;
+        }
+
+        /* Then four quoted numbers: open, close, high, low. */
+        float values[4];
+        const char *scan = date_end + 1;
+        bool ok = true;
+        for (int i = 0; i < 4; i++) {
+            scan = strchr(scan, '"');
+            if (scan == NULL) {
+                ok = false;
+                break;
+            }
+            values[i] = strtof(scan + 1, NULL);
+            scan = strchr(scan + 1, '"');
+            if (scan == NULL) {
+                ok = false;
+                break;
+            }
+            scan++;
+        }
+        if (!ok) {
+            break;
+        }
+
+        int i = out->k_count;
+        out->k_open[i] = values[0];
+        out->k_close[i] = values[1];
+        out->k_high[i] = values[2];
+        out->k_low[i] = values[3];
+        out->k_count++;
+        cursor = scan;
+    }
+
+    stock_response_free(response);
+    return out->k_count > 0 ? ESP_OK : ESP_FAIL;
 }
 
 static esp_err_t fetch_agent_status(agent_status_t *status)
@@ -4982,11 +5667,14 @@ static bool dechunk_http_body(char *body, int *length)
     return true;
 }
 
-static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bundle,
-                              http_response_t *response)
+/* Core fetcher on a caller-supplied buffer, so the same socket and chunk
+ * handling serves both the shared 4 KB response and the larger PSRAM
+ * buffer the stock feeds need. */
+static esp_err_t http_get_into(const char *url, int timeout_ms, char *buf,
+                               size_t buf_size, int *length)
 {
-    (void)use_crt_bundle;
-    memset(response, 0, sizeof(*response));
+    *length = 0;
+    buf[0] = '\0';
 
     const char *scheme = "http://";
     size_t scheme_len = strlen(scheme);
@@ -5047,6 +5735,11 @@ static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bund
     };
     (void)setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     (void)setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    /* Release the descriptor on close instead of parking it in TIME_WAIT:
+     * several pollers share a small socket pool, and a stale queue there
+     * starves later fetches with ENOBUFS. */
+    struct linger no_linger = {.l_onoff = 1, .l_linger = 0};
+    (void)setsockopt(sock, SOL_SOCKET, SO_LINGER, &no_linger, sizeof(no_linger));
 
     ESP_LOGI(TAG, "Connecting weather host %s:%s", host, port_text);
     if (connect(sock, result->ai_addr, result->ai_addrlen) != 0) {
@@ -5084,12 +5777,12 @@ static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bund
         sent_total += sent;
     }
 
-    while (response->length < (int)sizeof(response->body) - 1) {
-        int room = (int)sizeof(response->body) - response->length - 1;
-        int received = recv(sock, response->body + response->length, room, 0);
+    while (*length < (int)buf_size - 1) {
+        int room = (int)buf_size - *length - 1;
+        int received = recv(sock, buf + *length, room, 0);
         if (received > 0) {
-            response->length += received;
-            response->body[response->length] = '\0';
+            *length += received;
+            buf[*length] = '\0';
             continue;
         }
         if (received == 0) {
@@ -5104,33 +5797,33 @@ static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bund
     }
     close(sock);
 
-    if (response->length == 0) {
+    if (*length == 0) {
         ESP_LOGW(TAG, "Weather HTTP timeout/no data");
         return ESP_ERR_TIMEOUT;
     }
 
     int status_code = 0;
-    if (sscanf(response->body, "HTTP/%*s %d", &status_code) != 1) {
+    if (sscanf(buf, "HTTP/%*s %d", &status_code) != 1) {
         ESP_LOGW(TAG, "Weather HTTP response missing status line");
         return ESP_FAIL;
     }
 
-    char *body = strstr(response->body, "\r\n\r\n");
+    char *body = strstr(buf, "\r\n\r\n");
     if (body == NULL) {
         ESP_LOGW(TAG, "Weather HTTP response missing body");
         return ESP_FAIL;
     }
     *body = '\0';
-    bool chunked = http_headers_have_chunked(response->body);
+    bool chunked = http_headers_have_chunked(buf);
     *body = '\r';
     body += 4;
-    size_t header_len = (size_t)(body - response->body);
-    size_t body_len = (size_t)response->length - header_len;
-    memmove(response->body, body, body_len);
-    response->body[body_len] = '\0';
-    response->length = (int)body_len;
+    size_t header_len = (size_t)(body - buf);
+    size_t body_len = (size_t)*length - header_len;
+    memmove(buf, body, body_len);
+    buf[body_len] = '\0';
+    *length = (int)body_len;
 
-    if (chunked && !dechunk_http_body(response->body, &response->length)) {
+    if (chunked && !dechunk_http_body(buf, length)) {
         ESP_LOGW(TAG, "Weather HTTP dechunk failed");
         return ESP_FAIL;
     }
@@ -5140,8 +5833,23 @@ static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bund
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Weather HTTP OK, %d bytes", response->length);
+    ESP_LOGD(TAG, "HTTP OK, %d bytes", *length);
     return ESP_OK;
+}
+
+static esp_err_t http_get_url(const char *url, int timeout_ms, bool use_crt_bundle,
+                              http_response_t *response)
+{
+    (void)use_crt_bundle;
+    return http_get_into(url, timeout_ms, response->body, sizeof(response->body),
+                         &response->length);
+}
+
+static esp_err_t http_get_url_big(const char *url, int timeout_ms,
+                                  stock_response_t *response)
+{
+    return http_get_into(url, timeout_ms, response->body, sizeof(response->body),
+                         &response->length);
 }
 
 static esp_err_t fetch_weather(weather_data_t *weather)
@@ -6060,6 +6768,78 @@ static void render_music_bars_locked(const float *levels, const float *peaks)
     }
 }
 
+static void request_stock_refresh(void)
+{
+    if (s_wifi_event_group != NULL) {
+        xEventGroupSetBits(s_wifi_event_group, STOCK_REFRESH_REQUEST_BIT);
+    }
+}
+
+/* Poll fast while any covered market is open, slowly otherwise. Covers the
+ * A-share and HK sessions together (09:15-16:10 local) plus a margin. */
+static bool stock_market_hours(void)
+{
+    struct tm now;
+    get_local_clock(&now);
+    if (now.tm_wday == 0 || now.tm_wday == 6) {
+        return false;
+    }
+    int minutes = now.tm_hour * 60 + now.tm_min;
+    return minutes >= (9 * 60 + 15) && minutes <= (16 * 60 + 10);
+}
+
+static void stock_task(void *arg)
+{
+    (void)arg;
+
+    while (true) {
+        if (s_wifi_event_group == NULL || !wifi_configured()) {
+            render_stock("未配网");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
+        EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
+        if ((bits & WIFI_CONNECTED_BIT) == 0) {
+            render_stock("等待网络");
+            (void)xEventGroupWaitBits(s_wifi_event_group,
+                                      WIFI_CONNECTED_BIT | STOCK_REFRESH_REQUEST_BIT,
+                                      pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
+            continue;
+        }
+
+        if (s_stock_count <= 0) {
+            render_stock("未设置代码");
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            continue;
+        }
+
+        const char *code = s_stock_codes[s_stock_index];
+        stock_data_t fetched = {0};
+        esp_err_t ret = stock_fetch_quote(code, &fetched);
+        if (ret == ESP_OK) {
+            /* Charts are optional: a quote alone is still worth showing. */
+            if (stock_fetch_trend(code, &fetched) != ESP_OK) {
+                fetched.trend_count = 0;
+            }
+            if (stock_fetch_kline(code, &fetched) != ESP_OK) {
+                fetched.k_count = 0;
+            }
+            s_stock_data = fetched;
+            ESP_LOGI(TAG, "Stock %s %.2f %+.2f%% trend=%d k=%d", code, fetched.price,
+                     fetched.change_pct, fetched.trend_count, fetched.k_count);
+            render_stock(NULL);
+        } else {
+            ESP_LOGW(TAG, "Stock fetch failed for %s: %s", code, esp_err_to_name(ret));
+            render_stock("行情获取失败");
+        }
+
+        uint32_t wait = stock_market_hours() ? STOCK_POLL_OPEN_MS : STOCK_POLL_CLOSED_MS;
+        (void)xEventGroupWaitBits(s_wifi_event_group, STOCK_REFRESH_REQUEST_BIT, pdTRUE,
+                                  pdFALSE, pdMS_TO_TICKS(wait));
+    }
+}
+
 static void music_audio_task(void *arg)
 {
     (void)arg;
@@ -6663,6 +7443,9 @@ void app_main(void)
     }
     if (xTaskCreate(music_audio_task, "music_audio", 4096, NULL, 5, NULL) != pdPASS) {
         ESP_LOGW(TAG, "Music audio task create failed");
+    }
+    if (xTaskCreate(stock_task, "stock_task", 5120, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "Stock task create failed");
     }
     xTaskCreate(screenshot_console_task, "shot_console", SCREENSHOT_CMD_TASK_STACK, NULL, 2,
                 NULL);

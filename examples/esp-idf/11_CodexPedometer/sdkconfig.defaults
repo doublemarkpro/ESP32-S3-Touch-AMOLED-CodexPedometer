@@ -70,3 +70,10 @@ CONFIG_LV_USE_IMGFONT=y
 CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 
 CONFIG_LWIP_SNTP_STARTUP_DELAY=n
+
+# Several pollers (agent 2s, stock, weather, codex) plus the config
+# server share the socket pool; the default 10 with a 60s TIME_WAIT
+# runs out and fetches start failing with ENOBUFS.
+CONFIG_LWIP_MAX_SOCKETS=16
+CONFIG_LWIP_TCP_MSL=10000
+CONFIG_LWIP_SO_LINGER=y
