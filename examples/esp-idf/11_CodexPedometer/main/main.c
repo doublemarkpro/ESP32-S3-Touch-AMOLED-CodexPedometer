@@ -3515,32 +3515,16 @@ static void create_stock_page(lv_obj_t *parent)
     }
 }
 
-/* Two beamed eighth notes, drawn from primitives: a bitmap font symbol would
- * be stuck at one size and LVGL's own symbol set has no note. */
+/* Beamed double note, in the same Lucide family as the other page icons.
+ * The artwork is white, so the theme colour comes from a recolor. */
 static void create_music_note_icon(lv_obj_t *parent, int32_t center_y)
 {
-    uint32_t accent = s_theme_color[THEME_MUSIC];
-
-    static const struct {
-        int32_t x, y, w, h, radius;
-    } parts[] = {
-        {-20, 14, 22, 16, 8},   /* left note head  */
-        {14, 8, 22, 16, 8},     /* right note head */
-        {-11, -3, 4, 20, 2},    /* left stem       */
-        {23, -9, 4, 20, 2},     /* right stem      */
-        {6, -14, 30, 5, 2},     /* beam            */
-    };
-
-    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
-        lv_obj_t *part = lv_obj_create(parent);
-        lv_obj_remove_style_all(part);
-        lv_obj_set_size(part, parts[i].w, parts[i].h);
-        lv_obj_align(part, LV_ALIGN_CENTER, parts[i].x, center_y + parts[i].y);
-        lv_obj_set_style_radius(part, parts[i].radius, 0);
-        lv_obj_set_style_bg_color(part, lv_color_hex(accent), 0);
-        lv_obj_set_style_bg_opa(part, LV_OPA_COVER, 0);
-        lv_obj_clear_flag(part, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-    }
+    lv_obj_t *icon = lv_image_create(parent);
+    lv_image_set_src(icon, &ui_icon_music);
+    lv_obj_align(icon, LV_ALIGN_CENTER, 0, center_y);
+    lv_obj_set_style_image_recolor(icon, lv_color_hex(s_theme_color[THEME_MUSIC]), 0);
+    lv_obj_set_style_image_recolor_opa(icon, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(icon, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 }
 
 static void create_music_page(lv_obj_t *parent)
@@ -3563,7 +3547,8 @@ static void create_music_page(lv_obj_t *parent)
     lv_obj_set_style_arc_color(s_music_ui.vu_arc,
                                lv_color_hex(s_theme_color[THEME_MUSIC]), LV_PART_INDICATOR);
 
-    create_music_note_icon(s_music_ui.page, UI_MAIN_ICON_CENTER_Y - 8);
+    /* Clear of the caption at -118: the icon is 56 px tall. */
+    create_music_note_icon(s_music_ui.page, -168);
 
     /* Caption sits high so the tallest bars never crowd it. */
     lv_obj_t *caption = create_label(s_music_ui.page, tr("音乐", "MUSIC"), FONT_TITLE,
