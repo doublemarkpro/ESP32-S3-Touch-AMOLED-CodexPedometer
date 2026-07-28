@@ -216,10 +216,10 @@
 #define UI_VALUE_CENTER_Y -8
 #define UI_GOAL_CENTER_Y 52
 #define UI_STATUS_CENTER_Y 86
-#define UI_METRIC_COL_OFS 117
+#define UI_METRIC_COL_OFS 104
 #define UI_METRIC_ICON_CENTER_Y 107
-#define UI_METRIC_VALUE_CENTER_Y 133
-#define UI_METRIC_LABEL_CENTER_Y 155
+#define UI_METRIC_VALUE_CENTER_Y 126
+#define UI_METRIC_LABEL_CENTER_Y 148
 #define UI_UPDATED_CENTER_Y 172
 /* Agent page keeps its timestamp directly under the state word. */
 #define UI_AGENT_UPDATED_CENTER_Y 26
@@ -446,7 +446,7 @@ typedef struct {
     float low;
     float change;
     float change_pct;
-    float volume_lots;   /* 手 */
+    float turnover_rate; /* percent of float traded today */
     float turnover_yi;   /* 成交额, 亿 */
     char updated[8];     /* HH:MM */
     bool valid;
@@ -640,6 +640,15 @@ static volatile float s_board_temp_c = BOARD_TEMP_INVALID;
 static volatile bool s_ntp_resync_requested;
 static uint8_t s_corner_widget[4] = {CW_BATTERY, CW_TEMP, CW_WEEKDAY, CW_DATE};
 static uint8_t s_watchface = FACE_INFOGRAPH;
+/* UI language. Values that come from a Chinese feed (city, weather words)
+ * follow this; tickers and numbers never change. */
+static bool s_lang_chinese = true;
+
+/* Pick between a Chinese and an English label. */
+static const char *tr(const char *zh, const char *en)
+{
+    return s_lang_chinese ? zh : en;
+}
 
 /* Ring accent colors, adjustable from the provisioning web page. The AI ring
  * is deliberately absent: its color IS the state. */
@@ -671,6 +680,7 @@ typedef struct {
     lv_obj_t *standby_checkbox;
     lv_obj_t *standby_slider;
     lv_obj_t *face_buttons[FACE_COUNT];
+    lv_obj_t *lang_buttons[2];
     lv_obj_t *ip_label;
 } settings_ui_t;
 
@@ -711,6 +721,7 @@ static esp_err_t request_ntp_sync(void);
 static void show_settings_panel(bool show);
 static void agent_refresh_lamp(void);
 static void request_stock_refresh(void);
+static void create_app_ui(void);
 static void stock_parse_config(const char *text);
 static void stock_format_config(char *out, size_t out_size);
 static void render_stock_locked(const char *status_text);
@@ -722,6 +733,7 @@ static void save_ui_settings(void);
 static bool corner_handle_tap(lv_point_t point);
 static void rebuild_watchface_locked(void);
 static void settings_face_event_cb(lv_event_t *event);
+static void settings_language_event_cb(lv_event_t *event);
 static bool weather_icon_hit(lv_point_t point);
 static void show_forecast_page(bool show);
 static void render_forecast_locked(void);
@@ -900,6 +912,13 @@ static bool lookup_weather_city_code(const char *city, char *city_code, size_t c
 
 static void build_weather_display_city(const char *city, char *out, size_t out_size)
 {
+    /* In Chinese mode the configured name is already what we want to show;
+     * the font covers it now, so there is no reason to romanise it. */
+    if (s_lang_chinese && city != NULL && city[0] != '\0') {
+        copy_string(out, out_size, city);
+        return;
+    }
+
     double unused_latitude = 0.0;
     double unused_longitude = 0.0;
     if (lookup_weather_city_preset(city, &unused_latitude, &unused_longitude, out, out_size)) {
@@ -908,7 +927,8 @@ static void build_weather_display_city(const char *city, char *out, size_t out_s
     if (has_non_ascii(city)) {
         copy_string(out, out_size, "China City");
     } else {
-        copy_string(out, out_size, city != NULL && city[0] != '\0' ? city : "Weather");
+        copy_string(out, out_size,
+                    city != NULL && city[0] != '\0' ? city : tr("天气", "Weather"));
     }
 }
 
@@ -1021,6 +1041,9 @@ static void load_ui_settings(void)
     if (nvs_get_u8(nvs, "face", &value) == ESP_OK && value < FACE_COUNT) {
         s_watchface = value;
     }
+    if (nvs_get_u8(nvs, "lang", &value) == ESP_OK) {
+        s_lang_chinese = value != 0;
+    }
     /* Stored as "code:name,code:name,..." so one key covers the whole list. */
     char stocks[STOCK_MAX_SYMBOLS * (STOCK_CODE_LEN + STOCK_NAME_LEN) + 8];
     size_t stocks_len = sizeof(stocks);
@@ -1051,6 +1074,7 @@ static void save_ui_settings(void)
         (void)nvs_set_u32(nvs, key, s_theme_color[i]);
     }
     (void)nvs_set_u8(nvs, "face", s_watchface);
+    (void)nvs_set_u8(nvs, "lang", s_lang_chinese ? 1 : 0);
     {
         char stocks[STOCK_MAX_SYMBOLS * (STOCK_CODE_LEN + STOCK_NAME_LEN) + 8];
         stock_format_config(stocks, sizeof(stocks));
@@ -1143,7 +1167,7 @@ static esp_err_t save_pedometer_goal(uint32_t goal_steps)
 
     if (ret == ESP_OK) {
         s_pedometer_goal_steps = goal_steps;
-        render_pedometer(s_step_count, 0, "Goal saved");
+        render_pedometer(s_step_count, 0, tr("目标已保存", "Goal saved"));
     }
     return ret;
 }
@@ -1280,9 +1304,37 @@ static void set_default_clock(void)
     settimeofday(&tv, NULL);
 }
 
+/* Montserrat carries no hanzi, so a translated caption has to fall back to
+ * one of the two CJK cuts. Pick the one closest to the size the layout was
+ * drawn for. */
+static const lv_font_t *cjk_font_for(const lv_font_t *latin)
+{
+    if (latin == NULL) {
+        return FONT_CJK;
+    }
+    return latin->line_height >= 24 ? FONT_CJK_LARGE : FONT_CJK;
+}
+
+/* For labels whose text only turns Chinese later, at render time: the font is
+ * fixed when the label is built, so it has to be chosen by language. */
+static const lv_font_t *lang_font(const lv_font_t *latin)
+{
+    return s_lang_chinese ? cjk_font_for(latin) : latin;
+}
+
 static lv_obj_t *create_label(lv_obj_t *parent, const char *text, const lv_font_t *font,
                               lv_color_t color)
 {
+    /* Any caption that came back from tr() as Chinese silently gets the CJK
+     * face here, so call sites do not each have to think about it. Only swap
+     * when the CJK cut can actually draw the string - LV_SYMBOL icons live in
+     * Montserrat and would turn into boxes otherwise. */
+    if (!text_glyphs_available(font, text)) {
+        const lv_font_t *cjk = cjk_font_for(font);
+        if (text_glyphs_available(cjk, text)) {
+            font = cjk;
+        }
+    }
     lv_obj_t *label = lv_label_create(parent);
     lv_label_set_text(label, text);
     lv_obj_set_style_text_font(label, font, 0);
@@ -1389,7 +1441,7 @@ static void create_status_bar(lv_obj_t *parent)
     lv_obj_set_style_bg_opa(s_status_ui.separator, LV_OPA_70, 0);
     lv_obj_clear_flag(s_status_ui.separator, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
-    s_status_ui.title_label = create_label(parent, "QMI8658", FONT_MEDIUM, lv_color_hex(0xF7FBFF));
+    s_status_ui.title_label = create_label(parent, tr("计步", "STEPS"), lang_font(FONT_MEDIUM), lv_color_hex(0xF7FBFF));
     lv_obj_set_size(s_status_ui.title_label, 90, 24);
     lv_obj_set_style_text_align(s_status_ui.title_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_status_ui.title_label, LV_LABEL_LONG_CLIP);
@@ -1440,19 +1492,19 @@ static void update_status_bar_locked(void)
     snprintf(time_text, sizeof(time_text), "%02d:%02d", local_time.tm_hour, local_time.tm_min);
     set_label_text_if_changed(s_status_ui.time_label, time_text);
 
-    const char *title = "TIME";
+    const char *title = tr("时间", "TIME");
     if (s_current_page == APP_PAGE_WEATHER) {
-        title = "WEATHER";
+        title = tr("天气", "WEATHER");
     } else if (s_current_page == APP_PAGE_PEDOMETER) {
-        title = "QMI8658";
+        title = tr("计步", "STEPS");
     } else if (s_current_page == APP_PAGE_CODEX) {
         title = "Codex";
     } else if (s_current_page == APP_PAGE_AGENT) {
         title = "AI";
     } else if (s_current_page == APP_PAGE_MUSIC) {
-        title = "MUSIC";
+        title = tr("音乐", "MUSIC");
     } else if (s_current_page == APP_PAGE_STOCK) {
-        title = "STOCK";
+        title = tr("股票", "STOCK");
     }
     set_label_text_if_changed(s_status_ui.title_label, title);
 }
@@ -1516,7 +1568,7 @@ static lv_obj_t *create_metric_column(lv_obj_t *parent, int32_t x_ofs, bool with
     /* Captions may be Chinese now, and Montserrat has no CJK - pick the font
      * that can actually draw what was passed in. */
     const lv_font_t *caption_font =
-        text_glyphs_available(FONT_SMALL, label_text) ? FONT_SMALL : FONT_CJK;
+        text_glyphs_available(FONT_SMALL, label_text) ? FONT_SMALL : cjk_font_for(FONT_SMALL);
     lv_obj_t *title_label = create_label(parent, label_text, caption_font,
                                          lv_color_hex(0x9AA7B5));
     lv_obj_align(title_label, LV_ALIGN_CENTER, x_ofs, UI_METRIC_LABEL_CENTER_Y);
@@ -1801,7 +1853,7 @@ static void page_nav_event_cb(lv_event_t *event)
                 if (s_stock_count > 0) {
                     s_stock_index = (s_stock_index + 1) % s_stock_count;
                     memset(&s_stock_data, 0, sizeof(s_stock_data));
-                    render_stock_locked("载入中");
+                    render_stock_locked(tr("载入中", "Loading"));
                     request_stock_refresh();
                 }
             }
@@ -1809,7 +1861,7 @@ static void page_nav_event_cb(lv_event_t *event)
                    abs_dx < PAGE_SWIPE_MIN_PX && abs_dy < PAGE_SWIPE_MIN_PX) {
             /* Short tap toggles between the intraday line and daily candles. */
             s_stock_kline_view = !s_stock_kline_view;
-            render_stock_locked(s_stock_kline_view ? "20日K线  ·  轻点返回" : NULL);
+            render_stock_locked(s_stock_kline_view ? tr("20日K线  ·  轻点返回", "20d candles - tap back") : NULL);
         } else if (s_current_page == APP_PAGE_TIME && corner_handle_tap(release_point)) {
             /* Tap on a watch-face corner cycles that complication instead of
              * switching pages. */
@@ -1987,11 +2039,22 @@ static lv_obj_t *create_corner_gauge(lv_obj_t *parent, int32_t x_ofs, int32_t y_
 
 static const char *weekday_short_cn(int wday)
 {
-    static const char *const days[] = {"日", "一", "二", "三", "四", "五", "六"};
+    static const char *const zh[] = {"日", "一", "二", "三", "四", "五", "六"};
+    static const char *const en[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
     if (wday < 0 || wday > 6) {
         return "-";
     }
-    return days[wday];
+    return s_lang_chinese ? zh[wday] : en[wday];
+}
+
+static const char *month_short_en(int mon)
+{
+    static const char *const months[] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                                         "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
+    if (mon < 0 || mon > 11) {
+        return "--";
+    }
+    return months[mon];
 }
 
 static int days_in_month(int year, int month)
@@ -2047,13 +2110,13 @@ static void corner_apply_widget_locked(int corner)
 
     switch (type) {
     case CW_BATTERY:
-        caption_text = "电量";
+        caption_text = tr("电量", "BATT");
         break;
     case CW_TEMP:
         arc_color = s_theme_color[THEME_TEMP];
         range_min = -10;
         range_max = 50;
-        caption_text = "温度";
+        caption_text = tr("温度", "TEMP");
         break;
     case CW_WEEKDAY:
         /* Ring fills wday/7; the single weekday character sits inside. */
@@ -2061,7 +2124,7 @@ static void corner_apply_widget_locked(int corner)
         range_max = 7;
         value_font = FONT_CJK;
         value_color = s_theme_color[THEME_WEEKDAY];
-        caption_text = "星期";
+        caption_text = tr("星期", "WEEK");
         break;
     case CW_DATE:
         /* Ring fills day/days-in-month; caption doubles as the month. */
@@ -2075,7 +2138,7 @@ static void corner_apply_widget_locked(int corner)
          * forecast low..high; range is set per render. */
         arc_color = s_theme_color[THEME_WEATHER];
         value_font = FONT_MEDIUM;
-        caption_text = "天气";
+        caption_text = tr("天气", "WEATHER");
         caption_color = WATCH_COLOR_WEEKDAY;
         break;
     case CW_CODEX:
@@ -2158,7 +2221,11 @@ static void corner_render_widget_locked(int corner, const struct tm *local_time)
         if (lv_arc_get_value(arc) != local_time->tm_mday) {
             lv_arc_set_value(arc, local_time->tm_mday);
         }
-        snprintf(text, sizeof(text), "%d月", local_time->tm_mon + 1);
+        if (s_lang_chinese) {
+            snprintf(text, sizeof(text), "%d月", local_time->tm_mon + 1);
+        } else {
+            snprintf(text, sizeof(text), "%s", month_short_en(local_time->tm_mon));
+        }
         set_label_text_if_changed(caption, text);
         snprintf(text, sizeof(text), "%d", local_time->tm_mday);
         set_label_text_if_changed(value, text);
@@ -2180,13 +2247,14 @@ static void corner_render_widget_locked(int corner, const struct tm *local_time)
             }
             snprintf(text, sizeof(text), "%d°", s_last_weather.current_temp_c);
             set_label_text_if_changed(value, text);
-            const char *cond = text_glyphs_available(FONT_CJK, s_last_weather.condition)
-                                   ? s_last_weather.condition
-                                   : weather_condition_en(s_last_weather.weather_code);
+            const char *cond =
+                s_lang_chinese && text_glyphs_available(FONT_CJK, s_last_weather.condition)
+                    ? s_last_weather.condition
+                    : weather_condition_en(s_last_weather.weather_code);
             set_label_text_if_changed(caption, cond);
         } else {
             set_label_text_if_changed(value, "--");
-            set_label_text_if_changed(caption, "天气");
+            set_label_text_if_changed(caption, tr("天气", "WEATHER"));
         }
         break;
     case CW_CODEX: {
@@ -2540,7 +2608,7 @@ static void build_face_pixel_tiles(lv_obj_t *page)
                                              lv_color_hex(PX_BLUE_BRIGHT));
     lv_obj_set_parent(s_time_ui.corner_value[2], s_time_ui.tile_steps);
     lv_obj_align(s_time_ui.corner_value[2], LV_ALIGN_CENTER, 0, -9);
-    lv_obj_t *steps_cap = create_label(page, "STEPS", FONT_SMALL, lv_color_hex(PX_BLUE_DIM));
+    lv_obj_t *steps_cap = create_label(page, tr("步数", "STEPS"), FONT_SMALL, lv_color_hex(PX_BLUE_DIM));
     lv_obj_set_parent(steps_cap, s_time_ui.tile_steps);
     lv_obj_align(steps_cap, LV_ALIGN_CENTER, 0, 14);
 
@@ -2549,7 +2617,7 @@ static void build_face_pixel_tiles(lv_obj_t *page)
                                              lv_color_hex(PX_BLUE_TEXT));
     lv_obj_set_parent(s_time_ui.corner_value[0], s_time_ui.tile_batt);
     lv_obj_align(s_time_ui.corner_value[0], LV_ALIGN_CENTER, 0, -9);
-    lv_obj_t *batt_cap = create_label(page, "BATT", FONT_SMALL, lv_color_hex(PX_BLUE_DIM));
+    lv_obj_t *batt_cap = create_label(page, tr("电量", "BATT"), FONT_SMALL, lv_color_hex(PX_BLUE_DIM));
     lv_obj_set_parent(batt_cap, s_time_ui.tile_batt);
     lv_obj_align(batt_cap, LV_ALIGN_CENTER, 0, 14);
 
@@ -2817,7 +2885,7 @@ static void create_weather_page(lv_obj_t *parent)
                                LV_PART_INDICATOR);
 
     /* City sits below the condition text so the icon has the top to itself. */
-    s_weather_ui.city_label = create_label(s_weather_ui.page, "Qingdao", FONT_CJK,
+    s_weather_ui.city_label = create_label(s_weather_ui.page, "--", FONT_CJK,
                                            lv_color_hex(0x8DDFFF));
     lv_obj_set_width(s_weather_ui.city_label, 280);
     lv_obj_set_style_text_align(s_weather_ui.city_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -2826,7 +2894,7 @@ static void create_weather_page(lv_obj_t *parent)
 
     s_weather_ui.icon_bg = create_weather_icon_visual(s_weather_ui.page);
 
-    lv_obj_t *caption = create_label(s_weather_ui.page, "WEATHER", FONT_TITLE,
+    lv_obj_t *caption = create_label(s_weather_ui.page, tr("天气", "WEATHER"), FONT_TITLE,
                                      lv_color_hex(0xE6EDF5));
     lv_obj_align(caption, LV_ALIGN_CENTER, 0, -50);
 
@@ -2851,7 +2919,7 @@ static void create_weather_page(lv_obj_t *parent)
     lv_label_set_long_mode(s_weather_ui.range_label, LV_LABEL_LONG_CLIP);
     lv_obj_align(s_weather_ui.range_label, LV_ALIGN_CENTER, 0, UI_STATUS_CENTER_Y);
 
-    s_weather_ui.status_label = create_label(s_weather_ui.page, "Open setup AP", FONT_SMALL,
+    s_weather_ui.status_label = create_label(s_weather_ui.page, tr("打开配网热点", "Open setup AP"), FONT_SMALL,
                                              lv_color_hex(0x92A0AD));
     lv_obj_set_width(s_weather_ui.status_label, 320);
     lv_obj_set_style_text_align(s_weather_ui.status_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -2860,13 +2928,13 @@ static void create_weather_page(lv_obj_t *parent)
 
     s_weather_ui.low_value_label =
         create_metric_column(s_weather_ui.page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED,
-                             "LOW", "--");
+                             tr("低温", "LOW"), "--");
     s_weather_ui.code_value_label =
         create_metric_column(s_weather_ui.page, 0, false, METRIC_ICON_LEFT,
-                             "UPDATE", "--");
+                             tr("更新", "UPDATE"), "--");
     s_weather_ui.high_value_label =
         create_metric_column(s_weather_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT,
-                             "HIGH", "--");
+                             tr("高温", "HIGH"), "--");
 
     s_weather_ui.updated_label = create_label(s_weather_ui.page, "", FONT_SMALL,
                                               lv_color_hex(0x63717F));
@@ -2899,7 +2967,7 @@ static void create_pedometer_page(lv_obj_t *parent)
 
     s_pedometer_ui.main_icon = create_main_icon(s_pedometer_ui.page, &ui_icon_steps);
 
-    lv_obj_t *steps_caption = create_label(s_pedometer_ui.page, "STEPS", FONT_TITLE,
+    lv_obj_t *steps_caption = create_label(s_pedometer_ui.page, tr("步数", "STEPS"), FONT_TITLE,
                                             lv_color_hex(0xE6EDF5));
     lv_obj_align(steps_caption, LV_ALIGN_CENTER, 0, UI_CAPTION_CENTER_Y);
 
@@ -2910,25 +2978,25 @@ static void create_pedometer_page(lv_obj_t *parent)
     lv_label_set_long_mode(s_pedometer_ui.steps_label, LV_LABEL_LONG_CLIP);
     lv_obj_align(s_pedometer_ui.steps_label, LV_ALIGN_CENTER, 0, UI_VALUE_CENTER_Y);
 
-    s_pedometer_ui.goal_label = create_label(s_pedometer_ui.page, "0% OF 12K", FONT_MEDIUM,
+    s_pedometer_ui.goal_label = create_label(s_pedometer_ui.page, "--", lang_font(FONT_MEDIUM),
                                              lv_color_hex(0x9DFF35));
     lv_obj_set_width(s_pedometer_ui.goal_label, 260);
     lv_obj_set_style_text_align(s_pedometer_ui.goal_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_pedometer_ui.goal_label, LV_LABEL_LONG_CLIP);
     lv_obj_align(s_pedometer_ui.goal_label, LV_ALIGN_CENTER, 0, UI_GOAL_CENTER_Y);
 
-    s_pedometer_ui.status_label = create_label(s_pedometer_ui.page, "Waiting for QMI8658",
+    s_pedometer_ui.status_label = create_label(s_pedometer_ui.page, tr("等待传感器", "Waiting for QMI8658"),
                                                 FONT_SMALL, lv_color_hex(0x92A0AD));
     lv_obj_align(s_pedometer_ui.status_label, LV_ALIGN_CENTER, 0, UI_STATUS_CENTER_Y);
 
     s_pedometer_ui.distance_value_label =
         create_metric_column(s_pedometer_ui.page, -UI_METRIC_COL_OFS, true, METRIC_ICON_PIN,
-                             "DIST", "0.0");
+                             tr("距离", "DIST"), "0.0");
     s_pedometer_ui.calories_value_label =
-        create_metric_column(s_pedometer_ui.page, 0, true, METRIC_ICON_FLAME, "KCAL", "0");
+        create_metric_column(s_pedometer_ui.page, 0, true, METRIC_ICON_FLAME, tr("千卡", "KCAL"), "0");
     s_pedometer_ui.motion_value_label =
         create_metric_column(s_pedometer_ui.page, UI_METRIC_COL_OFS, true, METRIC_ICON_HEART,
-                             "MOVE", "0");
+                             tr("活动", "MOVE"), "0");
 }
 
 static void create_codex_page(lv_obj_t *parent)
@@ -2969,7 +3037,7 @@ static void create_codex_page(lv_obj_t *parent)
     lv_label_set_long_mode(s_codex_ui.label_label, LV_LABEL_LONG_DOT);
     lv_obj_align(s_codex_ui.label_label, LV_ALIGN_CENTER, 0, UI_STATUS_CENTER_Y);
 
-    s_codex_ui.status_label = create_label(s_codex_ui.page, "Wi-Fi not configured", FONT_SMALL,
+    s_codex_ui.status_label = create_label(s_codex_ui.page, tr("未配置 Wi-Fi", "Wi-Fi not configured"), FONT_SMALL,
                                             lv_color_hex(0x92A0AD));
     lv_obj_set_width(s_codex_ui.status_label, 340);
     lv_obj_set_style_text_align(s_codex_ui.status_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -2978,14 +3046,14 @@ static void create_codex_page(lv_obj_t *parent)
 
     s_codex_ui.used_value_label =
         create_metric_column(s_codex_ui.page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED,
-                             "USED", "0");
+                             tr("已用", "USED"), "0");
     s_codex_ui.limit_value_label =
-        create_metric_column(s_codex_ui.page, 0, false, METRIC_ICON_LIMIT, "LIMIT", "500K");
+        create_metric_column(s_codex_ui.page, 0, false, METRIC_ICON_LIMIT, tr("上限", "LIMIT"), "500K");
     s_codex_ui.left_value_label =
         create_metric_column(s_codex_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LEFT,
-                             "LEFT", "500K");
+                             tr("剩余", "LEFT"), "500K");
 
-    s_codex_ui.updated_label = create_label(s_codex_ui.page, "Updated boot", FONT_SMALL,
+    s_codex_ui.updated_label = create_label(s_codex_ui.page, "", FONT_SMALL,
                                              lv_color_hex(0x63717F));
     lv_obj_set_width(s_codex_ui.updated_label, 280);
     lv_obj_set_style_text_align(s_codex_ui.updated_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -3014,15 +3082,15 @@ static const char *agent_state_text(agent_state_t state)
 {
     switch (state) {
     case AGENT_STATE_IDLE:
-        return "IDLE";
+        return tr("空闲", "IDLE");
     case AGENT_STATE_WORKING:
-        return "WORKING";
+        return tr("工作中", "WORKING");
     case AGENT_STATE_WAITING:
-        return "WAITING";
+        return tr("等待确认", "WAITING");
     case AGENT_STATE_ERROR:
-        return "ERROR";
+        return tr("出错", "ERROR");
     case AGENT_STATE_DONE:
-        return "DONE";
+        return tr("完成", "DONE");
     default:
         return "--";
     }
@@ -3032,15 +3100,15 @@ static const char *agent_state_short(agent_state_t state)
 {
     switch (state) {
     case AGENT_STATE_IDLE:
-        return "idle";
+        return tr("空闲", "idle");
     case AGENT_STATE_WORKING:
-        return "busy";
+        return tr("工作", "busy");
     case AGENT_STATE_WAITING:
-        return "wait";
+        return tr("等待", "wait");
     case AGENT_STATE_ERROR:
-        return "err";
+        return tr("出错", "err");
     case AGENT_STATE_DONE:
-        return "done";
+        return tr("完成", "done");
     default:
         return "--";
     }
@@ -3174,11 +3242,11 @@ static void create_agent_page(lv_obj_t *parent)
     lv_obj_set_style_arc_color(s_agent_ui.ring, lv_color_hex(agent_state_color(AGENT_STATE_UNKNOWN)),
                                LV_PART_INDICATOR);
 
-    s_agent_ui.title_label = create_label(s_agent_ui.page, "AI STATUS", FONT_TITLE,
+    s_agent_ui.title_label = create_label(s_agent_ui.page, tr("AI 状态", "AI STATUS"), FONT_TITLE,
                                           lv_color_hex(0xE6EDF5));
     lv_obj_align(s_agent_ui.title_label, LV_ALIGN_CENTER, 0, UI_MAIN_ICON_CENTER_Y);
 
-    s_agent_ui.state_label = create_label(s_agent_ui.page, "--", FONT_VALUE,
+    s_agent_ui.state_label = create_label(s_agent_ui.page, "--", lang_font(FONT_VALUE),
                                           lv_color_hex(0xF7FBFF));
     lv_obj_set_width(s_agent_ui.state_label, 320);
     lv_obj_set_style_text_align(s_agent_ui.state_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -3200,7 +3268,7 @@ static void create_agent_page(lv_obj_t *parent)
     lv_label_set_long_mode(s_agent_ui.target_label, LV_LABEL_LONG_DOT);
     lv_obj_align(s_agent_ui.target_label, LV_ALIGN_CENTER, 0, UI_GOAL_CENTER_Y);
 
-    s_agent_ui.detail_label = create_label(s_agent_ui.page, "Bridge offline", FONT_SMALL,
+    s_agent_ui.detail_label = create_label(s_agent_ui.page, tr("桥接离线", "Bridge offline"), FONT_SMALL,
                                            lv_color_hex(0x92A0AD));
     lv_obj_set_width(s_agent_ui.detail_label, 340);
     lv_obj_set_style_text_align(s_agent_ui.detail_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -3214,7 +3282,7 @@ static void create_agent_page(lv_obj_t *parent)
         create_metric_column(s_agent_ui.page, 0, false, METRIC_ICON_LEFT, "CLAUDE", "--");
     s_agent_ui.elapsed_value_label =
         create_metric_column(s_agent_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT,
-                             "FOR", "--");
+                             tr("时长", "FOR"), "--");
 
 }
 
@@ -3264,7 +3332,7 @@ static void create_forecast_page(lv_obj_t *parent)
     lv_obj_set_style_arc_color(s_forecast_ui.range_arc,
                                lv_color_hex(s_theme_color[THEME_WEATHER]), LV_PART_INDICATOR);
 
-    s_forecast_ui.day_label = create_label(page, "TODAY", FONT_MEDIUM,
+    s_forecast_ui.day_label = create_label(page, tr("今天", "TODAY"), lang_font(FONT_MEDIUM),
                                            lv_color_hex(0x8E99A5));
     lv_obj_set_style_text_letter_space(s_forecast_ui.day_label, 3, 0);
     lv_obj_align(s_forecast_ui.day_label, LV_ALIGN_CENTER, 0, -142);
@@ -3294,11 +3362,11 @@ static void create_forecast_page(lv_obj_t *parent)
      * under the temperature range so it is not repeated here. These three
      * carry Chinese values, so they switch to the CJK font. */
     s_forecast_ui.night_value_label =
-        create_metric_column(page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED, "夜间", "--");
+        create_metric_column(page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED, tr("夜间", "NIGHT"), "--");
     s_forecast_ui.wind_value_label =
-        create_metric_column(page, 0, false, METRIC_ICON_LEFT, "风向", "--");
+        create_metric_column(page, 0, false, METRIC_ICON_LEFT, tr("风向", "WIND"), "--");
     s_forecast_ui.force_value_label =
-        create_metric_column(page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT, "风力", "--");
+        create_metric_column(page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT, tr("风力", "FORCE"), "--");
     lv_obj_set_style_text_font(s_forecast_ui.night_value_label, FONT_CJK, 0);
     lv_obj_set_style_text_font(s_forecast_ui.wind_value_label, FONT_CJK, 0);
 
@@ -3396,16 +3464,15 @@ static void create_stock_page(lv_obj_t *parent)
 
     s_stock_ui.high_value_label =
         create_metric_column(s_stock_ui.page, -UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT,
-                             "最高", "--");
+                             tr("最高", "HIGH"), "--");
     s_stock_ui.low_value_label =
-        create_metric_column(s_stock_ui.page, 0, false, METRIC_ICON_USED, "最低", "--");
+        create_metric_column(s_stock_ui.page, 0, false, METRIC_ICON_USED,
+                             tr("最低", "LOW"), "--");
     s_stock_ui.vol_value_label =
         create_metric_column(s_stock_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LEFT,
-                             "成交", "--");
+                             tr("换手", "TURN"), "--");
 
-    lv_obj_set_style_text_font(s_stock_ui.vol_value_label, FONT_CJK, 0);
-
-    s_stock_ui.status_label = create_label(s_stock_ui.page, "等待行情", FONT_CJK,
+    s_stock_ui.status_label = create_label(s_stock_ui.page, tr("等待行情", "No quote"), FONT_CJK,
                                             lv_color_hex(0x63717F));
     lv_obj_set_width(s_stock_ui.status_label, 300);
     lv_obj_set_style_text_align(s_stock_ui.status_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -3446,7 +3513,7 @@ static void create_music_page(lv_obj_t *parent)
                                lv_color_hex(s_theme_color[THEME_MUSIC]), LV_PART_INDICATOR);
 
     /* Caption sits high so the tallest bars never crowd it. */
-    lv_obj_t *caption = create_label(s_music_ui.page, "MUSIC", FONT_TITLE,
+    lv_obj_t *caption = create_label(s_music_ui.page, tr("音乐", "MUSIC"), FONT_TITLE,
                                      lv_color_hex(0xE6EDF5));
     lv_obj_align(caption, LV_ALIGN_CENTER, 0, -118);
 
@@ -3485,12 +3552,12 @@ static void create_music_page(lv_obj_t *parent)
 
     s_music_ui.bass_value_label =
         create_metric_column(s_music_ui.page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED,
-                             "BASS", "--");
+                             tr("低音", "BASS"), "--");
     s_music_ui.vol_value_label =
-        create_metric_column(s_music_ui.page, 0, false, METRIC_ICON_LEFT, "VOL dB", "--");
+        create_metric_column(s_music_ui.page, 0, false, METRIC_ICON_LEFT, tr("音量 dB", "VOL dB"), "--");
     s_music_ui.treb_value_label =
         create_metric_column(s_music_ui.page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT,
-                             "TREB", "--");
+                             tr("高音", "TREB"), "--");
 }
 
 static void create_page_dots(lv_obj_t *parent)
@@ -3527,12 +3594,12 @@ static void create_page_dots(lv_obj_t *parent)
 static void settings_update_labels(void)
 {
     char text[32];
-    snprintf(text, sizeof(text), "BRIGHTNESS %d%%", s_cfg_brightness);
+    snprintf(text, sizeof(text), tr("亮度 %d%%", "BRIGHTNESS %d%%"), s_cfg_brightness);
     set_label_text_if_changed(s_settings_ui.brightness_label, text);
-    snprintf(text, sizeof(text), "VOLUME %d%%", s_cfg_volume);
+    snprintf(text, sizeof(text), tr("音量 %d%%", "VOLUME %d%%"), s_cfg_volume);
     set_label_text_if_changed(s_settings_ui.volume_label, text);
     if (s_settings_ui.standby_checkbox != NULL) {
-        snprintf(text, sizeof(text), "STANDBY %d MIN", s_cfg_standby_minutes);
+        snprintf(text, sizeof(text), tr("待机 %d 分钟", "STANDBY %d MIN"), s_cfg_standby_minutes);
         lv_checkbox_set_text(s_settings_ui.standby_checkbox, text);
     }
 
@@ -3541,7 +3608,7 @@ static void settings_update_labels(void)
         if (s_sta_ip[0] != '\0') {
             snprintf(line, sizeof(line), "IP  %s", s_sta_ip);
         } else if (wifi_configured()) {
-            snprintf(line, sizeof(line), "IP  connecting...");
+            snprintf(line, sizeof(line), tr("IP  连接中...", "IP  connecting..."));
         } else {
             snprintf(line, sizeof(line), "AP  192.168.4.1");
         }
@@ -3613,6 +3680,29 @@ static void settings_face_event_cb(lv_event_t *event)
                                         lv_color_hex(active ? 0x03181F : 0xC9D3DC), 0);
         }
     }
+}
+
+static void settings_language_apply_cb(void *unused)
+{
+    (void)unused;
+    create_app_ui();
+    request_weather_refresh();
+    request_stock_refresh();
+}
+
+static void settings_language_event_cb(lv_event_t *event)
+{
+    bool chinese = (int)(intptr_t)lv_event_get_user_data(event) != 0;
+    s_last_activity_ms = now_ms();
+    if (chinese == s_lang_chinese) {
+        return;
+    }
+    s_lang_chinese = chinese;
+    save_ui_settings();
+    /* Captions are baked in when a page is built, so switching language means
+     * rebuilding everything - including the button we are dispatching on.
+     * Defer it until LVGL is done with this event. */
+    lv_async_call(settings_language_apply_cb, NULL);
 }
 
 static void settings_standby_switch_event_cb(lv_event_t *event)
@@ -3701,32 +3791,32 @@ static void create_settings_panel(lv_obj_t *parent)
     lv_obj_add_event_cb(panel, settings_panel_event_cb, LV_EVENT_PRESS_LOST, NULL);
     s_settings_ui.panel = panel;
 
-    lv_obj_t *title = create_label(panel, "SETTINGS", FONT_TITLE, lv_color_hex(0xF7FBFF));
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 56);
+    lv_obj_t *title = create_label(panel, tr("设置", "SETTINGS"), FONT_TITLE, lv_color_hex(0xF7FBFF));
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 52);
 
     /* Where to reach the device, so uploading a wallpaper or opening the
      * config page does not mean digging through the router. */
     s_settings_ui.ip_label = create_label(panel, "", FONT_SMALL, lv_color_hex(0x92A0AD));
-    lv_obj_align(s_settings_ui.ip_label, LV_ALIGN_TOP_MID, 0, 88);
+    lv_obj_align(s_settings_ui.ip_label, LV_ALIGN_TOP_MID, 0, 82);
 
-    s_settings_ui.brightness_label = create_label(panel, "BRIGHTNESS", FONT_SMALL,
+    s_settings_ui.brightness_label = create_label(panel, tr("亮度", "BRIGHTNESS"), FONT_SMALL,
                                                   lv_color_hex(0x9AA7B5));
-    lv_obj_align(s_settings_ui.brightness_label, LV_ALIGN_TOP_MID, 0, 116);
+    lv_obj_align(s_settings_ui.brightness_label, LV_ALIGN_TOP_MID, 0, 108);
     s_settings_ui.brightness_slider =
-        create_settings_slider(panel, 142, SETTINGS_BRIGHTNESS_MIN, 100, s_cfg_brightness,
+        create_settings_slider(panel, 132, SETTINGS_BRIGHTNESS_MIN, 100, s_cfg_brightness,
                                settings_brightness_event_cb);
 
-    s_settings_ui.volume_label = create_label(panel, "VOLUME", FONT_SMALL,
+    s_settings_ui.volume_label = create_label(panel, tr("音量", "VOLUME"), FONT_SMALL,
                                               lv_color_hex(0x9AA7B5));
-    lv_obj_align(s_settings_ui.volume_label, LV_ALIGN_TOP_MID, 0, 190);
+    lv_obj_align(s_settings_ui.volume_label, LV_ALIGN_TOP_MID, 0, 172);
     s_settings_ui.volume_slider =
-        create_settings_slider(panel, 216, 0, 100, s_cfg_volume, settings_volume_event_cb);
+        create_settings_slider(panel, 196, 0, 100, s_cfg_volume, settings_volume_event_cb);
 
     s_settings_ui.standby_checkbox = lv_checkbox_create(panel);
-    lv_checkbox_set_text(s_settings_ui.standby_checkbox, "STANDBY 3 MIN");
-    lv_obj_align(s_settings_ui.standby_checkbox, LV_ALIGN_TOP_MID, 0, 262);
+    lv_checkbox_set_text(s_settings_ui.standby_checkbox, tr("待机 3 分钟", "STANDBY 3 MIN"));
+    lv_obj_align(s_settings_ui.standby_checkbox, LV_ALIGN_TOP_MID, 0, 236);
     lv_obj_set_style_text_color(s_settings_ui.standby_checkbox, lv_color_hex(0xF7FBFF), 0);
-    lv_obj_set_style_text_font(s_settings_ui.standby_checkbox, FONT_SMALL, 0);
+    lv_obj_set_style_text_font(s_settings_ui.standby_checkbox, lang_font(FONT_SMALL), 0);
     lv_obj_set_style_border_color(s_settings_ui.standby_checkbox, lv_color_hex(0x657181),
                                   LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(s_settings_ui.standby_checkbox, lv_color_hex(0x101820),
@@ -3740,19 +3830,19 @@ static void create_settings_panel(lv_obj_t *parent)
                         LV_EVENT_VALUE_CHANGED, NULL);
 
     s_settings_ui.standby_slider =
-        create_settings_slider(panel, 306, SETTINGS_STANDBY_MIN_MINUTES,
+        create_settings_slider(panel, 274, SETTINGS_STANDBY_MIN_MINUTES,
                                SETTINGS_STANDBY_MAX_MINUTES, s_cfg_standby_minutes,
                                settings_standby_slider_event_cb);
 
     /* Watch face picker: one button per face, highlighted when active. */
-    lv_obj_t *face_caption = create_label(panel, "WATCH FACE", FONT_SMALL,
+    lv_obj_t *face_caption = create_label(panel, tr("表盘", "WATCH FACE"), FONT_SMALL,
                                           lv_color_hex(0x9AA7B5));
-    lv_obj_align(face_caption, LV_ALIGN_TOP_MID, 0, 336);
+    lv_obj_align(face_caption, LV_ALIGN_TOP_MID, 0, 304);
     for (int i = 0; i < FACE_COUNT; i++) {
         static const char *const names[FACE_COUNT] = {"INFO", "PIXEL", "TILES"};
         lv_obj_t *btn = lv_button_create(panel);
         lv_obj_set_size(btn, 78, 34);
-        lv_obj_align(btn, LV_ALIGN_TOP_MID, (i - 1) * 84, 360);
+        lv_obj_align(btn, LV_ALIGN_TOP_MID, (i - 1) * 84, 326);
         lv_obj_set_style_radius(btn, 17, 0);
         lv_obj_set_style_bg_color(btn, lv_color_hex(i == s_watchface ? 0x18D7F5 : 0x1B222B),
                                   0);
@@ -3765,12 +3855,35 @@ static void create_settings_panel(lv_obj_t *parent)
         s_settings_ui.face_buttons[i] = btn;
     }
 
-    lv_obj_t *hint = create_label(panel, "Swipe up to close", FONT_SMALL,
+    /* Language picker. Same pill styling as the face row; the panel rebuilds
+     * itself when this changes. */
+    lv_obj_t *lang_caption = create_label(panel, tr("语言", "LANGUAGE"), FONT_SMALL,
+                                          lv_color_hex(0x9AA7B5));
+    lv_obj_align(lang_caption, LV_ALIGN_TOP_MID, 0, 368);
+    for (int i = 0; i < 2; i++) {
+        bool chinese = i == 0;
+        bool active = chinese == s_lang_chinese;
+        lv_obj_t *btn = lv_button_create(panel);
+        lv_obj_set_size(btn, 84, 32);
+        lv_obj_align(btn, LV_ALIGN_TOP_MID, chinese ? -46 : 46, 390);
+        lv_obj_set_style_radius(btn, 16, 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(active ? 0x18D7F5 : 0x1B222B), 0);
+        lv_obj_set_style_border_width(btn, 0, 0);
+        lv_obj_add_event_cb(btn, settings_language_event_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)(chinese ? 1 : 0));
+        lv_obj_t *label = create_label(btn, chinese ? "中文" : "English", FONT_SMALL,
+                                       lv_color_hex(active ? 0x03181F : 0xC9D3DC));
+        lv_obj_center(label);
+        s_settings_ui.lang_buttons[i] = btn;
+    }
+
+    lv_obj_t *hint = create_label(panel, tr("上滑关闭", "Swipe up to close"), FONT_SMALL,
                                   lv_color_hex(0x63717F));
-    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 404);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 428);
 
     settings_update_labels();
     set_obj_hidden(panel, true);
+    s_settings_visible = false;
 }
 
 static void create_app_ui(void)
@@ -4278,15 +4391,15 @@ static void render_pedometer(uint32_t steps, int motion_mg, const char *status_t
     if (goal_steps >= 1000U) {
         uint32_t goal_tenths_k = (goal_steps + 50U) / 100U;
         if ((goal_tenths_k % 10U) == 0U) {
-            snprintf(goal_text, sizeof(goal_text), "%lu%% OF %luK",
+            snprintf(goal_text, sizeof(goal_text), tr("%lu%% 目标 %luK", "%lu%% OF %luK"),
                      (unsigned long)progress, (unsigned long)(goal_tenths_k / 10U));
         } else {
-            snprintf(goal_text, sizeof(goal_text), "%lu%% OF %lu.%luK",
+            snprintf(goal_text, sizeof(goal_text), tr("%lu%% 目标 %lu.%luK", "%lu%% OF %lu.%luK"),
                      (unsigned long)progress, (unsigned long)(goal_tenths_k / 10U),
                      (unsigned long)(goal_tenths_k % 10U));
         }
     } else {
-        snprintf(goal_text, sizeof(goal_text), "%lu%% OF %lu",
+        snprintf(goal_text, sizeof(goal_text), tr("%lu%% 目标 %lu", "%lu%% OF %lu"),
                  (unsigned long)progress, (unsigned long)goal_steps);
     }
     snprintf(distance_text, sizeof(distance_text), "%lu.%lu",
@@ -4462,7 +4575,7 @@ static void render_weather(const weather_data_t *weather, const char *status_tex
     }
     const char *condition_text = "--";
     if (data->valid) {
-        condition_text = text_glyphs_available(FONT_CJK, data->condition)
+        condition_text = s_lang_chinese && text_glyphs_available(FONT_CJK, data->condition)
                              ? data->condition
                              : weather_condition_en(data->weather_code);
     }
@@ -4693,23 +4806,20 @@ static void render_stock_locked(const char *status_text)
     snprintf(text, sizeof(text), "%.2f", d->low);
     set_label_text_if_changed(s_stock_ui.low_value_label, text);
 
-    /* Raw 手 counts are unwieldy; switch to 万手 past ten thousand. */
-    if (d->volume_lots >= 10000.0f) {
-        snprintf(text, sizeof(text), "%.1f万手", d->volume_lots / 10000.0f);
-    } else {
-        snprintf(text, sizeof(text), "%.0f手", d->volume_lots);
-    }
+    /* Turnover rate reads better than a raw lot count and needs no unit
+     * glyph, so the column stays in the Latin face. */
+    snprintf(text, sizeof(text), "%.2f%%", d->turnover_rate);
     set_label_text_if_changed(s_stock_ui.vol_value_label, text);
 
     if (status_text != NULL) {
         set_label_text_if_changed(s_stock_ui.status_label, status_text);
     } else if (s_stock_kline_view && d->k_count == 0) {
         /* Charts come from the bridge; say so rather than show a blank. */
-        set_label_text_if_changed(s_stock_ui.status_label, "需要电脑端桥接");
+        set_label_text_if_changed(s_stock_ui.status_label, tr("需要电脑端桥接", "Bridge offline"));
     } else if (!s_stock_kline_view && d->trend_count == 0) {
         set_label_text_if_changed(s_stock_ui.status_label, "需要电脑端桥接");
     } else if (d->updated[0] != '\0') {
-        snprintf(text, sizeof(text), "%.5s  ·  轻点看日K", d->updated);
+        snprintf(text, sizeof(text), tr("%.5s  ·  轻点看日K", "%.5s - tap for candles"), d->updated);
         set_label_text_if_changed(s_stock_ui.status_label, text);
     }
 
@@ -4744,7 +4854,7 @@ static void render_forecast_locked(void)
 
     int count = s_last_weather.day_count;
     if (count <= 0) {
-        set_label_text_if_changed(s_forecast_ui.day_label, "NO DATA");
+        set_label_text_if_changed(s_forecast_ui.day_label, tr("无数据", "NO DATA"));
         set_label_text_if_changed(s_forecast_ui.date_label, "");
         set_label_text_if_changed(s_forecast_ui.range_label, "--");
         set_label_text_if_changed(s_forecast_ui.cond_label, "");
@@ -4781,8 +4891,11 @@ static void render_forecast_locked(void)
     }
     lv_arc_set_angles(s_forecast_ui.range_arc, start_angle, end_angle);
 
-    static const char *const day_names[WEATHER_FORECAST_DAYS] = {"TODAY", "DAY 2", "DAY 3",
-                                                                 "DAY 4"};
+    static const char *const day_names_en[WEATHER_FORECAST_DAYS] = {"TODAY", "DAY 2",
+                                                                    "DAY 3", "DAY 4"};
+    static const char *const day_names_zh[WEATHER_FORECAST_DAYS] = {"今天", "明天", "后天",
+                                                                    "第4天"};
+    const char *const *day_names = s_lang_chinese ? day_names_zh : day_names_en;
     set_label_text_if_changed(s_forecast_ui.day_label, day_names[s_forecast_day]);
     set_label_text_if_changed(s_forecast_ui.date_label, day->date);
 
@@ -4883,7 +4996,7 @@ static void format_codex_reset_text(const char *updated, char *buffer, size_t bu
     while (*reset == ' ' || *reset == ',') {
         reset++;
     }
-    snprintf(buffer, buffer_size, "Reset %s", reset);
+    snprintf(buffer, buffer_size, tr("重置 %s", "Reset %s"), reset);
 }
 
 static void render_codex_usage(const codex_usage_t *usage, const char *status_text)
@@ -4914,7 +5027,7 @@ static void render_codex_usage(const codex_usage_t *usage, const char *status_te
     snprintf(percent_text, sizeof(percent_text), "%lu%%", (unsigned long)percent);
     format_codex_reset_text(usage->updated, reset_text, sizeof(reset_text));
 
-    bool online = strcmp(status_text, "Online") == 0;
+    bool online = strcmp(status_text, tr("在线", "Online")) == 0;
 
     set_label_text_if_changed(s_codex_ui.percent_label, percent_text);
     set_label_text_if_changed(s_codex_ui.label_label, online ? reset_text : "");
@@ -4938,11 +5051,11 @@ static void render_codex_status(const char *status_text)
 static void format_elapsed_short(uint32_t seconds, char *buffer, size_t buffer_size)
 {
     if (seconds >= 3600U) {
-        snprintf(buffer, buffer_size, "%luh", (unsigned long)(seconds / 3600U));
+        snprintf(buffer, buffer_size, tr("%lu时", "%luh"), (unsigned long)(seconds / 3600U));
     } else if (seconds >= 60U) {
-        snprintf(buffer, buffer_size, "%lum", (unsigned long)(seconds / 60U));
+        snprintf(buffer, buffer_size, tr("%lu分", "%lum"), (unsigned long)(seconds / 60U));
     } else {
-        snprintf(buffer, buffer_size, "%lus", (unsigned long)seconds);
+        snprintf(buffer, buffer_size, tr("%lu秒", "%lus"), (unsigned long)seconds);
     }
 }
 
@@ -5136,7 +5249,7 @@ static esp_err_t stock_fetch_quote(const char *code, stock_data_t *out)
     out->price = stock_field_float(fields, count, 3);
     out->prev_close = stock_field_float(fields, count, 4);
     out->open = stock_field_float(fields, count, 5);
-    out->volume_lots = stock_field_float(fields, count, 6);
+    out->turnover_rate = stock_field_float(fields, count, 43);
     out->change = stock_field_float(fields, count, 31);
     out->change_pct = stock_field_float(fields, count, 32);
     out->high = stock_field_float(fields, count, 33);
@@ -5919,7 +6032,7 @@ static esp_err_t fetch_weather(weather_data_t *weather)
         .valid = false,
     };
 
-    render_weather_status("AMap HTTP");
+    render_weather_status(tr("高德接口", "AMap HTTP"));
     ESP_LOGI(TAG, "Fetching AMap weather for %s (%s)", display_city, adcode);
     snprintf(url, sizeof(url),
              "http://restapi.amap.com/v3/weather/weatherInfo?city=%s&key=%s&extensions=all&output=JSON",
@@ -6108,16 +6221,16 @@ static void reconnect_station(void)
     esp_err_t ret = apply_station_config();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Apply STA config failed: %s", esp_err_to_name(ret));
-        render_weather_status("Wi-Fi config failed");
+        render_weather_status(tr("Wi-Fi 配置失败", "Wi-Fi config failed"));
         return;
     }
 
-    render_weather_status("Wi-Fi connecting");
+    render_weather_status(tr("Wi-Fi 连接中", "Wi-Fi connecting"));
     (void)esp_wifi_disconnect();
     ret = esp_wifi_connect();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "STA reconnect failed: %s", esp_err_to_name(ret));
-        render_weather_status("Wi-Fi connect failed");
+        render_weather_status(tr("Wi-Fi 连接失败", "Wi-Fi connect failed"));
     }
     render_time_page();
 }
@@ -6296,6 +6409,17 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
     httpd_resp_sendstr_chunk(req, goal_input);
 
     {
+        char lang[220];
+        snprintf(lang, sizeof(lang),
+                 "<label>语言 / Language</label><select name='lang'>"
+                 "<option value='zh'%s>中文</option>"
+                 "<option value='en'%s>English</option></select>",
+                 s_lang_chinese ? " selected" : "",
+                 s_lang_chinese ? "" : " selected");
+        httpd_resp_sendstr_chunk(req, lang);
+    }
+
+    {
         char stocks[STOCK_MAX_SYMBOLS * (STOCK_CODE_LEN + STOCK_NAME_LEN) + 8];
         char escaped[sizeof(stocks)];
         /* Only the value is variable; the prose is sent as its own chunk so
@@ -6437,6 +6561,25 @@ static esp_err_t config_page_post_handler(httpd_req_t *req)
     }
 
     {
+        char lang[8];
+        if (get_form_value(body, "lang", lang, sizeof(lang)) && lang[0] != '\0') {
+            bool chinese = strcmp(lang, "en") != 0;
+            if (chinese != s_lang_chinese) {
+                s_lang_chinese = chinese;
+                save_ui_settings();
+                /* Captions are baked in when a page is built, so the whole
+                 * UI has to be recreated for a language switch. */
+                if (bsp_display_lock(DISPLAY_LOCK_TIMEOUT_MS) == ESP_OK) {
+                    create_app_ui();
+                    bsp_display_unlock();
+                }
+                request_weather_refresh();
+                request_stock_refresh();
+            }
+        }
+    }
+
+    {
         char stocks[STOCK_MAX_SYMBOLS * (STOCK_CODE_LEN + STOCK_NAME_LEN) + 8];
         if (get_form_value(body, "stocks", stocks, sizeof(stocks)) && stocks[0] != '\0') {
             stock_parse_config(stocks);
@@ -6485,7 +6628,7 @@ static esp_err_t config_page_post_handler(httpd_req_t *req)
         s_last_weather.valid = false;
         copy_string(s_last_weather.condition, sizeof(s_last_weather.condition), "等待天气");
         copy_string(s_last_weather.updated, sizeof(s_last_weather.updated), "weather saved");
-        render_weather_status("Weather saved");
+        render_weather_status(tr("天气已保存", "Weather saved"));
         request_weather_refresh();
     }
 
@@ -6668,7 +6811,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             xEventGroupSetBits(s_wifi_event_group, WEATHER_REFRESH_REQUEST_BIT);
         }
-        render_weather_status("Wi-Fi reconnecting");
+        render_weather_status(tr("Wi-Fi 重连中", "Wi-Fi reconnecting"));
         if (s_ap_client_count > 0) {
             /* A phone is provisioning on the setup AP: keep the radio parked
              * on the AP channel instead of scanning for the router. */
@@ -6699,7 +6842,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         }
         /* Kick SNTP right away instead of waiting for the codex task loop. */
         (void)request_ntp_sync();
-        render_weather_status("Weather updating");
+        render_weather_status(tr("天气更新中", "Weather updating"));
         ESP_LOGI(TAG, "Wi-Fi connected");
     }
 }
@@ -6765,8 +6908,8 @@ static esp_err_t start_wifi_station(void)
     s_wifi_started = true;
     ESP_RETURN_ON_ERROR(start_config_web_server(), TAG, "start config web failed");
     render_time_page();
-    render_weather_status(wifi_configured() ? "Wi-Fi connecting" : "Open setup AP");
-    render_codex_status(wifi_configured() ? "Wi-Fi connecting" : "Open setup AP");
+    render_weather_status(wifi_configured() ? tr("Wi-Fi 连接中", "Wi-Fi connecting") : tr("打开配网热点", "Open setup AP"));
+    render_codex_status(wifi_configured() ? tr("Wi-Fi 连接中", "Wi-Fi connecting") : tr("打开配网热点", "Open setup AP"));
     return ESP_OK;
 }
 
@@ -6860,14 +7003,14 @@ static void stock_task(void *arg)
 
     while (true) {
         if (s_wifi_event_group == NULL || !wifi_configured()) {
-            render_stock("未配网");
+            render_stock(tr("未配网", "No Wi-Fi"));
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
 
         EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
         if ((bits & WIFI_CONNECTED_BIT) == 0) {
-            render_stock("等待网络");
+            render_stock(tr("等待网络", "Connecting"));
             (void)xEventGroupWaitBits(s_wifi_event_group,
                                       WIFI_CONNECTED_BIT | STOCK_REFRESH_REQUEST_BIT,
                                       pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
@@ -6875,7 +7018,7 @@ static void stock_task(void *arg)
         }
 
         if (s_stock_count <= 0) {
-            render_stock("未设置代码");
+            render_stock(tr("未设置代码", "No symbols"));
             vTaskDelay(pdMS_TO_TICKS(10000));
             continue;
         }
@@ -6896,7 +7039,7 @@ static void stock_task(void *arg)
             render_stock(NULL);
         } else {
             ESP_LOGW(TAG, "Stock fetch failed for %s: %s", code, esp_err_to_name(ret));
-            render_stock("行情获取失败");
+            render_stock(tr("行情获取失败", "Quote failed"));
         }
 
         uint32_t wait = stock_market_hours() ? STOCK_POLL_OPEN_MS : STOCK_POLL_CLOSED_MS;
@@ -7106,7 +7249,7 @@ static void pedometer_task(void *arg)
             s_step_count = 0;
             filter.armed = true;
             filter.last_step_ms = 0;
-            render_pedometer(s_step_count, 0, "Reset by BOOT");
+            render_pedometer(s_step_count, 0, tr("BOOT 已清零", "Reset by BOOT"));
         }
 
         bool ready = true;
@@ -7125,11 +7268,11 @@ static void pedometer_task(void *arg)
                 if ((current_ms - last_ui_ms) >= UI_REFRESH_MS) {
                     last_ui_ms = current_ms;
                     render_pedometer(s_step_count, motion_to_mg(ax, ay, az, filter.gravity_g),
-                                     "Tracking steps");
+                                     tr("计步中", "Tracking steps"));
                 }
             } else if ((now_ms() - last_ui_ms) >= UI_REFRESH_MS) {
                 last_ui_ms = now_ms();
-                render_pedometer(s_step_count, 0, "QMI8658 read failed");
+                render_pedometer(s_step_count, 0, tr("传感器读取失败", "QMI8658 read failed"));
             }
         }
 
@@ -7144,7 +7287,7 @@ static void codex_usage_task(void *arg)
     esp_err_t ret = start_wifi_station();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Wi-Fi start failed: %s", esp_err_to_name(ret));
-        render_codex_status("Wi-Fi start failed");
+        render_codex_status(tr("Wi-Fi 启动失败", "Wi-Fi start failed"));
         render_time_page();
         vTaskDelete(NULL);
         return;
@@ -7155,7 +7298,7 @@ static void codex_usage_task(void *arg)
 
     while (true) {
         if (!wifi_configured()) {
-            render_codex_status("Open setup AP");
+            render_codex_status(tr("打开配网热点", "Open setup AP"));
             render_time_page();
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
@@ -7182,17 +7325,17 @@ static void codex_usage_task(void *arg)
                 codex_fetched_once = true;
                 last_codex_fetch_ms = now;
                 if (codex_configured()) {
-                    render_codex_status("Codex updating");
+                    render_codex_status(tr("Codex 更新中", "Codex updating"));
                     codex_usage_t usage;
                     ret = fetch_codex_usage(&usage);
                     if (ret == ESP_OK) {
                         s_last_codex_usage = usage;
-                        render_codex_usage(&s_last_codex_usage, "Online");
+                        render_codex_usage(&s_last_codex_usage, tr("在线", "Online"));
                     } else {
-                        render_codex_status("Bridge offline");
+                        render_codex_status(tr("桥接离线", "Bridge offline"));
                     }
                 } else {
-                    render_codex_status("Edit CODEX URL");
+                    render_codex_status(tr("请填 Codex 地址", "Edit CODEX URL"));
                 }
             }
 
@@ -7215,7 +7358,7 @@ static void codex_usage_task(void *arg)
                                       pdTRUE, pdFALSE,
                                       pdMS_TO_TICKS(AGENT_POLL_INTERVAL_MS));
         } else if ((bits & WIFI_FAIL_BIT) != 0) {
-            render_codex_status("Wi-Fi failed");
+            render_codex_status(tr("Wi-Fi 失败", "Wi-Fi failed"));
             render_time_page();
             EventBits_t recover_bits =
                 xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE,
@@ -7224,7 +7367,7 @@ static void codex_usage_task(void *arg)
                 reconnect_station();
             }
         } else {
-            render_codex_status("Wi-Fi timeout");
+            render_codex_status(tr("Wi-Fi 超时", "Wi-Fi timeout"));
             render_time_page();
         }
     }
@@ -7238,7 +7381,7 @@ static void weather_task(void *arg)
     esp_err_t ret = start_wifi_station();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Wi-Fi start failed for weather: %s", esp_err_to_name(ret));
-        render_weather_status("Wi-Fi start failed");
+        render_weather_status(tr("Wi-Fi 启动失败", "Wi-Fi start failed"));
         vTaskDelete(NULL);
         return;
     }
@@ -7246,20 +7389,20 @@ static void weather_task(void *arg)
     while (true) {
         if (!wifi_configured() || s_weather_city[0] == '\0') {
             ESP_LOGW(TAG, "Weather waiting: Wi-Fi or city missing");
-            render_weather_status("Open setup AP");
+            render_weather_status(tr("打开配网热点", "Open setup AP"));
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
         if (!weather_api_key_configured()) {
             ESP_LOGW(TAG, "Weather waiting: AMap key missing");
-            render_weather_status("Set AMap key");
+            render_weather_status(tr("请填高德密钥", "Set AMap key"));
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
 
         if (s_wifi_event_group == NULL) {
             ESP_LOGW(TAG, "Weather waiting: Wi-Fi event group missing");
-            render_weather_status("Wi-Fi not started");
+            render_weather_status(tr("Wi-Fi 未启动", "Wi-Fi not started"));
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
@@ -7267,7 +7410,7 @@ static void weather_task(void *arg)
         EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
         if ((bits & WIFI_CONNECTED_BIT) != 0) {
             xEventGroupClearBits(s_wifi_event_group, WEATHER_REFRESH_REQUEST_BIT);
-            render_weather_status("Weather updating");
+            render_weather_status(tr("天气更新中", "Weather updating"));
 
             weather_data_t weather;
             ret = fetch_weather(&weather);
@@ -7276,7 +7419,7 @@ static void weather_task(void *arg)
                 render_weather(&s_last_weather, "");
             } else {
                 ESP_LOGW(TAG, "Weather refresh failed: %s", esp_err_to_name(ret));
-                render_weather_status("Weather offline");
+                render_weather_status(tr("天气离线", "Weather offline"));
             }
 
             /* Retry soon after a failure; do not clear WIFI_FAIL_BIT here —
@@ -7289,13 +7432,13 @@ static void weather_task(void *arg)
         } else if ((bits & WIFI_FAIL_BIT) != 0) {
             /* Reconnect attempts are owned by codex_usage_task; driving them
              * from here too would defeat the retry backoff. */
-            render_weather_status("Wi-Fi failed");
+            render_weather_status(tr("Wi-Fi 失败", "Wi-Fi failed"));
             (void)xEventGroupWaitBits(s_wifi_event_group,
                                       WIFI_CONNECTED_BIT | WEATHER_REFRESH_REQUEST_BIT,
                                       pdFALSE, pdFALSE,
                                       pdMS_TO_TICKS(WIFI_RETRY_BACKOFF_MS));
         } else {
-            render_weather_status("Wi-Fi connecting");
+            render_weather_status(tr("Wi-Fi 连接中", "Wi-Fi connecting"));
             (void)xEventGroupWaitBits(s_wifi_event_group,
                                       WIFI_CONNECTED_BIT | WIFI_FAIL_BIT |
                                           WEATHER_REFRESH_REQUEST_BIT,
@@ -7471,9 +7614,9 @@ void app_main(void)
         bsp_display_unlock();
     }
     render_time_page();
-    render_weather_status(wifi_configured() ? "Wi-Fi not started" : "Edit Wi-Fi config");
-    render_pedometer(0, 0, "Waiting for QMI8658");
-    render_codex_status(wifi_configured() ? "Wi-Fi not started" : "Edit Wi-Fi config");
+    render_weather_status(wifi_configured() ? tr("Wi-Fi 未启动", "Wi-Fi not started") : "Edit Wi-Fi config");
+    render_pedometer(0, 0, tr("等待传感器", "Waiting for QMI8658"));
+    render_codex_status(wifi_configured() ? tr("Wi-Fi 未启动", "Wi-Fi not started") : "Edit Wi-Fi config");
     request_full_screen_refresh();
 
     init_reset_button();
@@ -7481,8 +7624,8 @@ void app_main(void)
     ret = start_wifi_station();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Wi-Fi start failed at boot: %s", esp_err_to_name(ret));
-        render_weather_status("Wi-Fi start failed");
-        render_codex_status("Wi-Fi start failed");
+        render_weather_status(tr("Wi-Fi 启动失败", "Wi-Fi start failed"));
+        render_codex_status(tr("Wi-Fi 启动失败", "Wi-Fi start failed"));
     }
     xTaskCreate(clock_task, "clock_task", 4096, NULL, 3, NULL);
 
@@ -7490,10 +7633,10 @@ void app_main(void)
     ret = init_qmi8658(&dev);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "Pedometer ready");
-        render_pedometer(0, 0, "Tracking steps");
+        render_pedometer(0, 0, tr("计步中", "Tracking steps"));
         xTaskCreate(pedometer_task, "pedometer_task", 4096, dev, 5, NULL);
     } else {
-        render_pedometer(0, 0, "QMI8658 offline");
+        render_pedometer(0, 0, tr("传感器离线", "QMI8658 offline"));
     }
 
     if (xTaskCreate(weather_task, "weather_task", 5120, NULL, 4, NULL) != pdPASS) {

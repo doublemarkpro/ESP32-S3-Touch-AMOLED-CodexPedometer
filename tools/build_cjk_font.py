@@ -3,8 +3,8 @@
 The bundled lv_font_source_han_sans_sc_16_cjk.c is an upstream LVGL sample
 subset aimed at Japanese; it is missing many everyday Chinese characters
 (云, 阴, 雷, 雾, 东, 风 ...), which is why several screens fall back to
-English. This builds a replacement covering GB2312 level 1 (the 3755
-most common simplified characters) plus ASCII and the FontAwesome glyphs
+English. This builds a replacement covering GB2312 level 1 (6763 characters,
+both tiers - level 2 carries name characters like 鑫) plus ASCII and the FontAwesome glyphs
 LVGL's built-in symbols use.
 
     python tools/build_cjk_font.py            # 16 px, into the component
@@ -44,13 +44,16 @@ EXTRA_CODEPOINTS = [
 ]
 
 
-def gb2312_level1() -> list[int]:
-    """Enumerate GB2312 level 1: the 3755 most common simplified characters.
+def gb2312_hanzi() -> list[int]:
+    """Enumerate both GB2312 tiers: 6763 simplified characters.
 
-    Rows 0xB0-0xD7, cells 0xA1-0xFE, with row 0xD7 stopping at 0xF9.
+    Level 1 (rows 0xB0-0xD7, cells 0xA1-0xFE, row 0xD7 stopping at 0xF9) is
+    the 3755 most common characters. Level 2 (rows 0xD8-0xF7) carries the
+    rarer ones - surnames and company names live there (鑫, 昇, 淼 ...), so
+    a stock or city the user types would otherwise render as boxes.
     """
     points: list[int] = []
-    for row in range(0xB0, 0xD8):
+    for row in range(0xB0, 0xF8):
         last = 0xF9 if row == 0xD7 else 0xFE
         for cell in range(0xA1, last + 1):
             try:
@@ -106,11 +109,11 @@ def main() -> int:
     )
 
     ranges = compress_ranges(
-        list(range(0x20, 0x80)) + EXTRA_CODEPOINTS + gb2312_level1()
+        list(range(0x20, 0x80)) + EXTRA_CODEPOINTS + gb2312_hanzi()
     )
 
     print(f"Building {args.size}px font -> {out.name}")
-    print(f"  glyphs: ASCII + {len(EXTRA_CODEPOINTS)} symbols + GB2312 level 1")
+    print(f"  glyphs: ASCII + {len(EXTRA_CODEPOINTS)} symbols + GB2312 level 1+2")
 
     # 3755 ranges blow past the Windows command-line limit, so drive
     # lv_font_conv through Node instead of argv.
