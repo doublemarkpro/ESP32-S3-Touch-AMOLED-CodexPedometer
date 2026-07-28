@@ -471,7 +471,8 @@ typedef struct {
 typedef struct {
     char date[12];      /* MM-DD */
     char day_cond[24];
-    char wind_dir[8];   /* compass letters, e.g. "S" */
+    char night_cond[24];
+    char wind_dir[16];  /* Chinese direction, e.g. 东北 */
     char wind_power[12];/* Beaufort range, e.g. "1-3" */
     int day_temp_c;
     int night_temp_c;
@@ -1367,7 +1368,11 @@ static lv_obj_t *create_metric_column(lv_obj_t *parent, int32_t x_ofs, bool with
                                          lv_color_hex(0xF4FAFF));
     lv_obj_align(value_label, LV_ALIGN_CENTER, x_ofs, UI_METRIC_VALUE_CENTER_Y);
 
-    lv_obj_t *title_label = create_label(parent, label_text, FONT_SMALL,
+    /* Captions may be Chinese now, and Montserrat has no CJK - pick the font
+     * that can actually draw what was passed in. */
+    const lv_font_t *caption_font =
+        text_glyphs_available(FONT_SMALL, label_text) ? FONT_SMALL : FONT_CJK;
+    lv_obj_t *title_label = create_label(parent, label_text, caption_font,
                                          lv_color_hex(0x9AA7B5));
     lv_obj_align(title_label, LV_ALIGN_CENTER, x_ofs, UI_METRIC_LABEL_CENTER_Y);
 
@@ -3124,13 +3129,16 @@ static void create_forecast_page(lv_obj_t *parent)
     lv_obj_align(s_forecast_ui.cond_label, LV_ALIGN_CENTER, 0, 58);
 
     /* One unambiguous fact per column; the daytime condition already sits
-     * under the temperature range so it is not repeated here. */
+     * under the temperature range so it is not repeated here. These three
+     * carry Chinese values, so they switch to the CJK font. */
     s_forecast_ui.night_value_label =
-        create_metric_column(page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED, "NIGHT", "--");
+        create_metric_column(page, -UI_METRIC_COL_OFS, false, METRIC_ICON_USED, "夜间", "--");
     s_forecast_ui.wind_value_label =
-        create_metric_column(page, 0, false, METRIC_ICON_LEFT, "WIND", "--");
+        create_metric_column(page, 0, false, METRIC_ICON_LEFT, "风向", "--");
     s_forecast_ui.force_value_label =
-        create_metric_column(page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT, "FORCE", "--");
+        create_metric_column(page, UI_METRIC_COL_OFS, false, METRIC_ICON_LIMIT, "风力", "--");
+    lv_obj_set_style_text_font(s_forecast_ui.night_value_label, FONT_CJK, 0);
+    lv_obj_set_style_text_font(s_forecast_ui.wind_value_label, FONT_CJK, 0);
 
     for (int i = 0; i < WEATHER_FORECAST_DAYS; i++) {
         lv_obj_t *dot = lv_obj_create(page);
@@ -4262,16 +4270,17 @@ static void render_forecast_locked(void)
     snprintf(text, sizeof(text), "%d°~%d°", day->night_temp_c, day->day_temp_c);
     set_label_text_if_changed(s_forecast_ui.range_label, text);
 
-    /* The centre line uses the CJK font, so Chinese is fine there. */
+    /* The font now covers common Chinese, so show what the API returned and
+     * keep the English mapping only as a fallback for anything exotic. */
     set_label_text_if_changed(s_forecast_ui.cond_label,
                               text_glyphs_available(FONT_CJK, day->day_cond)
                                   ? day->day_cond
                                   : weather_condition_en(day->day_code));
 
-    /* Metric columns render in Montserrat, which carries no CJK at all, so
-     * their values must stay ASCII regardless of what the API returned. */
     set_label_text_if_changed(s_forecast_ui.night_value_label,
-                              weather_condition_en(day->night_code));
+                              text_glyphs_available(FONT_CJK, day->night_cond)
+                                  ? day->night_cond
+                                  : weather_condition_en(day->night_code));
     set_label_text_if_changed(s_forecast_ui.wind_value_label,
                               day->wind_dir[0] != '\0' ? day->wind_dir : "--");
     set_label_text_if_changed(s_forecast_ui.force_value_label,
@@ -4800,37 +4809,6 @@ static bool parse_codex_usage_json(const char *json, codex_usage_t *usage)
     return true;
 }
 
-/* The bundled CJK subset lacks 东 and 风, so wind directions are rendered as
- * compass letters rather than the Chinese names AMap returns. */
-static const char *wind_direction_en(const char *cn)
-{
-    if (text_contains(cn, "东") && text_contains(cn, "北")) {
-        return "NE";
-    }
-    if (text_contains(cn, "东") && text_contains(cn, "南")) {
-        return "SE";
-    }
-    if (text_contains(cn, "西") && text_contains(cn, "北")) {
-        return "NW";
-    }
-    if (text_contains(cn, "西") && text_contains(cn, "南")) {
-        return "SW";
-    }
-    if (text_contains(cn, "东")) {
-        return "E";
-    }
-    if (text_contains(cn, "南")) {
-        return "S";
-    }
-    if (text_contains(cn, "西")) {
-        return "W";
-    }
-    if (text_contains(cn, "北")) {
-        return "N";
-    }
-    return "--";
-}
-
 static bool parse_amap_weather_json(const char *json, weather_data_t *weather,
                                     const char *display_city)
 {
@@ -4917,11 +4895,13 @@ static bool parse_amap_weather_json(const char *json, weather_data_t *weather,
             day->day_code = weather_code_from_china_type(field);
         }
         if (json_get_string(entry, "nightweather", field, sizeof(field))) {
+            copy_string(day->night_cond, sizeof(day->night_cond), field);
             day->night_code = weather_code_from_china_type(field);
         }
 
         if (json_get_string(entry, "daywind", field, sizeof(field))) {
-            copy_string(day->wind_dir, sizeof(day->wind_dir), wind_direction_en(field));
+            /* The font now covers 东/风, so keep AMap's own wording. */
+            copy_string(day->wind_dir, sizeof(day->wind_dir), field);
         }
         if (json_get_string(entry, "daypower", field, sizeof(field))) {
             copy_string(day->wind_power, sizeof(day->wind_power), field);
