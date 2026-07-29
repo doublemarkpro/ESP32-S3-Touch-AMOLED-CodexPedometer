@@ -56,7 +56,12 @@
  * starts failing once Wi-Fi has claimed internal heap. 466 x 20 x 2 bytes
  * x 2 buffers = ~26 KB reserved once at boot. Height is kept modest so task
  * stacks (which must be internal) always fit alongside the LVGL widgets. */
-#define APP_DRAW_BUFFER_HEIGHT 20
+/* 466 x 14 x 2 bytes, double buffered: 26 KB of internal RAM. Twenty rows was
+ * 37 KB and left the microphone's DMA descriptors with nothing. */
+#define APP_DRAW_BUFFER_HEIGHT 14
+
+/* Below this the BSP's mic init will abort rather than fail. */
+#define MUSIC_MIC_MIN_INTERNAL_HEAP (24 * 1024)
 #define CO5300_GRAM_RES 480
 #define PANEL_CLEAR_ROWS 13
 
@@ -130,6 +135,11 @@
 /* While the screen is dark nobody is reading the AI ring, so the radio can
  * stay asleep between polls instead of waking every two seconds. */
 #define AGENT_POLL_DARK_INTERVAL_MS 20000
+
+/* An hour of samples at the 15 s poll: enough to read a discharge slope off
+ * the device over Wi-Fi, which is the only way to see it once USB - and with
+ * it the serial port - is unplugged. */
+#define BATTERY_LOG_SAMPLES 240
 #define BOARD_TEMP_INVALID (-1000.0f)
 
 #define PEDOMETER_DEFAULT_GOAL_STEPS 12000U
@@ -649,6 +659,8 @@ static char s_sta_ip[16];
 static wifi_ap_record_t s_wifi_scan_cache[WIFI_SCAN_MAX_AP];
 static uint16_t s_wifi_scan_cache_count;
 static uint32_t s_wifi_scan_cache_ms;
+static volatile bool s_wifi_scan_in_progress;
+static volatile bool s_wifi_scan_requested;
 static char s_weather_city[WEATHER_CITY_STORAGE_SIZE];
 static char s_weather_api_key[WEATHER_KEY_STORAGE_SIZE];
 static uint32_t s_pedometer_goal_steps = PEDOMETER_DEFAULT_GOAL_STEPS;
@@ -663,6 +675,21 @@ static lv_point_precise_t s_second_hand_points[2];
 static lv_point_precise_t s_hour_edge_points[2];
 static lv_point_precise_t s_minute_edge_points[2];
 static volatile int s_battery_percent = -1;
+
+/* Off by default: modem sleep makes softAP beacons irregular, and a setup
+ * hotspot you cannot find is worse than an hour of runtime. */
+static bool s_cfg_power_save;
+
+typedef struct {
+    uint32_t uptime_s;
+    int16_t percent;
+    int16_t millivolts;
+    uint8_t charge_state;
+} battery_sample_t;
+
+static battery_sample_t *s_battery_log;
+static size_t s_battery_log_count;
+static size_t s_battery_log_next;
 static volatile float s_board_temp_c = BOARD_TEMP_INVALID;
 static volatile bool s_ntp_resync_requested;
 static uint8_t s_corner_widget[4] = {CW_BATTERY, CW_TEMP, CW_WEEKDAY, CW_DATE};
@@ -961,6 +988,52 @@ static void build_weather_display_city(const char *city, char *out, size_t out_s
     copy_string(out, out_size, tr("天气", "Weather"));
 }
 
+/* Calling the scan API from the httpd task is what wedged the config page:
+ * the response stopped mid-<select> and never resumed, with a non-blocking
+ * scan just as much as a blocking one. The handler now only raises a flag and
+ * renders whatever the cache holds; a dedicated task owns the radio call. */
+static void request_wifi_scan(void)
+{
+    s_wifi_scan_requested = true;
+}
+
+static void wifi_scan_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        if (s_wifi_scan_requested && !s_wifi_scan_in_progress && s_wifi_started) {
+            s_wifi_scan_requested = false;
+            s_wifi_scan_in_progress = true;
+
+            /* Short dwell: the radio is shared with the softAP, and a long
+             * scan drops whoever is provisioning on it. */
+            wifi_scan_config_t scan_config = {
+                .show_hidden = false,
+                .scan_time = {
+                    .active = {
+                        .min = 100,
+                        .max = 150,
+                    },
+                },
+            };
+            uint16_t ap_count = WIFI_SCAN_MAX_AP;
+            esp_err_t ret = esp_wifi_scan_start(&scan_config, true);
+            if (ret == ESP_OK) {
+                ret = esp_wifi_scan_get_ap_records(&ap_count, s_wifi_scan_cache);
+            }
+            if (ret == ESP_OK && ap_count > 0) {
+                s_wifi_scan_cache_count = ap_count;
+                s_wifi_scan_cache_ms = now_ms();
+                ESP_LOGI(TAG, "Wi-Fi scan cached %u networks", (unsigned)ap_count);
+            } else {
+                ESP_LOGW(TAG, "Wi-Fi scan failed: %s", esp_err_to_name(ret));
+            }
+            s_wifi_scan_in_progress = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
 static void request_weather_refresh(void)
 {
     if (s_wifi_event_group != NULL) {
@@ -1073,6 +1146,9 @@ static void load_ui_settings(void)
     if (nvs_get_u8(nvs, "lang", &value) == ESP_OK) {
         s_lang_chinese = value != 0;
     }
+    if (nvs_get_u8(nvs, "psave", &value) == ESP_OK) {
+        s_cfg_power_save = value != 0;
+    }
     /* Stored as "code:name,code:name,..." so one key covers the whole list. */
     char stocks[STOCK_MAX_SYMBOLS * (STOCK_CODE_LEN + STOCK_NAME_LEN) + 8];
     size_t stocks_len = sizeof(stocks);
@@ -1104,6 +1180,7 @@ static void save_ui_settings(void)
     }
     (void)nvs_set_u8(nvs, "face", s_watchface);
     (void)nvs_set_u8(nvs, "lang", s_lang_chinese ? 1 : 0);
+    (void)nvs_set_u8(nvs, "psave", s_cfg_power_save ? 1 : 0);
     {
         char stocks[STOCK_MAX_SYMBOLS * (STOCK_CODE_LEN + STOCK_NAME_LEN) + 8];
         stock_format_config(stocks, sizeof(stocks));
@@ -4403,6 +4480,11 @@ static void init_battery_monitor(void)
         s_axp2101_dev = NULL;
         return;
     }
+    /* PSRAM: an hour of samples is 2 KB that internal RAM cannot spare - the
+     * microphone's I2S descriptors have to come out of internal memory and
+     * abort the boot if they cannot. */
+    s_battery_log = heap_caps_calloc(BATTERY_LOG_SAMPLES, sizeof(battery_sample_t),
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     log_battery_config();
     configure_battery_charging();
 }
@@ -4468,6 +4550,20 @@ static void log_battery_diagnostics(int percent)
     last_ms = now;
     last_percent = percent;
     last_mv = millivolts;
+
+    if (s_battery_log == NULL) {
+        return;
+    }
+    s_battery_log[s_battery_log_next] = (battery_sample_t){
+        .uptime_s = now / 1000U,
+        .percent = (int16_t)percent,
+        .millivolts = (int16_t)millivolts,
+        .charge_state = (uint8_t)((status2 >> 5) & 0x03),
+    };
+    s_battery_log_next = (s_battery_log_next + 1) % BATTERY_LOG_SAMPLES;
+    if (s_battery_log_count < BATTERY_LOG_SAMPLES) {
+        s_battery_log_count++;
+    }
 }
 
 /* The only charge parameter worth changing for the 400 mAh pack. The PMU
@@ -6564,34 +6660,14 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
                              "<p class='hint'>天气使用高德开放平台 Web 服务。可填城市名，也可填 6 位高德 adcode，例如青岛 370200。</p>"
                              "<form method='post' action='/save'><label>选择 Wi-Fi</label><select name='ssid'>");
 
-    /* A blocking scan pulls the shared radio off the AP channel and can drop
-     * the provisioning client, so keep the dwell short and cache the results
-     * for a while: refreshing the page does not rescan. */
+    /* Serve whatever the last scan found and refresh it in the background. */
     uint32_t scan_now = now_ms();
     bool cache_fresh = s_wifi_scan_cache_count > 0 &&
                        (scan_now - s_wifi_scan_cache_ms) < WIFI_SCAN_CACHE_MS;
     if (!cache_fresh) {
-        uint16_t ap_count = WIFI_SCAN_MAX_AP;
-        wifi_scan_config_t scan_config = {
-            .show_hidden = false,
-            .scan_time = {
-                .active = {
-                    .min = 100,
-                    .max = 150,
-                },
-            },
-        };
-        esp_err_t ret = esp_wifi_scan_start(&scan_config, true);
-        if (ret == ESP_OK) {
-            ret = esp_wifi_scan_get_ap_records(&ap_count, s_wifi_scan_cache);
-        }
-        if (ret == ESP_OK && ap_count > 0) {
-            s_wifi_scan_cache_count = ap_count;
-            s_wifi_scan_cache_ms = scan_now;
-        } else {
-            ESP_LOGW(TAG, "Config page Wi-Fi scan failed: %s", esp_err_to_name(ret));
-        }
+        request_wifi_scan();
     }
+    bool scan_pending = s_wifi_scan_cache_count == 0;
 
     if (s_wifi_scan_cache_count > 0) {
         for (uint16_t i = 0; i < s_wifi_scan_cache_count; i++) {
@@ -6605,9 +6681,17 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
             httpd_resp_sendstr_chunk(req, option);
         }
     } else {
-        httpd_resp_sendstr_chunk(req, "<option value=''>扫描失败，请刷新页面</option>");
+        httpd_resp_sendstr_chunk(req, "<option value=''>正在扫描…</option>");
     }
 
+    if (scan_pending) {
+        httpd_resp_sendstr_chunk(
+            req,
+            "</select><p class='hint'>首次打开要等几秒扫描，页面会自动刷新一次。</p>"
+            "<script>if(!location.search){setTimeout(function(){"
+            "location.replace('/?scanned=1');},3500);}</script>"
+            "<select name='ssid_placeholder' style='display:none'>");
+    }
     httpd_resp_sendstr_chunk(req,
                              "</select><label>或手动输入 SSID</label>"
                              "<input name='manual_ssid' maxlength='32' placeholder='可留空，默认使用上面的选择'>"
@@ -6650,6 +6734,20 @@ static esp_err_t config_page_get_handler(httpd_req_t *req)
                  s_lang_chinese ? " selected" : "",
                  s_lang_chinese ? "" : " selected");
         httpd_resp_sendstr_chunk(req, lang);
+    }
+
+    {
+        char psave[460];
+        snprintf(psave, sizeof(psave),
+                 "<label>Wi-Fi 省电</label><select name='psave'>"
+                 "<option value='0'%s>关闭（热点随时可搜到）</option>"
+                 "<option value='1'%s>开启（省约 70mA）</option></select>"
+                 "<p class='hint'>开启后，连上路由器时 Wi-Fi 会在信标间隙休眠，"
+                 "续航明显变长；代价是 192.168.4.1 这个配网热点的信标变得不规律，"
+                 "手机可能要多扫几次才搜得到。与路由器断开时会自动恢复常开。</p>",
+                 s_cfg_power_save ? "" : " selected",
+                 s_cfg_power_save ? " selected" : "");
+        httpd_resp_sendstr_chunk(req, psave);
     }
 
     {
@@ -6813,6 +6911,23 @@ static esp_err_t config_page_post_handler(httpd_req_t *req)
     }
 
     {
+        char psave[8];
+        if (get_form_value(body, "psave", psave, sizeof(psave)) && psave[0] != '\0') {
+            bool wanted = psave[0] == '1';
+            if (wanted != s_cfg_power_save) {
+                s_cfg_power_save = wanted;
+                save_ui_settings();
+                /* Apply now if the station is already up; otherwise the next
+                 * IP_EVENT_STA_GOT_IP picks it up. */
+                if (s_sta_ip[0] != '\0') {
+                    (void)esp_wifi_set_ps(wanted ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE);
+                }
+                ESP_LOGI(TAG, "Wi-Fi power save %s", wanted ? "on" : "off");
+            }
+        }
+    }
+
+    {
         char stocks[STOCK_MAX_SYMBOLS * (STOCK_CODE_LEN + STOCK_NAME_LEN) + 8];
         if (get_form_value(body, "stocks", stocks, sizeof(stocks)) && stocks[0] != '\0') {
             stock_parse_config(stocks);
@@ -6971,6 +7086,58 @@ static esp_err_t wallpaper_delete_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Battery history over HTTP. Unplugging USB takes the serial port with it, so
+ * this is the only way to watch a discharge on the pack that is actually
+ * powering the board. Plain text, oldest first, one sample per line. */
+static esp_err_t battery_log_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+
+    char line[128];
+    snprintf(line, sizeof(line),
+             "# pack %.0fmAh, poll %ums, state 1=charging 2=discharging\n"
+             "# uptime_s percent millivolts state\n",
+             BATTERY_PACK_MAH, (unsigned)BATTERY_POLL_MS);
+    httpd_resp_sendstr_chunk(req, line);
+
+    size_t start = s_battery_log_count == BATTERY_LOG_SAMPLES ? s_battery_log_next : 0;
+    if (s_battery_log == NULL) {
+        httpd_resp_sendstr_chunk(req, "# no battery log\n");
+        httpd_resp_sendstr_chunk(req, NULL);
+        return ESP_OK;
+    }
+    const battery_sample_t *first = NULL;
+    const battery_sample_t *last = NULL;
+    for (size_t i = 0; i < s_battery_log_count; i++) {
+        const battery_sample_t *sample =
+            &s_battery_log[(start + i) % BATTERY_LOG_SAMPLES];
+        snprintf(line, sizeof(line), "%lu %d %d %u\n",
+                 (unsigned long)sample->uptime_s, sample->percent,
+                 sample->millivolts, (unsigned)sample->charge_state);
+        httpd_resp_sendstr_chunk(req, line);
+        if (sample->charge_state == 2) {
+            if (first == NULL) {
+                first = sample;
+            }
+            last = sample;
+        }
+    }
+
+    /* Average draw across the discharge samples, which is the number worth
+     * knowing: percent per hour of a known pack is milliamps. */
+    if (first != NULL && last != NULL && last->uptime_s > first->uptime_s &&
+        first->percent > last->percent) {
+        float hours = (float)(last->uptime_s - first->uptime_s) / 3600.0f;
+        float used = (float)(first->percent - last->percent) / 100.0f;
+        snprintf(line, sizeof(line), "# discharge %.0fmA over %.2fh (%d%% -> %d%%)\n",
+                 used * BATTERY_PACK_MAH / hours, hours, first->percent, last->percent);
+        httpd_resp_sendstr_chunk(req, line);
+    }
+
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
+}
+
 static esp_err_t start_config_web_server(void)
 {
     if (s_config_server != NULL) {
@@ -7009,7 +7176,13 @@ static esp_err_t start_config_web_server(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_config_server, &root_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_config_server, &save_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_config_server, &wallpaper_uri));
+    httpd_uri_t battery_uri = {
+        .uri = "/battery",
+        .method = HTTP_GET,
+        .handler = battery_log_get_handler,
+    };
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_config_server, &wallpaper_clear_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_config_server, &battery_uri));
     ESP_LOGI(TAG, "Config web server started at http://192.168.4.1");
     return ESP_OK;
 }
@@ -7070,9 +7243,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         s_wifi_retry_num = 0;
         s_ntp_sync_in_progress = false;
         s_last_ntp_attempt_ms = 0;
-        /* Connected to the router: nobody is hunting for the setup hotspot any
-         * more, so let the radio sleep between beacons. */
-        (void)esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        /* Connected to the router. Sleeping between beacons saves roughly
+         * 70 mA, but the softAP shares the radio and its beacons get ragged,
+         * so this is the user's call - see the config page. */
+        (void)esp_wifi_set_ps(s_cfg_power_save ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE);
         if (s_wifi_event_group != NULL) {
             xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT |
@@ -7145,6 +7319,8 @@ static esp_err_t start_wifi_station(void)
     (void)esp_wifi_set_ps(WIFI_PS_NONE);
 
     s_wifi_started = true;
+    xTaskCreate(wifi_scan_task, "wifi_scan", 2560, NULL, 4, NULL);
+    request_wifi_scan();
     ESP_RETURN_ON_ERROR(start_config_web_server(), TAG, "start config web failed");
     render_time_page();
     render_weather_status(wifi_configured() ? tr("Wi-Fi 连接中", "Wi-Fi connecting") : tr("打开配网热点", "Open setup AP"));
@@ -7327,6 +7503,18 @@ static void music_audio_task(void *arg)
         .sample_rate = MUSIC_SAMPLE_RATE,
         .mclk_multiple = 0,
     };
+
+    /* The BSP's mic init ESP_ERROR_CHECKs its I2S DMA allocation, so a short
+     * internal heap turns into an abort and a boot loop. The panel and Wi-Fi
+     * have first claim on that memory; if what is left cannot cover the
+     * descriptors, run without the spectrum instead of taking the board down. */
+    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (internal_free < MUSIC_MIC_MIN_INTERNAL_HEAP) {
+        ESP_LOGW(TAG, "Skipping microphone: %u bytes internal heap free",
+                 (unsigned)internal_free);
+        vTaskDelete(NULL);
+        return;
+    }
 
     /* One boot-time capture proves the mic path end to end in the serial
      * log, since the page itself can only be exercised by touch. */
