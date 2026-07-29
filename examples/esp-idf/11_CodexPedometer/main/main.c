@@ -354,6 +354,7 @@ typedef struct {
     lv_obj_t *status_label;
     lv_obj_t *wifi_icon;
     lv_obj_t *ntp_icon;
+    lv_obj_t *power_icon;
     lv_obj_t *corner_arc[4];
     lv_obj_t *corner_value[4];
     lv_obj_t *corner_caption[4];
@@ -675,6 +676,19 @@ static lv_point_precise_t s_second_hand_points[2];
 static lv_point_precise_t s_hour_edge_points[2];
 static lv_point_precise_t s_minute_edge_points[2];
 static volatile int s_battery_percent = -1;
+
+/* What the PMU says about where the board's power is coming from. The panel
+ * looks the same on a full battery and on USB with no pack fitted, which is
+ * exactly the pair worth telling apart. */
+typedef enum {
+    POWER_UNKNOWN,
+    POWER_BATTERY,   /* running the pack down          */
+    POWER_CHARGING,  /* USB in, pack taking charge     */
+    POWER_CHARGED,   /* USB in, pack full              */
+    POWER_USB_ONLY,  /* USB in, no pack fitted         */
+} power_state_t;
+
+static volatile power_state_t s_power_state = POWER_UNKNOWN;
 
 /* Off by default: modem sleep makes softAP beacons irregular, and a setup
  * hotspot you cannot find is worse than an hour of runtime. */
@@ -2307,7 +2321,10 @@ static void corner_render_widget_locked(int corner, const struct tm *local_time)
     case CW_BATTERY: {
         int battery = s_battery_percent;
         if (battery >= 0) {
-            snprintf(text, sizeof(text), "%d%%", battery);
+            /* A bolt in front of the number is the difference between "82% and
+             * falling" and "82% and climbing". */
+            snprintf(text, sizeof(text), "%s%d%%",
+                     s_power_state == POWER_CHARGING ? LV_SYMBOL_CHARGE : "", battery);
             if (lv_arc_get_value(arc) != battery) {
                 lv_arc_set_value(arc, battery);
             }
@@ -2778,11 +2795,16 @@ static void build_face_infograph(lv_obj_t *page)
 
     s_time_ui.wifi_icon = create_label(page, LV_SYMBOL_WIFI, FONT_MEDIUM,
                                        lv_color_hex(WATCH_COLOR_CAPTION));
-    lv_obj_align(s_time_ui.wifi_icon, LV_ALIGN_CENTER, -18, 97);
+    lv_obj_align(s_time_ui.wifi_icon, LV_ALIGN_CENTER, -36, 97);
 
     s_time_ui.ntp_icon = create_label(page, LV_SYMBOL_REFRESH, FONT_MEDIUM,
                                       lv_color_hex(WATCH_COLOR_CAPTION));
-    lv_obj_align(s_time_ui.ntp_icon, LV_ALIGN_CENTER, 18, 97);
+    lv_obj_align(s_time_ui.ntp_icon, LV_ALIGN_CENTER, 0, 97);
+
+    /* Third glyph in the same row: where the power is coming from. */
+    s_time_ui.power_icon = create_label(page, LV_SYMBOL_BATTERY_FULL, FONT_MEDIUM,
+                                        lv_color_hex(WATCH_COLOR_CAPTION));
+    lv_obj_align(s_time_ui.power_icon, LV_ALIGN_CENTER, 36, 97);
 
     s_time_ui.hour_hand = create_watch_hand(page, 9, WATCH_COLOR_HAND, s_hour_hand_points);
     s_time_ui.minute_hand = create_watch_hand(page, 6, WATCH_COLOR_HAND, s_minute_hand_points);
@@ -4430,6 +4452,51 @@ static void update_time_page_locked(void)
     set_obj_hidden(s_time_ui.wifi_icon, !configured);
     set_obj_hidden(s_time_ui.ntp_icon, !configured);
 
+    if (s_time_ui.power_icon != NULL) {
+        /* Charging is a bolt, USB with no pack is a plug, and on battery the
+         * glyph fills according to what is left - so the icon says both what
+         * the source is and, when it matters, how much is behind it. */
+        const char *glyph = LV_SYMBOL_BATTERY_FULL;
+        uint32_t colour = WATCH_COLOR_CAPTION;
+        int percent = s_battery_percent;
+        switch (s_power_state) {
+        case POWER_CHARGING:
+            glyph = LV_SYMBOL_CHARGE;
+            colour = WATCH_COLOR_BATTERY;
+            break;
+        case POWER_CHARGED:
+            glyph = LV_SYMBOL_BATTERY_FULL;
+            colour = WATCH_COLOR_BATTERY;
+            break;
+        case POWER_USB_ONLY:
+            glyph = LV_SYMBOL_USB;
+            colour = 0x64D2FF;
+            break;
+        case POWER_BATTERY:
+            if (percent < 0) {
+                glyph = LV_SYMBOL_BATTERY_EMPTY;
+            } else if (percent >= 80) {
+                glyph = LV_SYMBOL_BATTERY_FULL;
+            } else if (percent >= 55) {
+                glyph = LV_SYMBOL_BATTERY_3;
+            } else if (percent >= 30) {
+                glyph = LV_SYMBOL_BATTERY_2;
+            } else if (percent >= 12) {
+                glyph = LV_SYMBOL_BATTERY_1;
+            } else {
+                glyph = LV_SYMBOL_BATTERY_EMPTY;
+            }
+            colour = percent >= 0 && percent < 20 ? WATCH_COLOR_MONTH : 0xF7FBFF;
+            break;
+        default:
+            break;
+        }
+        set_label_text_if_changed(s_time_ui.power_icon, glyph);
+        lv_obj_set_style_text_color(s_time_ui.power_icon, lv_color_hex(colour), 0);
+        /* Before provisioning the AP hint sits in this row; it wins. */
+        set_obj_hidden(s_time_ui.power_icon, !configured);
+    }
+
     if (configured) {
         uint32_t wifi_color;
         if ((bits & WIFI_CONNECTED_BIT) != 0) {
@@ -4532,6 +4599,7 @@ static void log_battery_diagnostics(int percent)
     (void)axp2101_read(AXP2101_REG_STATUS2, &status2);
     int millivolts = axp2101_battery_mv();
 
+
     uint32_t now = now_ms();
     float minutes = last_ms == 0 ? 0.0f : (float)(now - last_ms) / 60000.0f;
     float drop_per_min = (minutes > 0.01f && last_percent >= 0)
@@ -4606,6 +4674,33 @@ static void log_battery_config(void)
              adc, gauge, icc, iterm, cv, detect);
 }
 
+/* Two register reads, cheap enough to run every second so the icon changes
+ * when the cable does. STATUS1 bit3: pack present, bit5: VBUS good.
+ * STATUS2 bits6:5: 0 standby, 1 charging, 2 discharging. */
+static void refresh_power_state(void)
+{
+    uint8_t status1 = 0;
+    uint8_t status2 = 0;
+    if (!axp2101_read(AXP2101_REG_STATUS1, &status1) ||
+        !axp2101_read(AXP2101_REG_STATUS2, &status2)) {
+        return;
+    }
+
+    bool battery_present = (status1 & 0x08) != 0;
+    bool vbus_good = (status1 & 0x20) != 0;
+    uint8_t charge_state = (status2 >> 5) & 0x03;
+
+    if (!battery_present) {
+        s_power_state = vbus_good ? POWER_USB_ONLY : POWER_UNKNOWN;
+    } else if (charge_state == 1) {
+        s_power_state = POWER_CHARGING;
+    } else if (charge_state == 2) {
+        s_power_state = POWER_BATTERY;
+    } else {
+        s_power_state = vbus_good ? POWER_CHARGED : POWER_BATTERY;
+    }
+}
+
 static void refresh_battery_percent(void)
 {
     if (s_axp2101_dev == NULL) {
@@ -4613,10 +4708,13 @@ static void refresh_battery_percent(void)
     }
 
     uint8_t value = 0;
-    if (axp2101_read(AXP2101_REG_BATT_PERCENT, &value) && value <= 100) {
-        s_battery_percent = value;
-        log_battery_diagnostics(value);
+    if (!axp2101_read(AXP2101_REG_BATT_PERCENT, &value)) {
+        return; /* I2C hiccup: keep the last reading rather than blanking it */
     }
+    /* With no pack fitted the gauge reports nonsense, which is the signal to
+     * stop showing a percentage at all. */
+    s_battery_percent = value <= 100 ? (int)value : -1;
+    log_battery_diagnostics(s_battery_percent);
 }
 
 static void clock_task(void *arg)
@@ -4632,6 +4730,7 @@ static void clock_task(void *arg)
             last_battery_ms = current_ms;
             refresh_battery_percent();
         }
+        refresh_power_state();
 
         if (s_ntp_resync_requested) {
             s_ntp_resync_requested = false;
