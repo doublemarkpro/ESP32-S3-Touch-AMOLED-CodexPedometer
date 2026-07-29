@@ -77,6 +77,9 @@ machine on the same LAN:
 | `:8765/usage` | Codex quota |
 | `:8766/status` | Codex / Claude Code agent state |
 | `:8766/stock?code=` | Intraday and daily series — the public chart endpoints redirect to HTTPS, which this build cannot reach |
+| `:8766/weather?city=` | Current conditions and today's range, from Open-Meteo (no key) |
+| `:8766/quote?codes=` | Live quotes, names included — the feed speaks GBK, which the watch cannot decode |
+| `:8766/claude` | Tokens and turns Claude Code has spent in a rolling 5-hour window |
 
 ```bash
 python tools/agent_status_server.py --install-autostart
@@ -96,9 +99,23 @@ python tools/agent_widget.py
 
 ![Desktop widget](docs/widget.png)
 
+It carries the agent state, Codex quota, Claude's token spend, the weather and
+the watchlist — the same numbers the watch shows, in the same colours.
+
+```bash
+python tools/agent_widget.py --city 上海 --codes sz002241,sh600519
+```
+
 Drag it anywhere (the position is remembered), right-click for opacity and
 always-on-top, `--host` if the bridge runs on another machine, and
 `--install-autostart` to start it at logon. Standard library only.
+
+**On Claude's usage:** there is no local record of the plan's rate-limit
+percentage — that lives server-side behind the account's credentials — so the
+widget reports what can honestly be measured on this machine: tokens and turns
+summed from Claude Code's own transcripts over a rolling 5-hour window. Cache
+reads are counted separately and left out of the headline; they dwarf
+everything else and say nothing about how hard the model is working.
 
 ## Assets
 

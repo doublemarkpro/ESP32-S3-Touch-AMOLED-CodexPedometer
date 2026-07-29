@@ -13,10 +13,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -140,6 +143,212 @@ class BridgeServer(ThreadingHTTPServer):
     allow_reuse_address = False
 
 
+WEATHER_CACHE_SECONDS = 600
+QUOTE_CACHE_SECONDS = 20
+CLAUDE_CACHE_SECONDS = 60
+CLAUDE_WINDOW_HOURS = 5.0
+
+# Same cities the firmware knows, with the coordinates it uses. Open-Meteo
+# needs no key, which is the whole point: the watch has an AMap key in its
+# NVS, and copying it onto the PC as well is one more secret to lose.
+CITIES = {
+    "青岛": (36.06488, 120.38042), "上海": (31.23040, 121.47370),
+    "北京": (39.90420, 116.40740), "深圳": (22.54310, 114.05790),
+    "广州": (23.12910, 113.26440), "杭州": (30.27410, 120.15510),
+    "南京": (32.06030, 118.79690), "济南": (36.65120, 117.12010),
+}
+# WMO weather codes, collapsed to the words the watch shows.
+WMO = {
+    0: "晴", 1: "多云", 2: "多云", 3: "阴", 45: "雾", 48: "雾",
+    51: "小雨", 53: "小雨", 55: "中雨", 61: "小雨", 63: "中雨", 65: "大雨",
+    66: "冻雨", 67: "冻雨", 71: "小雪", 73: "中雪", 75: "大雪", 77: "阵雪",
+    80: "阵雨", 81: "阵雨", 82: "暴雨", 85: "阵雪", 86: "阵雪",
+    95: "雷阵雨", 96: "雷阵雨", 99: "雷阵雨",
+}
+
+_weather_lock = threading.Lock()
+_weather_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _http_get(url: str, timeout: float = 6.0) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": "codex-bridge/1"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def fetch_weather(city: str) -> dict[str, Any]:
+    """Current conditions and today's range. Cached for ten minutes - the
+    forecast does not change faster than that and neither does the widget."""
+    city = city or "青岛"
+    now = time.time()
+    with _weather_lock:
+        cached = _weather_cache.get(city)
+        if cached and now - cached[0] < WEATHER_CACHE_SECONDS:
+            return cached[1]
+
+    latitude, longitude = CITIES.get(city, CITIES["青岛"])
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={latitude}&longitude={longitude}"
+        "&current=temperature_2m,weather_code"
+        "&daily=temperature_2m_max,temperature_2m_min"
+        "&timezone=auto&forecast_days=1"
+    )
+    try:
+        payload = json.loads(_http_get(url).decode("utf-8"))
+        current = payload["current"]
+        daily = payload["daily"]
+        result = {
+            "city": city,
+            "temp": round(float(current["temperature_2m"])),
+            "condition": WMO.get(int(current["weather_code"]), "--"),
+            "low": round(float(daily["temperature_2m_min"][0])),
+            "high": round(float(daily["temperature_2m_max"][0])),
+            "updated": time.strftime("%H:%M"),
+        }
+    except Exception as exc:  # noqa: BLE001 - any failure is just "no weather"
+        result = {"city": city, "error": str(exc)[:80]}
+
+    with _weather_lock:
+        _weather_cache[city] = (now, result)
+    return result
+
+
+# ------------------------------------------------------------------ quotes
+_quote_lock = threading.Lock()
+_quote_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def fetch_quote(code: str) -> dict[str, Any]:
+    """Live quote from the same feed the watch uses. The feed speaks GBK,
+    which is why the watch cannot read the name out of it and this can."""
+    now = time.time()
+    with _quote_lock:
+        cached = _quote_cache.get(code)
+        if cached and now - cached[0] < QUOTE_CACHE_SECONDS:
+            return cached[1]
+
+    try:
+        raw = _http_get(f"http://qt.gtimg.cn/q={code}", timeout=4.0)
+        text = raw.decode("gbk", errors="replace")
+        fields = text.split('="', 1)[1].rstrip('";\n').split("~")
+        price = float(fields[3])
+        prev = float(fields[4])
+        result = {
+            "code": code,
+            "name": fields[1],
+            "price": price,
+            "change": price - prev,
+            "change_pct": (price - prev) / prev * 100.0 if prev else 0.0,
+        }
+    except Exception as exc:  # noqa: BLE001
+        result = {"code": code, "error": str(exc)[:80]}
+
+    with _quote_lock:
+        _quote_cache[code] = (now, result)
+    return result
+
+
+# ----------------------------------------------------- Claude Code token use
+_claude_lock = threading.Lock()
+_claude_cache: tuple[float, dict[str, Any]] = (0.0, {})
+_claude_offsets: dict[str, tuple[int, list[tuple[float, int]]]] = {}
+_TS_RE = re.compile(r'"timestamp":"([^"]+)"')
+_USAGE_RE = re.compile(r'"usage":\{([^}]*)\}')
+_TOKEN_RE = re.compile(r'"(input_tokens|output_tokens|cache_creation_input_tokens|'
+                       r'cache_read_input_tokens)":(\d+)')
+
+
+def _parse_iso(value: str) -> float:
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def claude_usage() -> dict[str, Any]:
+    """Tokens Claude Code has spent recently, summed from its own transcripts.
+
+    There is no local record of the plan's rate-limit percentage - that lives
+    server-side behind the account's credentials - so this reports what can
+    honestly be measured here: tokens and turns in a rolling window.
+
+    Transcripts are append-only, so each file is read from where the last scan
+    stopped rather than re-parsed; a long session is tens of megabytes.
+    """
+    global _claude_cache
+    now = time.time()
+    with _claude_lock:
+        if now - _claude_cache[0] < CLAUDE_CACHE_SECONDS and _claude_cache[1]:
+            return _claude_cache[1]
+
+    root = Path.home() / ".claude" / "projects"
+    cutoff = now - CLAUDE_WINDOW_HOURS * 3600.0
+    day_start = time.mktime(time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1))
+
+    if root.is_dir():
+        for path in root.rglob("*.jsonl"):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_mtime < min(cutoff, day_start):
+                continue
+
+            key = str(path)
+            offset, samples = _claude_offsets.get(key, (0, []))
+            if stat.st_size < offset:      # rotated or truncated
+                offset, samples = 0, []
+            if stat.st_size > offset:
+                try:
+                    with path.open("r", encoding="utf-8", errors="replace") as fh:
+                        fh.seek(offset)
+                        for line in fh:
+                            usage = _USAGE_RE.search(line)
+                            if not usage:
+                                continue
+                            stamp = _TS_RE.search(line)
+                            when = _parse_iso(stamp.group(1)) if stamp else now
+                            counts = {key: int(value) for key, value
+                                      in _TOKEN_RE.findall(usage.group(1))}
+                            fresh = (counts.get("input_tokens", 0)
+                                     + counts.get("output_tokens", 0)
+                                     + counts.get("cache_creation_input_tokens", 0))
+                            cached = counts.get("cache_read_input_tokens", 0)
+                            if fresh or cached:
+                                samples.append((when, fresh, cached))
+                        offset = fh.tell()
+                except OSError:
+                    continue
+            # Keep only what either window could still need.
+            horizon = min(cutoff, day_start)
+            samples = [s for s in samples if s[0] >= horizon]
+            _claude_offsets[key] = (offset, samples)
+
+    window_tokens = window_turns = window_cached = today_tokens = 0
+    for offset, samples in _claude_offsets.values():
+        for when, fresh, cached in samples:
+            if when >= cutoff:
+                window_tokens += fresh
+                window_cached += cached
+                window_turns += 1
+            if when >= day_start:
+                today_tokens += fresh
+
+    result = {
+        "window_hours": CLAUDE_WINDOW_HOURS,
+        "window_tokens": window_tokens,
+        "window_cached": window_cached,
+        "window_turns": window_turns,
+        "today_tokens": today_tokens,
+        "source": "local transcripts",
+    }
+    with _claude_lock:
+        _claude_cache = (now, result)
+    return result
+
+
 STOCK_CACHE_SECONDS = 25
 _stock_lock = threading.Lock()
 _stock_cache: dict[str, tuple[float, str]] = {}
@@ -244,6 +453,19 @@ class Handler(BaseHTTPRequestHandler):
                 fields.get("note", ""),
             )
             self._send({"ok": True})
+            return
+        if path == "/weather":
+            self._send(fetch_weather(_parse_query(self.path).get("city", "青岛")))
+            return
+        # /quote?codes=sz002241,hk09903 - live prices for the desktop widget
+        if path == "/quote":
+            codes = [c.strip() for c in
+                     _parse_query(self.path).get("codes", "").split(",") if c.strip()]
+            codes = [c for c in codes if c.replace(".", "").isalnum()][:6]
+            self._send({"quotes": [fetch_quote(code) for code in codes]})
+            return
+        if path == "/claude":
+            self._send(claude_usage())
             return
         # /stock?code=sz002241 - chart data the watch cannot fetch itself
         if path == "/stock":

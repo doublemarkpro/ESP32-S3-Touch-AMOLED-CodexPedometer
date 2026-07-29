@@ -23,6 +23,7 @@ import sys
 import threading
 import tkinter as tk
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from tkinter import font as tkfont
@@ -31,6 +32,10 @@ STATUS_PORT = 8766
 USAGE_PORT = 8765
 STATUS_POLL_MS = 2000
 USAGE_POLL_MS = 30000
+EXTRAS_POLL_MS = 60000     # weather, quotes and Claude's token count
+
+DEFAULT_CITY = "青岛"
+DEFAULT_CODES = "sz002241,hk09903"
 
 TASK_NAME = "CodexAgentWidget"
 CONFIG_PATH = Path(os.environ.get("APPDATA", ".")) / "codex_agent_widget.json"
@@ -49,6 +54,9 @@ STATE_COLOURS = {
     "done": "#18D7F5",
     "offline": "#3A4450",
 }
+# Red for up, green for down - the watch's convention, and this market's.
+UP = "#FF453A"
+DOWN = "#30D158"
 STATE_LABELS = {
     "idle": "IDLE",
     "working": "WORKING",
@@ -67,6 +75,14 @@ def fetch_json(url: str, timeout: float = 2.5) -> dict | None:
         return None
 
 
+def format_tokens(count: int) -> str:
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    if count >= 1_000:
+        return f"{count / 1_000:.0f}K"
+    return str(count)
+
+
 def format_elapsed(seconds: int) -> str:
     if seconds >= 3600:
         return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
@@ -76,10 +92,16 @@ def format_elapsed(seconds: int) -> str:
 
 
 class Widget:
-    def __init__(self, host: str):
+    def __init__(self, host: str, city: str, codes: str):
         self.host = host
         self.status_url = f"http://{host}:{STATUS_PORT}/status"
         self.usage_url = f"http://{host}:{USAGE_PORT}/usage"
+        self.weather_url = (f"http://{host}:{STATUS_PORT}/weather"
+                            f"?city={urllib.parse.quote(city)}")
+        self.quote_url = (f"http://{host}:{STATUS_PORT}/quote"
+                          f"?codes={urllib.parse.quote(codes)}")
+        self.claude_url = f"http://{host}:{STATUS_PORT}/claude"
+        self.codes = [c.strip() for c in codes.split(",") if c.strip()]
         self.config = self._load_config()
 
         self.root = tk.Tk()
@@ -98,6 +120,7 @@ class Widget:
         self.usage_percent: int | None = None
         self.poll_status()
         self.poll_usage()
+        self.poll_extras()
 
     # ------------------------------------------------------------ appearance
     def _build(self) -> None:
@@ -156,6 +179,25 @@ class Widget:
         self.bar_fill = self.bar.create_rectangle(0, 0, 0, 6,
                                                   fill=STATE_COLOURS["idle"], width=0)
         self.bar.bind("<Configure>", lambda _event: self._draw_bar())
+
+        # Claude has no local record of its plan's rate limit, so what is
+        # shown is what can be measured here: tokens and turns.
+        self.claude_label = tk.Label(pad, text="CLAUDE --", font=pill_font,
+                                     bg=BG, fg=FAINT, anchor="w")
+        self.claude_label.pack(anchor="w", pady=(8, 0))
+
+        tk.Frame(pad, bg="#1B2430", height=1).pack(fill="x", pady=(11, 9))
+
+        self.weather = tk.Label(pad, text="--", font=small_font, bg=BG,
+                                fg=DIM, anchor="w")
+        self.weather.pack(anchor="w", fill="x")
+
+        self.quotes: list[tk.Label] = []
+        for _ in range(2):
+            row = tk.Label(pad, text="", font=small_font, bg=BG, fg=DIM,
+                           anchor="w")
+            row.pack(anchor="w", fill="x", pady=(3, 0))
+            self.quotes.append(row)
 
         self.root.update_idletasks()
         self.root.minsize(232, self.root.winfo_reqheight())
@@ -293,6 +335,50 @@ class Widget:
                 text=STATE_LABELS.get(value, value).lower(),
                 fg=STATE_COLOURS.get(value, DIM))
 
+    def poll_extras(self) -> None:
+        threading.Thread(target=self._extras_worker, daemon=True).start()
+        self.root.after(EXTRAS_POLL_MS, self.poll_extras)
+
+    def _extras_worker(self) -> None:
+        weather = fetch_json(self.weather_url, timeout=8.0)
+        quotes = fetch_json(self.quote_url, timeout=8.0)
+        claude = fetch_json(self.claude_url, timeout=8.0)
+        self.root.after(0, lambda: self._render_extras(weather, quotes, claude))
+
+    def _render_extras(self, weather: dict | None, quotes: dict | None,
+                       claude: dict | None) -> None:
+        if weather and "temp" in weather:
+            self.weather.configure(
+                text=f"{weather['city']}  {weather['temp']}°  "
+                     f"{weather['condition']}   {weather['low']}° / {weather['high']}°",
+                fg=DIM)
+        else:
+            self.weather.configure(text="weather unavailable", fg=FAINT)
+
+        rows = (quotes or {}).get("quotes", [])
+        for index, label in enumerate(self.quotes):
+            if index >= len(rows):
+                label.configure(text="")
+                continue
+            quote = rows[index]
+            if "price" not in quote:
+                label.configure(text=f"{quote.get('code', '')}  --", fg=FAINT)
+                continue
+            arrow = "▲" if quote["change"] >= 0 else "▼"
+            label.configure(
+                text=f"{quote['name']}  {quote['price']:.2f}  "
+                     f"{arrow} {abs(quote['change_pct']):.2f}%",
+                fg=UP if quote["change"] >= 0 else DOWN)
+
+        if claude and "window_tokens" in claude:
+            hours = claude.get("window_hours", 5)
+            self.claude_label.configure(
+                text=f"CLAUDE {format_tokens(claude['window_tokens'])} tok · "
+                     f"{claude['window_turns']} turns / {hours:.0f}h",
+                fg=DIM)
+        else:
+            self.claude_label.configure(text="CLAUDE --", fg=FAINT)
+
     def poll_usage(self) -> None:
         threading.Thread(target=self._usage_worker, daemon=True).start()
         self.root.after(USAGE_POLL_MS, self.poll_usage)
@@ -365,6 +451,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1",
                         help="where the bridge runs (default: this machine)")
+    parser.add_argument("--city", default=DEFAULT_CITY, help="weather city")
+    parser.add_argument("--codes", default=DEFAULT_CODES,
+                        help="comma-separated stock codes, up to two are shown")
     parser.add_argument("--install-autostart", action="store_true")
     parser.add_argument("--uninstall", action="store_true")
     args = parser.parse_args()
@@ -374,7 +463,7 @@ def main() -> int:
     if args.uninstall:
         return uninstall_autostart()
 
-    Widget(args.host).run()
+    Widget(args.host, args.city, args.codes).run()
     return 0
 
 
