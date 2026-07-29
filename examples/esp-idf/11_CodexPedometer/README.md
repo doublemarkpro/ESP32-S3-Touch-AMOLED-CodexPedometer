@@ -99,8 +99,21 @@ python tools/agent_widget.py
 
 ![Desktop widget](docs/widget.png)
 
-It carries the agent state, Codex quota, Claude's token spend, the weather and
-the watchlist — the same numbers the watch shows, in the same colours.
+Three tabs, one at a time — the same numbers the watch shows, in the same
+colours:
+
+| Tab | Shows |
+| --- | --- |
+| AI | Agent state and target, Codex quota remaining, Claude's token spend |
+| 天气 | Today's temperature, condition and range, then the next three days |
+| 股票 | Price and change, an intraday trace or 20-day candles, and your own symbol list |
+
+The lamp in the header stays visible on every tab, so switching away from AI
+does not cost you the one thing worth glancing at. Only the open tab is polled.
+
+On the stock tab: click a symbol chip to switch, click 日内 / 日K to change the
+chart, and type codes into the box (`sz002241,sh600519,hk09903`) then 应用 to
+change the list. Tab, symbols and chart mode are remembered.
 
 ```bash
 python tools/agent_widget.py --city 上海 --codes sz002241,sh600519

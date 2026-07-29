@@ -191,19 +191,29 @@ def fetch_weather(city: str) -> dict[str, Any]:
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={latitude}&longitude={longitude}"
         "&current=temperature_2m,weather_code"
-        "&daily=temperature_2m_max,temperature_2m_min"
-        "&timezone=auto&forecast_days=1"
+        "&daily=temperature_2m_max,temperature_2m_min,weather_code"
+        "&timezone=auto&forecast_days=4"
     )
     try:
         payload = json.loads(_http_get(url).decode("utf-8"))
         current = payload["current"]
         daily = payload["daily"]
+        days = [
+            {
+                "date": daily["time"][i][5:],          # MM-DD
+                "condition": WMO.get(int(daily["weather_code"][i]), "--"),
+                "low": round(float(daily["temperature_2m_min"][i])),
+                "high": round(float(daily["temperature_2m_max"][i])),
+            }
+            for i in range(len(daily["time"]))
+        ]
         result = {
             "city": city,
             "temp": round(float(current["temperature_2m"])),
             "condition": WMO.get(int(current["weather_code"]), "--"),
-            "low": round(float(daily["temperature_2m_min"][0])),
-            "high": round(float(daily["temperature_2m_max"][0])),
+            "low": days[0]["low"],
+            "high": days[0]["high"],
+            "days": days,
             "updated": time.strftime("%H:%M"),
         }
     except Exception as exc:  # noqa: BLE001 - any failure is just "no weather"
