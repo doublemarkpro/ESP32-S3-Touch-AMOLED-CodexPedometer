@@ -126,11 +126,24 @@
 #define AXP2101_REG_CV_CHG 0x64       /* bits2:0: 3=4.2V */
 #define AXP2101_REG_BAT_DETECT 0x68   /* bit0: battery detection */
 
-/* Capacity of the pack actually fitted; only used to turn the gauge's slope
- * into a current estimate in the log. */
-#define BATTERY_PACK_MAH 400.0f
+/* Capacity of the pack actually fitted. Drives both the current estimate in
+ * the log and the charge current, so changing the pack means changing this
+ * one number. */
+#define BATTERY_PACK_MAH 3000.0f
 /* Termination current index for register 0x63: 0 = 25 mA, one step per 25 mA. */
 #define AXP2101_ITERM_25MA 0
+
+/* Register 0x62 constant-current codes. Below 100 mA the steps are coarse and
+ * this board never wants them. */
+#define AXP2101_ICC_100MA 4
+#define AXP2101_ICC_200MA 8
+#define AXP2101_ICC_300MA 9
+#define AXP2101_ICC_400MA 10
+#define AXP2101_ICC_500MA 11
+#define AXP2101_ICC_600MA 12
+#define AXP2101_ICC_700MA 13
+#define AXP2101_ICC_800MA 14
+#define AXP2101_ICC_1000MA 16
 
 /* While the screen is dark nobody is reading the AI ring, so the radio can
  * stay asleep between polls instead of waking every two seconds. */
@@ -4634,24 +4647,52 @@ static void log_battery_diagnostics(int percent)
     }
 }
 
-/* The only charge parameter worth changing for the 400 mAh pack. The PMU
- * powers up terminating at 150 mA, which on a pack this small ends the charge
- * while the cell is still well short of full - the charge current has already
- * tapered below that before the cell is topped off, so it never gets there.
- * Target voltage (4.2 V) and constant current (200 mA = 0.5C) are already
- * right, and both are safety-relevant, so they are left alone. */
+/* Half of the pack's capacity, clamped to what the PMU and a USB supply can
+ * actually deliver. 0.5C is the usual "standard charge" for a LiPo pouch, and
+ * the AXP2101 tops out at 1 A. */
+static uint8_t charge_current_code(void)
+{
+    float half_c = BATTERY_PACK_MAH / 2.0f;
+    if (half_c >= 1000.0f) return AXP2101_ICC_1000MA;
+    if (half_c >= 800.0f) return AXP2101_ICC_800MA;
+    if (half_c >= 700.0f) return AXP2101_ICC_700MA;
+    if (half_c >= 600.0f) return AXP2101_ICC_600MA;
+    if (half_c >= 500.0f) return AXP2101_ICC_500MA;
+    if (half_c >= 400.0f) return AXP2101_ICC_400MA;
+    if (half_c >= 300.0f) return AXP2101_ICC_300MA;
+    if (half_c >= 200.0f) return AXP2101_ICC_200MA;
+    return AXP2101_ICC_100MA;
+}
+
+/* Two charge parameters follow the pack, and one deliberately does not.
+ *
+ * Termination: the PMU powers up ending the charge at 150 mA, which on a small
+ * pack happens while the cell is still well short of full. 25 mA suits
+ * anything from 250 mAh up.
+ *
+ * Constant current: the 200 mA default is 0.5C for a 400 mAh pack but only
+ * 0.07C for a 3000 mAh one, which would take most of a day. It now follows
+ * BATTERY_PACK_MAH.
+ *
+ * Target voltage stays at the 4.2 V default - it is the one setting where a
+ * wrong value damages the cell rather than merely inconveniencing it. */
 static void configure_battery_charging(void)
 {
     uint8_t iterm = 0;
-    if (!axp2101_read(AXP2101_REG_ITERM_CHG, &iterm)) {
-        return;
+    if (axp2101_read(AXP2101_REG_ITERM_CHG, &iterm)) {
+        uint8_t wanted = (uint8_t)((iterm & 0xF0) | AXP2101_ITERM_25MA);
+        if (wanted != iterm && axp2101_write(AXP2101_REG_ITERM_CHG, wanted)) {
+            ESP_LOGI(TAG, "PMU charge termination 0x%02X -> 0x%02X (25mA)", iterm, wanted);
+        }
     }
-    uint8_t wanted = (uint8_t)((iterm & 0xF0) | AXP2101_ITERM_25MA);
-    if (wanted == iterm) {
-        return;
-    }
-    if (axp2101_write(AXP2101_REG_ITERM_CHG, wanted)) {
-        ESP_LOGI(TAG, "PMU charge termination 0x%02X -> 0x%02X (25mA)", iterm, wanted);
+
+    uint8_t icc = 0;
+    if (axp2101_read(AXP2101_REG_ICC_CHG, &icc)) {
+        uint8_t wanted = (uint8_t)((icc & 0xE0) | charge_current_code());
+        if (wanted != icc && axp2101_write(AXP2101_REG_ICC_CHG, wanted)) {
+            ESP_LOGI(TAG, "PMU charge current 0x%02X -> 0x%02X for %.0fmAh pack",
+                     icc, wanted, (double)BATTERY_PACK_MAH);
+        }
     }
 }
 
