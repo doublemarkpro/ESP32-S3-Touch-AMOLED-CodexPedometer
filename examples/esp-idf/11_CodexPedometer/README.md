@@ -85,6 +85,21 @@ python tools/agent_status_server.py --install-autostart
 Agent state is pushed by hooks: Claude Code posts to the bridge natively, Codex
 through `tools/codex_hook.py` registered in `~/.codex/hooks.json`.
 
+## Desktop widget
+
+The same data, as a frameless always-on-top panel for the desktop - useful when
+the watch is not in front of you:
+
+```bash
+python tools/agent_widget.py
+```
+
+![Desktop widget](docs/widget.png)
+
+Drag it anywhere (the position is remembered), right-click for opacity and
+always-on-top, `--host` if the bridge runs on another machine, and
+`--install-autostart` to start it at logon. Standard library only.
+
 ## Assets
 
 Regenerate rather than hand-edit:
